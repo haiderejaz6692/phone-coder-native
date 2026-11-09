@@ -46,7 +46,9 @@ FAT_MAGICS = {
     b"\xca\xfe\xba\xbf": (">", 32), b"\xbf\xba\xfe\xca": ("<", 32),
 }
 SIGNATURE_BLOB = re.compile(
-    rb"(?:\xfa\xde\x0c[\xc0\xc1\x02]|\xfa\xde\x0b[\x01\x02])(.{4})", re.DOTALL
+    # Zero-width matching evaluates every magic offset, including a real header
+    # starting inside an earlier false candidate's four-byte length field.
+    rb"(?=(?:\xfa\xde\x0c[\xc0\xc1\x02]|\xfa\xde\x0b[\x01\x02])(.{4}))", re.DOTALL
 )
 
 def require(condition, message):

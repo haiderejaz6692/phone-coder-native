@@ -2,7 +2,7 @@
 # Real ZIP/filesystem checks against disposable fake app bundles; no Apple build.
 set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-python3 - "$repository_root" <<'PY'
+python3 - "$repository_root" "$@" <<'PY'
 import hashlib
 import os
 from pathlib import Path
@@ -100,9 +100,29 @@ def universal_macho(slices, bits=32, order=">"):
     table = header + b"".join(records)
     return table + b"\x00" * (256 - len(table)) + payload
 
+def check_overlapping_signature(temp):
+    dirty = app_fixture(temp / "overlapping-signature")
+    # A false magic interprets the real magic as its impossible length. The
+    # genuine superblob begins four bytes later and must still be evaluated.
+    data = thin_macho() + struct.pack(">I", 0xfade0cc0) + struct.pack(">III", 0xfade0cc0, 12, 0)
+    (dirty / "Phone Coder").write_bytes(data)
+    output = temp / "overlapping-signature.ipa"
+    raw_zip(dirty, output)
+    reject(run(verify, output), "overlapping embedded Mach-O signature")
+    packaged = temp / "overlapping-signature-packaged.ipa"
+    reject(run(package, dirty, packaged), "packaged overlapping embedded Mach-O signature")
+    check(not packaged.exists() and not Path(str(packaged) + ".sha256").exists(),
+          "published overlapping embedded Mach-O signature")
+    print("PASS: overlapping signature blob candidates fail closed in verification and packaging")
+
 try:
     check(package.is_file(), "packaging script does not exist")
     check(verify.is_file(), "verification script does not exist")
+    if sys.argv[2:] == ["--overlapping-signature"]:
+        with tempfile.TemporaryDirectory(prefix="phone-coder-ipa-overlap-test-") as temporary:
+            check_overlapping_signature(Path(temporary))
+        sys.exit(0)
+    check(not sys.argv[2:], "unknown regression-test selection")
     with tempfile.TemporaryDirectory(prefix="phone-coder-ipa-test-") as temporary:
         temp = Path(temporary)
         app = app_fixture(temp / "direct")
@@ -243,6 +263,8 @@ try:
             check(not packaged.exists() and not Path(str(packaged) + ".sha256").exists(),
                   "published signed Mach-O: " + label)
         print("PASS: unsigned Mach-O formats accepted; embedded signing commands/blobs rejected in every member and universal slice")
+
+        check_overlapping_signature(temp)
 
         malformed_machos = [
             ("truncated-thin", b"\xcf\xfa\xed\xfe"),
