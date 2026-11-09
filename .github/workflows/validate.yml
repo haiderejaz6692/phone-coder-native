@@ -27,6 +27,7 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/workflow-tools"
           "$RUNNER_TEMP/workflow-tools/bin/python3" -m pip install PyYAML==6.0.3
           PATH="$RUNNER_TEMP/workflow-tools/bin:$PATH" bash scripts/validate_phone_coder_workflows.sh
+          PATH="$RUNNER_TEMP/workflow-tools/bin:$PATH" bash scripts/tests/test_validate_phone_coder_workflows.sh
 
   voice-orb:
     runs-on: macos-15

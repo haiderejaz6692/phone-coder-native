@@ -6,6 +6,7 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 - "$repository_root" <<'PY'
 from pathlib import Path
 import re
+import shlex
 import sys
 
 root = Path(sys.argv[1])
@@ -79,39 +80,96 @@ try:
         require(isinstance(value, str), f"{step_id} needs a run script")
         return value
 
-    def contains(step_id, *commands):
+    def contains_text(step_id, *values):
         value = script(step_id)
-        for command in commands:
-            require(command in value, f"{step_id} must execute {command}")
+        for expected in values:
+            require(expected in value, f"{step_id} is missing required metadata: {expected}")
 
-    contains("tools", "xcodebuild -version", "17A400", "PyYAML==6.0.3", "xcodegen")
-    contains("repository-tests", "bash scripts/validate_open_source.sh",
+    def command_lines(step_id, content=None):
+        # The reviewed workflow uses direct commands, not generated shell code.
+        # Tokenize logical lines so comments, quoted print arguments, and
+        # heredoc bodies cannot impersonate an executable's argv prefix.
+        commands = []
+        pending = ""
+        heredoc = None
+        value = script(step_id) if content is None else content
+        for line in value.replace("\\\n", "").splitlines():
+            if heredoc is not None:
+                if line.strip() == heredoc:
+                    heredoc = None
+                continue
+            pending += line + "\n"
+            try:
+                words = shlex.split(pending, comments=True, posix=True)
+            except ValueError:
+                # A quoted print argument may span several physical lines.
+                continue
+            pending = ""
+            if not words:
+                continue
+            for word in words:
+                if word.startswith("<<"):
+                    heredoc = word[2:].lstrip("-")
+                    require(bool(heredoc), f"{step_id} needs a literal inline heredoc delimiter")
+            commands.append(words)
+        require(not pending and heredoc is None, f"{step_id} has an unterminated quote or heredoc")
+        return commands
+
+    def invokes(commands, command, *arguments):
+        prefix = shlex.split(command)
+        for words in commands:
+            # Environment assignments precede argv, including Validate's PATH.
+            while words and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", words[0]):
+                words = words[1:]
+            if (words[:len(prefix)] == prefix and all(argument in words for argument in arguments)
+                    and not any(operator in words for operator in ("&&", "||", ";", "|"))):
+                return True
+        return False
+
+    def executes(step_id, command, *arguments):
+        require(invokes(command_lines(step_id), command, *arguments), f"{step_id} must execute {command}")
+
+    executes("tools", "xcodebuild -version")
+    executes("tools", "xcodegen --version")
+    contains_text("tools", "17A400", "PyYAML==6.0.3")
+    for command in ("bash scripts/validate_open_source.sh",
              "bash scripts/validate_phone_coder_workflows.sh",
+             "bash scripts/tests/test_validate_phone_coder_workflows.sh",
              "bash scripts/tests/test_validate_open_source.sh",
              "bash scripts/tests/test_build_native_frameworks.sh",
              "bash scripts/tests/test_package_unsigned_ipa.sh",
-             "swift test --package-path Packages/VoiceAgentOrb")
-    contains("native", "bash scripts/build_native_frameworks.sh --llama-only")
-    native = script("native")
-    require(native.index("df -h") < native.index("build_native_frameworks.sh") < native.rindex("df -h"),
+             "swift test --package-path Packages/VoiceAgentOrb"):
+        executes("repository-tests", command)
+    executes("native", "bash scripts/build_native_frameworks.sh --llama-only")
+    executes("native", "df -h")
+    executes("native", "trap", "df -h", "EXIT")
+    native = command_lines("native")
+    build_index = next(index for index, words in enumerate(native)
+                       if invokes([words], "bash scripts/build_native_frameworks.sh --llama-only"))
+    require(any(invokes([words], "df -h") for words in native[:build_index])
+            and any(invokes([words], "df -h") for words in native[build_index + 1:]),
             "native compilation must report disk space before and after")
-    require("trap 'df -h' EXIT" in native, "native failures must also report disk space")
-    contains("dependencies", "xcodegen generate", "pod install",
-             "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
-             "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved",
-             "-resolvePackageDependencies", "-onlyUsePackageVersionsFromResolvedFile")
-    for step_id in ("dependencies", "unit-tests", "archive"):
-        contains(step_id, "-workspace PhoneCoder.xcworkspace", "-scheme PhoneCoder", "CODE_SIGNING_ALLOWED=NO")
-    contains("unit-tests", "xcodebuild test", "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1",
-             '-resultBundlePath "$RUNNER_TEMP/PhoneCoderTests.xcresult"',
+    executes("dependencies", "xcodegen generate")
+    executes("dependencies", "pod install")
+    executes("dependencies", "cp", "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+             "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved")
+    executes("dependencies", "xcodebuild -resolvePackageDependencies", "-onlyUsePackageVersionsFromResolvedFile")
+    for step_id, command in (("dependencies", "xcodebuild -resolvePackageDependencies"),
+                             ("unit-tests", "xcodebuild test"), ("archive", "xcodebuild archive")):
+        executes(step_id, command, "-workspace", "PhoneCoder.xcworkspace", "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO")
+    executes("unit-tests", "xcodebuild test", "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1",
+             "-resultBundlePath", "$RUNNER_TEMP/PhoneCoderTests.xcresult",
              "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile")
-    contains("archive", "xcodebuild archive", "generic/platform=iOS", "-configuration Release",
-             '-archivePath "$RUNNER_TEMP/PhoneCoder.xcarchive"',
-             'rm -rf "$RUNNER_TEMP/PhoneCoder-TestDerivedData"',
+    executes("archive", "xcodebuild archive", "generic/platform=iOS", "-configuration", "Release",
+             "-archivePath", "$RUNNER_TEMP/PhoneCoder.xcarchive",
              "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile")
-    contains("package", "bash scripts/package_unsigned_ipa.sh", "bash scripts/verify_unsigned_ipa.sh",
-             "phone-coder-unsigned-${GITHUB_SHA}.ipa", "shasum -a 256 -c")
-    contains("metadata", "build-metadata.json", "source_sha", "xcode_version", "dependency_lock_hashes",
+    executes("archive", "rm -rf", "$RUNNER_TEMP/PhoneCoder-TestDerivedData")
+    executes("package", "bash scripts/package_unsigned_ipa.sh")
+    executes("package", "bash scripts/verify_unsigned_ipa.sh")
+    executes("package", "shasum -a 256 -c")
+    contains_text("package", "phone-coder-unsigned-${GITHUB_SHA}.ipa")
+    executes("metadata", "python3 -")
+    contains_text("metadata", "build-metadata.json", "source_sha", "xcode_version", "dependency_lock_hashes",
              "policy_flavor", "api_profile", "hashlib.sha256", "Podfile.lock",
              "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved",
              'os.environ["GITHUB_SHA"]', 'os.environ["POLICY_FLAVOR"]', 'os.environ["API_PROFILE"]')
@@ -141,8 +199,10 @@ try:
     require(jobs["voice-orb"]["runs-on"] == "macos-15", "preserve VoiceAgentOrb runner")
     require(any(step.get("run") == "swift test --package-path Packages/VoiceAgentOrb"
                 for step in jobs["voice-orb"]["steps"]), "preserve VoiceAgentOrb tests")
-    require(any("bash scripts/validate_phone_coder_workflows.sh" in step.get("run", "")
+    require(any(invokes(command_lines("Validate", step.get("run", "")), "bash scripts/validate_phone_coder_workflows.sh")
                 for item in jobs.values() for step in item["steps"]), "Validate must run workflow invariants")
+    require(any(invokes(command_lines("Validate", step.get("run", "")), "bash scripts/tests/test_validate_phone_coder_workflows.sh")
+                for item in jobs.values() for step in item["steps"]), "Validate must run workflow mutation regressions")
 except (KeyError, TypeError, ValueError, AttributeError):
     sys.exit("FAIL: missing or invalid workflow configuration")
 print("PASS: Phone Coder CI pins, test gates, unsigned packaging, metadata, and artifact allowlist")
