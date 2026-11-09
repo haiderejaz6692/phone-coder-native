@@ -1,5 +1,5 @@
 import XCTest
-@testable import OnDeviceLAS
+@testable import PhoneCoder
 
 final class LocalAPIServerTests: XCTestCase {
     private let onePixelPNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9WlK7nAAAAAASUVORK5CYII="

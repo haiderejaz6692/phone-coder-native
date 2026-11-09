@@ -3,6 +3,45 @@
 The top-level MIT license covers original iOS Local LLM code and documentation. It
 does not replace the licenses of the components below.
 
+## Phone Coder fork provenance
+
+Phone Coder adapts iOS Local LLM from
+<https://github.com/Mesutcydev/ios-local-llm.git>, pinned at
+`cc4e2d3f25dfe77e9ef9e629ee6ddc7e3134ac88`; see [UPSTREAM_BASELINE](UPSTREAM_BASELINE).
+The upstream notice remains unchanged in [LICENSE](LICENSE):
+
+> Copyright (c) 2026 Mesut and iOS Local LLM contributors
+
+The complete MIT permission and warranty notice in that file continues to
+apply to the inherited code and documentation. Phone Coder's original
+modifications are provided under the same MIT license.
+
+Adapted upstream files in the identity bootstrap:
+
+- `project.yml` — Phone Coder project, product, module, scheme, test target,
+  display name, bundle identifiers, and build-flavor condition.
+- `Podfile` — renamed project and target integration.
+- `IOSLocalLLM/Services/Bridge/LocalAPIServer.swift` — Phone Coder local API
+  credential namespace selected by build flavor.
+- `IOSLocalLLM/Services/Web/KeychainStore.swift` — Phone Coder web-tool
+  credential namespace selected by build flavor.
+- `IOSLocalLLM/Services/HFTokenStore.swift` — shared foreground/background
+  Hugging Face credential namespace selected by build flavor.
+- `IOSLocalLLMTests/LocalAPIServerTests.swift`,
+  `IOSLocalLLMTests/DeviceTierAdvisorTests.swift`,
+  `IOSLocalLLMTests/LASAppIdentityTests.swift`,
+  `IOSLocalLLMTests/Int64FormattedBytesTests.swift`, and
+  `IOSLocalLLMTests/URLSafetyValidatorTests.swift` — renamed app-module imports.
+- `README.md` and `THIRD_PARTY_NOTICES.md` — fork identity, build instructions,
+  and attribution.
+
+New files `IOSLocalLLM/PhoneCoder/App/PhoneCoderBuildManifest.swift` and
+`IOSLocalLLMTests/PhoneCoderAppIdentityTests.swift` record and verify this fork's
+identity. Runtime inference and policy behavior are unchanged by this step;
+the policy flavor is declared metadata, pending the later image-policy audit.
+The separately identified Core AI reference target keeps its upstream
+credential namespaces.
+
 ## Source included in this repository
 
 | Component | Location | License |

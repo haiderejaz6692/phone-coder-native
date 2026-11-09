@@ -16,7 +16,11 @@ public enum KeychainStore {
     /// of the app can use their own keychain space if they want one.
     // Keep this product's keychain namespace separate from the reference app.
     // A sideloaded clone must not read or overwrite the reference app's keys.
+    #if PHONE_CODER_APP
+    public static let service = "com.haider.phonecoder.webtool"
+    #else
     public static let service = "com.mesutcydev.ondevicelas.webtool"
+    #endif
 
     public static func set(
         _ value: String,

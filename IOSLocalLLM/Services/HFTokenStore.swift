@@ -2,13 +2,21 @@ import Foundation
 import Security
 import Combine
 
+enum HFTokenKeychainIdentity {
+    #if PHONE_CODER_APP
+    static let service = "com.haider.phonecoder.huggingface"
+    #else
+    static let service = "com.mesutcydev.ioslocalllm.huggingface"
+    #endif
+}
+
 // MARK: - HFTokenStore
 //
 // Keychain-backed store for the user's Hugging Face access token.
 // Used to authenticate downloads of gated repos (google/gemma-3-*,
 // meta-llama/*, mistralai/Ministral-*, etc.).
 //
-// Storage: Generic password under service "com.mesutcydev.ioslocalllm.huggingface".
+// Storage: Generic password under the build flavor's HFTokenKeychainIdentity.
 // Accessibility is `AfterFirstUnlockThisDeviceOnly` — survives reboots
 // but never leaves the device or syncs via iCloud Keychain. Encryption
 // is iOS Data Protection, tied to the user's passcode.
@@ -50,7 +58,7 @@ final class HFTokenStore: ObservableObject {
     //
     // Keep these stable — renaming would orphan tokens stored under
     // the old service name and force users to re-enter.
-    private let service = "com.mesutcydev.ioslocalllm.huggingface"
+    private let service = HFTokenKeychainIdentity.service
     private let account = "default-token"
 
     private init() {
@@ -250,7 +258,7 @@ final class HFTokenStore: ObservableObject {
 
         let query: [String: Any] = [
             kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: "com.mesutcydev.ioslocalllm.huggingface",
+            kSecAttrService as String: HFTokenKeychainIdentity.service,
             kSecAttrAccount as String: "default-token",
             kSecReturnData as String:  true,
             kSecMatchLimit as String:  kSecMatchLimitOne,

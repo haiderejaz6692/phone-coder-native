@@ -1,6 +1,6 @@
 import XCTest
-#if canImport(OnDeviceLAS)
-@testable import OnDeviceLAS
+#if canImport(PhoneCoder)
+@testable import PhoneCoder
 #else
 @testable import IOSLocalLLM
 #endif

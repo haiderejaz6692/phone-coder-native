@@ -1,6 +1,6 @@
-name: OnDeviceLAS
+name: PhoneCoder
 options:
-  bundleIdPrefix: com.mesutcydev.ondevicelas
+  bundleIdPrefix: com.haider.phonecoder
   deploymentTarget:
     iOS: "18.0"
   xcodeVersion: "26.0"
@@ -64,7 +64,7 @@ settings:
       VALIDATE_PRODUCT: YES
 
 targets:
-  OnDeviceLAS:
+  PhoneCoder:
     type: application
     platform: iOS
     deploymentTarget: "18.0"
@@ -154,7 +154,7 @@ targets:
     info:
       path: IOSLocalLLM/Info.plist
       properties:
-        CFBundleDisplayName: "On Device: LAS"
+        CFBundleDisplayName: "Phone Coder"
         # Source of truth for both targets' marketing version. xcodegen
         # writes these into the generated Info.plist files on every run,
         # so hand-edits to those plists get reverted next regen — always
@@ -164,7 +164,7 @@ targets:
         # Standard HTTPS only — answers the ASC export-compliance question
         # automatically so review submission doesn't stall on it.
         ITSAppUsesNonExemptEncryption: false
-        NSLocalNetworkUsageDescription: "On Device: LAS exposes your selected on-device language model to trusted computers on your local network."
+        NSLocalNetworkUsageDescription: "Phone Coder exposes your selected on-device language model to trusted computers on your local network."
         UIRequiresFullScreen: true
         UIStatusBarStyle: UIStatusBarStyleDarkContent
         UIViewControllerBasedStatusBarAppearance: false
@@ -180,7 +180,10 @@ targets:
         LSSupportsOpeningDocumentsInPlace: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ondevicelas
+        PRODUCT_BUNDLE_IDENTIFIER: com.haider.phonecoder
+        PRODUCT_NAME: "Phone Coder"
+        PRODUCT_MODULE_NAME: PhoneCoder
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) PHONE_CODER_APP"
         INFOPLIST_FILE: IOSLocalLLM/Info.plist
         CODE_SIGN_ENTITLEMENTS: IOSLocalLLM/IOSLocalLLM.entitlements
         CODE_SIGN_STYLE: Automatic
@@ -241,7 +244,7 @@ targets:
       # libllama + libggml with Metal backend.
       - framework: ThirdParty/llama.cpp/build-apple/llama.xcframework
         embed: true
-  OnDeviceLASTests:
+  PhoneCoderTests:
     type: bundle.unit-test
     platform: iOS
     deploymentTarget: "18.0"
@@ -251,11 +254,12 @@ targets:
       - path: IOSLocalLLMTests/LASAppIdentityTests.swift
       - path: IOSLocalLLMTests/Int64FormattedBytesTests.swift
       - path: IOSLocalLLMTests/URLSafetyValidatorTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderAppIdentityTests.swift
     dependencies:
-      - target: OnDeviceLAS
+      - target: PhoneCoder
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.mesutcydev.ondevicelas.tests
+        PRODUCT_BUNDLE_IDENTIFIER: com.haider.phonecoder.tests
         INFOPLIST_FILE: ""   # auto-generate
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: "1"
@@ -276,7 +280,7 @@ targets:
   # Independent iOS 27/Core AI server product. This deliberately owns a
   # separate bundle and settings namespace while reusing the reference
   # dashboard/API source tree. CORE_AI_SERVER_APP switches only the inference
-  # boundary; the existing OnDeviceLAS target remains unchanged.
+  # boundary; the PhoneCoder target retains the upstream runtime boundary.
   CoreAIOnDeviceLAS:
     type: application
     platform: iOS
@@ -392,15 +396,15 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: ""
 
 schemes:
-  OnDeviceLAS:
+  PhoneCoder:
     build:
       targets:
-        OnDeviceLAS: all
-        OnDeviceLASTests: [test]
+        PhoneCoder: all
+        PhoneCoderTests: [test]
     test:
       config: Debug
       targets:
-        - OnDeviceLASTests
+        - PhoneCoderTests
     archive:
       config: Release
 

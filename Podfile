@@ -1,9 +1,9 @@
 platform :ios, '18.0'
 
-project 'OnDeviceLAS.xcodeproj'
+project 'PhoneCoder.xcodeproj'
 
-target 'OnDeviceLAS' do
-  target 'OnDeviceLASTests' do
+target 'PhoneCoder' do
+  target 'PhoneCoderTests' do
     inherit! :search_paths
   end
 end

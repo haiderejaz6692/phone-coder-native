@@ -64,7 +64,11 @@ enum LocalAPIKeyStore {
     static let account = "localAPI.bearerKey"
     // Use a second namespace inside the cloned app so its bearer token is
     // independent from both the reference app and any web-tool credentials.
+    #if PHONE_CODER_APP
+    static let keychainService = "com.haider.phonecoder.localapi"
+    #else
     static let keychainService = "com.mesutcydev.ondevicelas.localapi"
+    #endif
 
     static func key() -> String {
         if let existing = KeychainStore.get(

@@ -1,47 +1,36 @@
-# OnDevice LLM
+# Phone Coder
 
-**Run open-source LLMs on iPhone offline** — chat, vision, voice, RAG, and an
-authenticated local API. Built in SwiftUI with MLX, llama.cpp, whisper.cpp, and
-Core ML. Local chat works without an OnDevice account. See the
-[privacy policy](PRIVACY_POLICY.md) for optional network features.
+Phone Coder is an independent, owner-controlled iPhone fork of
+[iOS Local LLM](https://github.com/Mesutcydev/ios-local-llm), pinned to upstream
+commit `cc4e2d3f25dfe77e9ef9e629ee6ddc7e3134ac88`. See
+[UPSTREAM_BASELINE](UPSTREAM_BASELINE) for the source pin and
+[third-party notices](THIRD_PARTY_NOTICES.md) for attribution and adapted files.
 
-[![Validate](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/validate.yml/badge.svg)](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/validate.yml)
-[![CodeQL](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/codeql.yml/badge.svg)](https://github.com/Mesutcydev/ios-local-llm/actions/workflows/codeql.yml)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Mesutcydev/ios-local-llm/badge)](https://scorecard.dev/viewer/?uri=github.com/Mesutcydev/ios-local-llm)
-[![License: MIT](https://img.shields.io/badge/original%20code-MIT-2ea44f.svg)](LICENSE)
-[![Swift](https://img.shields.io/badge/Swift-5.10-F05138.svg)](https://www.swift.org/)
-[![Platform](https://img.shields.io/badge/platform-iOS%2018%2B%20%7C%20Mac%20Catalyst-blue.svg)](SETUP_INSTRUCTIONS.md)
-[![Website](https://img.shields.io/badge/website-ondevice.fun-0A66C2.svg)](https://ondevice.fun/local-ai-studio/)
+This bootstrap establishes the `PhoneCoder` app and scheme, `PhoneCoderTests`,
+display/product name **Phone Coder**, and bundle ID `com.haider.phonecoder`.
+The inherited runtime behavior is preserved here; the Phone Coder navigation
+shell and new server features are implemented in later tasks. The existing
+Core AI reference target remains separately identified.
 
-> Part of the **OnDevice** product line. Independent open-source project — not
-> affiliated with or endorsed by Apple Inc.
+`PhoneCoderBuildManifest.current` records API profile `phone-coder-api/1` and
+policy flavor `sideload-owner-controlled`. These are build declarations;
+the no-content-classifier runtime audit belongs to the later image-policy
+increment. This bootstrap does not claim that audit is complete.
 
-**OnDevice LLM** (this repo) is the main local-first AI workbench
-for iPhone and Apple silicon Macs. It runs language, vision, speech, and
-image-generation models on the device, and exposes opt-in OpenAI-, Anthropic-,
-and Ollama-compatible local APIs with structured tool calling and a paired Mac
-agent channel.
+Phone Coder uses separate Keychain services under `com.haider.phonecoder`
+for local API, web-tool, and Hugging Face credentials. Credentials from
+upstream builds are not migrated into this fork.
 
-| Product | Status | What it is |
-| --- | --- | --- |
-| [**OnDevice LLM**](https://ondevice.fun/local-ai-studio/) | App Store · open source | Full iOS/macCatalyst workbench (this repository) |
-| [**OnDevice Local API Server**](https://ondevice.fun/iphone-local-api/) | Sideload build | Dedicated local API surface for agents and LAN clients |
-| **OnDevice CoreAI Local API Server** | Beta | CoreAI-backed local API server variant |
+Original upstream code and documentation retain their [MIT license](LICENSE).
+Phone Coder is independent of the upstream OnDevice product line.
 
-Repository slug remains `ios-local-llm` for stable links. Product name is
-**OnDevice LLM** in this source tree. See the [app website](https://ondevice.fun/local-ai-studio/) for the current app.
+## Upstream reference
 
-The generated `OnDeviceLAS` target is the current server-only distribution of
-this source tree. It keeps local model loading, safety policy, and the
-authenticated API surface while omitting the assistant, lens, voice, and
-paired-Mac UI from the shipped app. The broader source catalog remains
-available for reuse and reference.
-
-[The App Store edition](https://apps.apple.com/app/id6770114399) is free on
-the App Store and requires iOS 18 or later. For the dedicated LAS build, see the
-[LAS download and setup guide](https://ondevice.fun/iphone-local-api/).
-
-[![OnDevice LLM specification chart](Docs/Images/ios-local-llm-spec-chart.png)](Docs/Images/ios-local-llm-spec-chart.svg)
+The material below describes inherited upstream capabilities and assets,
+including optional features outside Phone Coder's first release. Upstream
+OnDevice products and distribution links are reference material, not Phone
+Coder releases. Older setup guides use the upstream `OnDeviceLAS` identity;
+use `PhoneCoder` for this fork's workspace, target, and scheme.
 
 ## App screenshots
 
@@ -51,7 +40,7 @@ the App Store and requires iOS 18 or later. For the dedicated LAS build, see the
 | Models | Local vision onboarding |
 | <img src="Docs/Images/Screenshots/models.png" width="320" alt="Model discovery and management screen"> | <img src="Docs/Images/Screenshots/local-vision.png" width="320" alt="Local vision onboarding screen"> |
 
-These are unedited iPhone Simulator captures from the open-source source build.
+These are inherited iPhone Simulator captures from the upstream source build.
 They contain no user content, accounts, tokens, or model weights. Simulator UI
 validation does not substitute for physical-device thermal, memory, or
 performance evidence; see [validation policy](Docs/VALIDATION.md).
@@ -139,11 +128,11 @@ identifier.
 
 ## Build
 
-Clone the repository and its native dependencies:
+Clone the Phone Coder fork with its native dependencies. In an existing
+checkout, initialize the recorded submodules:
 
 ```bash
-git clone --recurse-submodules https://github.com/Mesutcydev/ios-local-llm.git
-cd ios-local-llm
+git submodule update --init --recursive
 ```
 
 Install project tools if needed:
@@ -167,18 +156,31 @@ Generate the Xcode project and install CocoaPods:
 ```bash
 xcodegen generate
 pod install
-open OnDeviceLAS.xcworkspace
+open PhoneCoder.xcworkspace
 ```
 
-Select the `OnDeviceLAS` scheme and an iOS Simulator. For a physical device,
+Select the `PhoneCoder` scheme and an iOS Simulator. For a physical device,
 change the bundle identifiers and select your own development team in Xcode.
 See [SETUP_INSTRUCTIONS.md](SETUP_INSTRUCTIONS.md) and
 [fork configuration](Docs/FORK_CONFIGURATION.md) for every identifier,
 capability, and optional model step.
 
+Run the focused identity tests on a macOS host after generating the project,
+installing pods, and building native dependencies:
+
+```bash
+xcodebuild test -workspace PhoneCoder.xcworkspace -scheme PhoneCoder \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:PhoneCoderTests/PhoneCoderAppIdentityTests
+```
+
+Run the full app suite by omitting `-only-testing`. Repository hygiene checks
+use `./scripts/validate_open_source.sh`. XcodeGen, CocoaPods, and iOS Simulator
+tests require macOS; Linux structural checks do not establish iOS build success.
+
 ## Releases
 
-Official releases are source-only. Starting with `v3.2.6`, each release
+Upstream official releases are source-only. Starting with `v3.2.6`, each release
 includes a reproducible source archive, SHA-256 checksum, and GitHub/Sigstore
 provenance attestation. See
 [release verification](Docs/RELEASE_VERIFICATION.md) for the exact download
