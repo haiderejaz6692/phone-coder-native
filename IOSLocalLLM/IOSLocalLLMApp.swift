@@ -2,43 +2,30 @@ import SwiftUI
 import UIKit
 
 @main
-struct OnDeviceLASApp: App {
-    @UIApplicationDelegateAdaptor(LASAppDelegate.self) private var appDelegate
-    @ObservedObject private var settings = AppSettings.shared
+struct PhoneCoderApp: App {
+    @UIApplicationDelegateAdaptor(PhoneCoderAppDelegate.self) private var appDelegate
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
-            ZStack {
-                // Shared ambient sample field so clear Liquid Glass has live
-                // pixels to refract (transparent-glass pattern).
-                LiquidPinkBackdrop()
-
-                Group {
-                    if settings.hasSeenOnboarding {
-                        LocalAPIServerView()
-                            .transition(.opacity)
-                    } else {
-                        LASOnboardingView()
-                            .transition(.opacity)
-                    }
-                }
-            }
-            .lasTheme()
+            PhoneCoderRootView()
         }
         .onChange(of: scenePhase) { _, newPhase in
-            LASLifecycleController.shared.handle(newPhase)
+            PhoneCoderLifecycleController.shared.handle(newPhase)
         }
     }
 }
 
-final class LASAppDelegate: NSObject, UIApplicationDelegate {
+@MainActor
+final class PhoneCoderAppDelegate: NSObject, UIApplicationDelegate {
     func application(
         _ application: UIApplication,
         didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
     ) -> Bool {
         CrashReporter.shared.install()
-        Diagnostics.shared.breadcrumb("On Device: LAS launch", category: "lifecycle")
+        Diagnostics.shared.breadcrumb(PhoneCoderBuildManifest.current.productName + " launch", category: "lifecycle")
+        _ = DeviceSafetyMonitor.shared
+        MemoryPressureCoordinator.shared.start()
         return true
     }
 
@@ -63,15 +50,11 @@ final class LASAppDelegate: NSObject, UIApplicationDelegate {
     }
 }
 
-/// Lifecycle policy for the server-only product.
-///
-/// The listener is deliberately stopped when the app backgrounds. This keeps
-/// the local API opt-in and matches iOS's foreground execution boundary. Any
-/// resident model is drained before the process gives the system its memory
-/// back; the user can load the selected model again after returning.
+/// Retains the upstream crash tracking and background memory cleanup.
+/// Foregrounding this shell does not start a listener or load a model.
 @MainActor
-final class LASLifecycleController {
-    static let shared = LASLifecycleController()
+final class PhoneCoderLifecycleController {
+    static let shared = PhoneCoderLifecycleController()
 
     private var epoch: UInt64 = 0
 
@@ -90,15 +73,6 @@ final class LASLifecycleController {
         switch phase {
         case .active:
             CrashReporter.shared.markRunning()
-            guard AppSettings.shared.hasSeenOnboarding else { return }
-            if AppSettings.shared.localAPIEnabled {
-                await LocalAPIManager.shared.start()
-            }
-            guard epoch == self.epoch else { return }
-            if AppSettings.shared.localAPIAutoLoadModel {
-                CodingAssistantService.shared.startLoad()
-            }
-            guard epoch == self.epoch else { return }
         case .background:
             // Clear the crash marker before the first suspension point. iOS
             // may suspend or terminate a backgrounded process while an

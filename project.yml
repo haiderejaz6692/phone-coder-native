@@ -95,9 +95,9 @@ targets:
           - "**/*.pkg"
           - "Resources/BundledVLM/**"
           - "Resources/BundledVoiceModels/**"
-          # This product has one screen: the authenticated local API server.
-          # Keep the inference and safety services above it, but do not compile
-          # the assistant, lens, voice, settings, or bridge UI surfaces.
+          # Phone Coder owns the native five-tab shell under PhoneCoder/App.
+          # Retain the inference and safety services, while keeping the legacy
+          # assistant, lens, voice, settings, and bridge UI surfaces excluded.
           - "**/Views/**"
           - "**/ViewModels/**"
           - "**/TipsManager.swift"
@@ -255,6 +255,7 @@ targets:
       - path: IOSLocalLLMTests/Int64FormattedBytesTests.swift
       - path: IOSLocalLLMTests/URLSafetyValidatorTests.swift
       - path: IOSLocalLLMTests/PhoneCoderAppIdentityTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderRootNavigationTests.swift
     dependencies:
       - target: PhoneCoder
     settings:
