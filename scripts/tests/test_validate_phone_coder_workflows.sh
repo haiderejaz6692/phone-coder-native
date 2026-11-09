@@ -27,6 +27,17 @@ mutations = [
     ("printed IPA verifier", "package", "bash scripts/verify_unsigned_ipa.sh", "printf '%s\\n' 'bash scripts/verify_unsigned_ipa.sh'"),
     ("multiline quoted test text", "repository-tests", "swift test --package-path Packages/VoiceAgentOrb", "printf '%s\\n' 'example:\nswift test --package-path Packages/VoiceAgentOrb\n'"),
     ("heredoc verifier text", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<'EXAMPLE'\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
+    ("space-padded false heredoc delimiter", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<'EXAMPLE'\n EXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
+    ("trailing-space false heredoc delimiter", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<'EXAMPLE'\nEXAMPLE \nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
+    ("tab-padded ordinary heredoc delimiter", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<'EXAMPLE'\n\tEXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
+    ("space-padded false tab-stripping delimiter", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<-'EXAMPLE'\n EXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
+    ("trailing-space false tab-stripping delimiter", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<-'EXAMPLE'\n\tEXAMPLE \nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
+    ("unspaced failure-swallowing true", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', 'bash scripts/verify_unsigned_ipa.sh "$ipa" ||true'),
+    ("unspaced failure-swallowing colon", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', 'bash scripts/verify_unsigned_ipa.sh "$ipa"||:'),
+    ("unspaced background success", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', 'bash scripts/verify_unsigned_ipa.sh "$ipa"&true'),
+]
+positive_mutations = [
+    ("tab-stripping heredoc with a real verifier after its terminator", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<-'EXAMPLE'\n\tprinted example\n\tEXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\""),
 ]
 failures = []
 with tempfile.TemporaryDirectory() as temporary:
@@ -46,12 +57,23 @@ with tempfile.TemporaryDirectory() as temporary:
     for name, step_id, command, replacement in mutations:
         changed = copy.deepcopy(original)
         replace_command(changed, step_id, command, replacement)
+        script = next(step["run"] for step in changed["jobs"]["phone-coder-ios"]["steps"] if step["id"] == step_id)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
         result = validate(changed)
         if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
             failures.append(name)
             print(f"FAIL: accepted {name}")
         else:
             print(f"PASS: rejects {name}")
+    for name, step_id, command, replacement in positive_mutations:
+        changed = copy.deepcopy(original)
+        replace_command(changed, step_id, command, replacement)
+        result = validate(changed)
+        if result.returncode != 0:
+            failures.append(name)
+            print(f"FAIL: rejected {name}")
+        else:
+            print(f"PASS: accepts {name}")
 if failures:
     sys.exit(1)
 print("All workflow command mutation regressions passed.")

@@ -93,24 +93,38 @@ try:
         pending = ""
         heredoc = None
         value = script(step_id) if content is None else content
-        for line in value.replace("\\\n", "").splitlines():
+        for line in value.split("\n"):
             if heredoc is not None:
-                if line.strip() == heredoc:
+                delimiter, strip_tabs = heredoc
+                candidate = line.lstrip("\t") if strip_tabs else line
+                if candidate == delimiter:
                     heredoc = None
+                continue
+            if line.endswith("\\"):
+                pending += line[:-1]
                 continue
             pending += line + "\n"
             try:
-                words = shlex.split(pending, comments=True, posix=True)
+                # Shell operators do not require surrounding whitespace.
+                lexer = shlex.shlex(pending, posix=True, punctuation_chars=";&|")
+                lexer.whitespace_split = True
+                words = list(lexer)
             except ValueError:
                 # A quoted print argument may span several physical lines.
                 continue
+            logical_line = pending
             pending = ""
             if not words:
                 continue
             for word in words:
                 if word.startswith("<<"):
-                    heredoc = word[2:].lstrip("-")
-                    require(bool(heredoc), f"{step_id} needs a literal inline heredoc delimiter")
+                    # Only the reviewed literal, inline delimiter form is
+                    # supported. Read <<- from source, before quote removal,
+                    # so a delimiter's quoted hyphen cannot masquerade as it.
+                    match = re.search(r'''(?:^|[ \t])<<(-?)(['"]?)([A-Za-z_][A-Za-z_0-9]*)\2[ \t]*(?:\#.*)?\n$''', logical_line)
+                    require(match is not None and heredoc is None,
+                            f"{step_id} needs one literal inline heredoc delimiter")
+                    heredoc = (match[3], match[1] == "-")
             commands.append(words)
         require(not pending and heredoc is None, f"{step_id} has an unterminated quote or heredoc")
         return commands
@@ -122,7 +136,7 @@ try:
             while words and re.match(r"^[A-Za-z_][A-Za-z_0-9]*=", words[0]):
                 words = words[1:]
             if (words[:len(prefix)] == prefix and all(argument in words for argument in arguments)
-                    and not any(operator in words for operator in ("&&", "||", ";", "|"))):
+                    and not any(re.fullmatch(r"[;&|]+", word) for word in words)):
                 return True
         return False
 
