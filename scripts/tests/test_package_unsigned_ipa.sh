@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import plistlib
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -65,6 +66,39 @@ def raw_zip(app, output, transform=None, extra=None):
             info.create_system = 3
             info.external_attr = mode << 16
             archive.writestr(info, data)
+
+def thin_macho(bits=64, order="<", signing_command=None, signature_blob=True):
+    # Independently encoded Mach-O header, UUID command and optional signature.
+    # These are structural fixtures, not runnable machine code.
+    header_size = 32 if bits == 64 else 28
+    uuid = struct.pack(order + "II", 0x1b, 24) + bytes(range(16))
+    blob = struct.pack(">III", 0xfade0cc0, 12, 0) if signature_blob and signing_command else b""
+    commands = uuid
+    if signing_command is not None:
+        commands += struct.pack(order + "IIII", signing_command, 16, header_size + 40, len(blob))
+    header = struct.pack(order + "IIIIIII", 0xfeedfacf if bits == 64 else 0xfeedface,
+                         0x0100000c if bits == 64 else 12, 0, 2,
+                         2 if signing_command is not None else 1, len(commands), 0)
+    if bits == 64:
+        header += struct.pack(order + "I", 0)
+    return header + commands + blob
+
+def universal_macho(slices, bits=32, order=">"):
+    # Two independently aligned architecture slices; exercise all fat formats.
+    offset = 256
+    records, payload = [], b""
+    for index, data in enumerate(slices):
+        cpu = 0x0100000c if index == 0 else 0x01000007
+        record = (struct.pack(order + "IIQQII", cpu, 0, offset, len(data), 8, 0)
+                  if bits == 64 else struct.pack(order + "IIIII", cpu, 0, offset, len(data), 8))
+        records.append(record)
+        payload += data
+        padding = (-len(data)) % 256
+        payload += b"\x00" * padding
+        offset += len(data) + padding
+    header = struct.pack(order + "II", 0xcafebabf if bits == 64 else 0xcafebabe, len(slices))
+    table = header + b"".join(records)
+    return table + b"\x00" * (256 - len(table)) + payload
 
 try:
     check(package.is_file(), "packaging script does not exist")
@@ -124,6 +158,7 @@ try:
             "BundledVLM/data", "BundledVoiceModels/data", ".env", ".env.production",
             "credentials.json", "secrets.json", "AuthKey.p8", "identity.p12",
             "key.pem", "key.key", ".git/config", ".DS_Store", "debug.dSYM/data",
+            "credential\u017f.json", "weights.\u017fafetensors",
         ]
         for index, name in enumerate(forbidden):
             dirty = app_fixture(temp / f"forbidden-{index}")
@@ -152,6 +187,75 @@ try:
             raw_zip(dirty, output)
             reject(run(verify, output), "credential content")
         print("PASS: credential content is rejected without exposing values")
+
+        # ZIP can preserve both spellings even when an Apple filesystem would
+        # map them to the same path. Test member and ancestor collision keys.
+        for label, descendant in [("members", ""), ("file-parent", "/child"),
+                                  ("directory-parent", "/child/")]:
+            output = temp / f"unicode-{label}.ipa"
+            raw_zip(app, output,
+                    lambda name: name.replace("Assets.car", "Caf\u00e9"),
+                    ("Payload/Phone Coder.app/cafe\u0301" + descendant,
+                     b"" if descendant.endswith("/") else b"collision",
+                     (stat.S_IFDIR | 0o755) if descendant.endswith("/") else (stat.S_IFREG | 0o644)))
+            reject(run(verify, output), "NFC/NFD " + label + " collision")
+        print("PASS: Unicode-equivalent entries and file/parent paths fail closed")
+
+        signed_machos = []
+        for bits in [32, 64]:
+            for order, endian_name in [("<", "le"), (">", "be")]:
+                label = f"{bits}-{endian_name}"
+                unsigned_thin = thin_macho(bits, order)
+                unsigned_fat = universal_macho([unsigned_thin, thin_macho()], bits, order)
+                clean = app_fixture(temp / ("unsigned-macho-" + label))
+                (clean / "Phone Coder").write_bytes(unsigned_thin)
+                (clean / "Frameworks/llama.framework/llama").write_bytes(unsigned_fat)
+                output = temp / ("unsigned-macho-" + label + ".ipa")
+                raw_zip(clean, output)
+                success(run(verify, output))
+                success(run(package, clean, temp / ("unsigned-macho-packaged-" + label + ".ipa")))
+                signed_machos.append(("thin-" + label, thin_macho(bits, order, 0x1d)))
+                signed_machos.append(("fat-second-slice-" + label,
+                                      universal_macho([unsigned_thin, thin_macho(64, "<", 0x1d)],
+                                                      bits, order)))
+        signed_machos += [
+            ("command-without-blob", thin_macho(signing_command=0x1d, signature_blob=False)),
+            ("dylib-code-sign-drs", thin_macho(signing_command=0x2b)),
+            ("orphan-superblob", thin_macho() + struct.pack(">III", 0xfade0cc0, 12, 0)),
+            ("orphan-old-blob", thin_macho() + struct.pack(">II", 0xfade0b02, 8)),
+        ]
+        # A signature header crossing the content scanner's read boundary must
+        # still be rejected after a removed signing command.
+        unsigned = thin_macho()
+        signed_machos.append(("boundary-superblob", unsigned + b"\x00" * (1024 * 1024 - 5 - len(unsigned))
+                              + struct.pack(">III", 0xfade0cc0, 12, 0)))
+        members = ["Phone Coder", "Frameworks/llama.framework/llama", "Resources/opaque.dat"]
+        for index, (label, data) in enumerate(signed_machos):
+            dirty = app_fixture(temp / ("signed-macho-" + label))
+            member = dirty / members[index % len(members)]
+            member.parent.mkdir(parents=True, exist_ok=True)
+            member.write_bytes(data)
+            output = temp / ("signed-macho-" + label + ".ipa")
+            raw_zip(dirty, output)
+            reject(run(verify, output), "embedded Mach-O signature: " + label)
+            packaged = temp / ("signed-macho-packaged-" + label + ".ipa")
+            reject(run(package, dirty, packaged), "packaged embedded Mach-O signature: " + label)
+            check(not packaged.exists() and not Path(str(packaged) + ".sha256").exists(),
+                  "published signed Mach-O: " + label)
+        print("PASS: unsigned Mach-O formats accepted; embedded signing commands/blobs rejected in every member and universal slice")
+
+        malformed_machos = [
+            ("truncated-thin", b"\xcf\xfa\xed\xfe"),
+            ("truncated-fat", b"\xca\xfe\xba\xbe\x00\x00\x00\x02"),
+            ("zero-command-size", struct.pack("<IIIIIIIIII", 0xfeedfacf, 0, 0, 2, 1, 8, 0, 0, 0x1b, 0)),
+            ("hidden-command", struct.pack("<IIIIIIIIII", 0xfeedfacf, 0, 0, 2, 0, 8, 0, 0, 0x1b, 8)),
+            ("slice-out-of-range", struct.pack(">IIIIIII", 0xcafebabe, 1, 0, 0, 4096, 32, 0)),
+        ]
+        for label, data in malformed_machos:
+            output = temp / ("malformed-macho-" + label + ".ipa")
+            raw_zip(app, output, extra=("Payload/Phone Coder.app/opaque.dat", data, stat.S_IFREG | 0o644))
+            reject(run(verify, output), "malformed Mach-O: " + label)
+        print("PASS: malformed Mach-O headers, load commands and universal slice bounds fail closed")
 
         for missing in ["Info.plist", "Phone Coder"]:
             dirty = app_fixture(temp / ("missing-" + missing))
