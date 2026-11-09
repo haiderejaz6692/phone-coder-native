@@ -128,7 +128,7 @@ struct LASModelDownloadsView: View {
             LASHFTokenSettingsView()
         }
         .sheet(isPresented: $showDocumentsImporter) {
-            LocalModelDocumentsImportSheet(appDocumentsName: "On Device: LAS") { url in
+            LocalModelDocumentsImportSheet(appDocumentsName: "Phone Coder") { url in
                 showDocumentsImporter = false
                 Task { await importModel(at: url) }
             }
@@ -484,7 +484,7 @@ private struct LASHubModelRow: View {
         guard category == .assistant || category == .vlm else {
             ToastCenter.shared.info(
                 "Unsupported runtime",
-                detail: "This LAS build currently serves language and vision models."
+                detail: "This Phone Coder build currently serves language and vision models."
             )
             return
         }
@@ -543,7 +543,7 @@ private struct LASModelLibraryCard: View {
 
             Text(appDocumentsPreferred
                  ? "Sideload build: Files folder-picking is unavailable here — use App Documents."
-                 : "Files → On My iPhone → On Device: LAS")
+                 : "Files → On My iPhone → Phone Coder")
                 .font(.caption.monospaced())
                 .foregroundStyle(.secondary)
 

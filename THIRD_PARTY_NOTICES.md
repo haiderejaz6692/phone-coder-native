@@ -27,6 +27,9 @@ Adapted upstream files in the identity bootstrap:
   credential namespace selected by build flavor.
 - `IOSLocalLLM/Services/HFTokenStore.swift` — shared foreground/background
   Hugging Face credential namespace selected by build flavor.
+- `IOSLocalLLM/ContentView.swift`, `IOSLocalLLM/LASOnboardingView.swift`, and
+  `IOSLocalLLM/ModelDownloadsView.swift` — visible Phone Coder product name,
+  setup-sharing copy, and Files model-import folder instructions.
 - `IOSLocalLLMTests/LocalAPIServerTests.swift`,
   `IOSLocalLLMTests/DeviceTierAdvisorTests.swift`,
   `IOSLocalLLMTests/LASAppIdentityTests.swift`,

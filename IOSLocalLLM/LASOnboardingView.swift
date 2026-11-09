@@ -43,7 +43,7 @@ struct LASOnboardingView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
 
             VStack(alignment: .leading, spacing: 2) {
-                Text("On Device : LAS")
+                Text("Phone Coder")
                     .font(.headline.weight(.semibold))
                 Text("LOCAL API SERVER")
                     .font(.caption2.weight(.bold).monospaced())
@@ -93,7 +93,7 @@ struct LASOnboardingView: View {
                 }
             } label: {
                 HStack {
-                    Text(isLastPage ? "Enter LAS" : "Next")
+                    Text(isLastPage ? "Enter Phone Coder" : "Next")
                     Spacer()
                     Image(systemName: isLastPage ? "arrow.right.circle.fill" : "arrow.right")
                 }
@@ -251,7 +251,7 @@ private struct LASOnboardingPage: Identifiable {
             id: 2,
             caption: "CLIENT COMPATIBILITY",
             title: "One server.\nFamiliar APIs.",
-            body: "Connect agent tools and local clients through OpenAI, Anthropic, and Ollama-compatible routes. Share setup commands directly from LAS.",
+            body: "Connect agent tools and local clients through OpenAI, Anthropic, and Ollama-compatible routes. Share setup commands directly from Phone Coder.",
             symbol: "point.3.connected.trianglepath.dotted",
             usesLogo: false,
             rows: [

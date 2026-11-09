@@ -260,6 +260,8 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.haider.phonecoder.tests
+        # XcodeGen's default uses the target name; the product contains a space.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Phone Coder.app/Phone Coder"
         INFOPLIST_FILE: ""   # auto-generate
         CODE_SIGN_STYLE: Automatic
         TARGETED_DEVICE_FAMILY: "1"

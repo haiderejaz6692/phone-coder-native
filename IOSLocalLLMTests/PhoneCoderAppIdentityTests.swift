@@ -25,6 +25,11 @@ final class PhoneCoderAppIdentityTests: XCTestCase {
         XCTAssertEqual(PhoneCoderBuildManifest.current.policyFlavor, "sideload-owner-controlled")
     }
 
+    func testHostedTestsRunInPhoneCoderProduct() {
+        XCTAssertEqual(Bundle.main.bundleURL.lastPathComponent, "Phone Coder.app")
+        XCTAssertEqual(Bundle.main.executableURL?.lastPathComponent, "Phone Coder")
+    }
+
     func testCredentialStoresUsePhoneCoderNamespaces() {
         XCTAssertEqual(LocalAPIKeyStore.keychainService, "com.haider.phonecoder.localapi")
         XCTAssertEqual(KeychainStore.service, "com.haider.phonecoder.webtool")

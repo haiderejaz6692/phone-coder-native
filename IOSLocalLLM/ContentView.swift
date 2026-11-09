@@ -272,7 +272,7 @@ struct LocalAPIServerView: View {
 private struct LASHomeHeader: View {
     var body: some View {
         HStack(spacing: LASDesignTokens.row) {
-            Text("On Device : LAS")
+            Text("Phone Coder")
                 .font(.title3.weight(.bold))
                 .lineLimit(1)
 
@@ -1100,7 +1100,7 @@ private struct LASHomeServerCard: View {
     private var setupShareButton: some View {
         ShareLink(
             item: setupCommandsWithAPIKey,
-            subject: Text("On Device LAS setup commands")
+            subject: Text("Phone Coder setup commands")
         ) {
             Label("Share setup", systemImage: "square.and.arrow.up")
         }
