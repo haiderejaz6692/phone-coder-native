@@ -17,6 +17,17 @@ jobs:
       - name: Validate repository contents
         run: ./scripts/validate_open_source.sh
 
+  phone-coder-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Validate Phone Coder workflow invariants
+        shell: bash
+        run: |
+          python3 -m venv "$RUNNER_TEMP/workflow-tools"
+          "$RUNNER_TEMP/workflow-tools/bin/python3" -m pip install PyYAML==6.0.3
+          PATH="$RUNNER_TEMP/workflow-tools/bin:$PATH" bash scripts/validate_phone_coder_workflows.sh
+
   voice-orb:
     runs-on: macos-15
     steps:

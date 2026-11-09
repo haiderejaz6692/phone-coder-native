@@ -161,6 +161,8 @@ retired_brand_matches="$(
     . \
     ':!ThirdParty/**' \
     ':!Pods/**' \
+    ':!docs/superpowers/specs/**' \
+    ':!docs/superpowers/plans/**' \
     ':!scripts/validate_open_source.sh' \
     ':!*.pbxproj' || true
 )"

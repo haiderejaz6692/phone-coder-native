@@ -1,0 +1,198 @@
+name: phone-coder-ios
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: phone-coder-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  phone-coder-ios:
+    # GitHub refreshes this OS image; record ImageVersion below. Never select
+    # a floating Xcode default: require this exact version and build instead.
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
+      CODE_SIGNING_ALLOWED: 'NO'
+      POLICY_FLAVOR: sideload-owner-controlled
+      API_PROFILE: phone-coder-api/1
+    steps:
+      - name: Checkout source and pinned submodules
+        id: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Check toolchain and install workflow tools
+        id: tools
+        run: |
+          set -euo pipefail
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+          test "$(xcodebuild -version)" = $'Xcode 26.0.1\nBuild version 17A400'
+          if ! command -v xcodegen >/dev/null; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
+          fi
+          xcodegen --version
+          pod --version
+          cmake --version
+          python3 -m venv "$RUNNER_TEMP/workflow-tools"
+          "$RUNNER_TEMP/workflow-tools/bin/python3" -m pip install PyYAML==6.0.3
+          echo "$RUNNER_TEMP/workflow-tools/bin" >> "$GITHUB_PATH"
+
+      - name: Run repository and script regression tests
+        id: repository-tests
+        run: |
+          set -euo pipefail
+          bash scripts/validate_open_source.sh
+          bash scripts/validate_phone_coder_workflows.sh
+          bash scripts/tests/test_validate_open_source.sh
+          bash scripts/tests/test_build_native_frameworks.sh
+          bash scripts/tests/test_package_unsigned_ipa.sh
+          swift test --package-path Packages/VoiceAgentOrb
+
+      - name: Build only the release-one native framework
+        id: native
+        run: |
+          set -euo pipefail
+          df -h
+          trap 'df -h' EXIT
+          bash scripts/build_native_frameworks.sh --llama-only
+          df -h
+
+      - name: Generate workspace and resolve locked dependencies
+        id: dependencies
+        run: |
+          set -euo pipefail
+          xcodegen generate
+          pod install
+          # Renaming the project must not silently resolve a new SwiftPM graph.
+          mkdir -p PhoneCoder.xcworkspace/xcshareddata/swiftpm
+          cp OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+            PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          xcodebuild -resolvePackageDependencies \
+            -workspace PhoneCoder.xcworkspace -scheme PhoneCoder \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-SourcePackages" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Test PhoneCoder on the pinned simulator
+        id: unit-tests
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -workspace PhoneCoder.xcworkspace -scheme PhoneCoder \
+            -configuration Debug \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1' \
+            -derivedDataPath "$RUNNER_TEMP/PhoneCoder-TestDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-SourcePackages" \
+            -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
+            -resultBundlePath "$RUNNER_TEMP/PhoneCoderTests.xcresult" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Archive PhoneCoder without signing
+        id: archive
+        run: |
+          set -euo pipefail
+          # Discard simulator intermediates before a separate device build.
+          # Retain the locked source packages, not a remotely restored cache.
+          rm -rf "$RUNNER_TEMP/PhoneCoder-TestDerivedData"
+          df -h
+          xcodebuild archive \
+            -workspace PhoneCoder.xcworkspace -scheme PhoneCoder \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/PhoneCoder-ArchiveDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-SourcePackages" \
+            -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
+            -archivePath "$RUNNER_TEMP/PhoneCoder.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=''
+          df -h
+
+      - name: Package and independently verify unsigned IPA and checksum
+        id: package
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/phone-coder-artifacts"
+          ipa="$RUNNER_TEMP/phone-coder-artifacts/phone-coder-unsigned-${GITHUB_SHA}.ipa"
+          bash scripts/package_unsigned_ipa.sh "$RUNNER_TEMP/PhoneCoder.xcarchive" "$ipa"
+          bash scripts/verify_unsigned_ipa.sh "$ipa"
+          (cd "$RUNNER_TEMP/phone-coder-artifacts" && shasum -a 256 -c "${ipa##*/}.sha256")
+
+      - name: Record auditable build metadata
+        id: metadata
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          def output(*args):
+              return subprocess.check_output(args, text=True).strip()
+
+          locks = [
+              "Podfile.lock",
+              "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+              "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+              "Packages/coreai-models/Package.resolved",
+              "project.yml",
+              ".gitmodules",
+          ]
+          metadata = {
+              "source_sha": os.environ["GITHUB_SHA"],
+              "checked_out_sha": output("git", "rev-parse", "HEAD"),
+              "xcode_version": output("xcodebuild", "-version"),
+              "runner_os": output("sw_vers", "-productVersion"),
+              "runner_image": os.environ.get("ImageOS"),
+              "runner_image_version": os.environ.get("ImageVersion"),
+              "dependency_lock_hashes": {
+                  name: hashlib.sha256(Path(name).read_bytes()).hexdigest()
+                  for name in locks
+              },
+              "submodule_commits": {
+                  name: output("git", "rev-parse", f"HEAD:{name}")
+                  for name in ("ThirdParty/llama.cpp", "ThirdParty/whisper.cpp")
+              },
+              "policy_flavor": os.environ["POLICY_FLAVOR"],
+              "api_profile": os.environ["API_PROFILE"],
+              "unsigned": True,
+              "native_components": ["llama.cpp"],
+              "tools": {
+                  "xcodegen": output("xcodegen", "--version"),
+                  "cocoapods": output("pod", "--version"),
+              },
+          }
+          assert metadata["checked_out_sha"] == metadata["source_sha"], "source SHA mismatch"
+          destination = Path(os.environ["RUNNER_TEMP"]) / "phone-coder-artifacts/build-metadata.json"
+          destination.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload verified unsigned build outputs
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: phone-coder-unsigned-${{ github.sha }}
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 14
+          path: |
+            ${{ runner.temp }}/phone-coder-artifacts/phone-coder-unsigned-${{ github.sha }}.ipa
+            ${{ runner.temp }}/phone-coder-artifacts/phone-coder-unsigned-${{ github.sha }}.ipa.sha256
+            ${{ runner.temp }}/phone-coder-artifacts/build-metadata.json
+            ${{ runner.temp }}/PhoneCoderTests.xcresult
