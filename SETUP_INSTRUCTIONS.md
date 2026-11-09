@@ -41,7 +41,27 @@ root script builds the native slices from pinned submodules:
 ./scripts/build_native_frameworks.sh
 ```
 
+For a llama-only build, initialize and build only the pinned llama.cpp submodule:
+
+```bash
+./scripts/build_native_frameworks.sh --llama-only
+```
+
+This mode skips whisper.cpp initialization, existing-artifact checks, and builds.
+The no-argument command retains the upstream behavior of building both llama.cpp
+and whisper.cpp. It initializes all recorded submodules recursively.
+
 Add `--with-catalyst` when you also need the Apple-Silicon Mac Catalyst target.
+Flags can appear in either order; for example:
+
+```bash
+./scripts/build_native_frameworks.sh --llama-only --with-catalyst
+```
+
+Use `--help` for usage without initializing submodules or building. Unknown
+arguments exit with status 64. The script reports repository disk usage before
+and after a successful native build for CI diagnostics.
+
 The script may apply the tracked iOS-only patch inside the generated
 llama.cpp build checkout; do not commit that submodule worktree change.
 
@@ -52,7 +72,9 @@ ThirdParty/llama.cpp/build-apple/llama.xcframework
 ThirdParty/whisper.cpp/build-apple/whisper.xcframework
 ```
 
-These outputs are generated files and must not be committed.
+The llama-only command produces only the first output. These outputs and native
+build directories are ignored by Git and must not be committed. Remove an
+existing generated XCFramework before rebuilding that component.
 
 ## Generate the workspace
 
@@ -125,6 +147,17 @@ project, and shared package resolution files. Do not commit `Pods`,
 frameworks.
 
 ## Tests
+
+Run the native-build orchestration regression tests on Linux or macOS:
+
+```bash
+bash -n scripts/build_native_frameworks.sh
+bash scripts/tests/test_build_native_frameworks.sh
+```
+
+These tests use disposable repositories and stubbed native builders; they do
+not compile frameworks or require Xcode. Real framework builds require the Mac
+prerequisites above.
 
 Run the standalone voice-orb package tests:
 
