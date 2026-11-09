@@ -35,9 +35,12 @@ mutations = [
     ("unspaced failure-swallowing true", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', 'bash scripts/verify_unsigned_ipa.sh "$ipa" ||true'),
     ("unspaced failure-swallowing colon", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', 'bash scripts/verify_unsigned_ipa.sh "$ipa"||:'),
     ("unspaced background success", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', 'bash scripts/verify_unsigned_ipa.sh "$ipa"&true'),
+    ("unquoted heredoc continuation hides verifier", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<EXAMPLE\nnot-end\\\nEXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
+    ("unquoted tab-stripping continuation hides verifier", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<-EXAMPLE\nnot-end\\\n\tEXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
 ]
 positive_mutations = [
     ("tab-stripping heredoc with a real verifier after its terminator", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<-'EXAMPLE'\n\tprinted example\n\tEXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\""),
+    ("quoted heredoc preserves a literal backslash before its terminator", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<'EXAMPLE'\nnot-end\\\nEXAMPLE\nbash scripts/verify_unsigned_ipa.sh \"$ipa\""),
 ]
 failures = []
 with tempfile.TemporaryDirectory() as temporary:

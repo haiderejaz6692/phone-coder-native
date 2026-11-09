@@ -118,12 +118,14 @@ try:
                 continue
             for word in words:
                 if word.startswith("<<"):
-                    # Only the reviewed literal, inline delimiter form is
-                    # supported. Read <<- from source, before quote removal,
+                    # Only quoted literal inline delimiters are supported;
+                    # unquoted bodies have expansion/continuation semantics
+                    # beyond this conservative checker. Read <<- from source,
+                    # before quote removal,
                     # so a delimiter's quoted hyphen cannot masquerade as it.
-                    match = re.search(r'''(?:^|[ \t])<<(-?)(['"]?)([A-Za-z_][A-Za-z_0-9]*)\2[ \t]*(?:\#.*)?\n$''', logical_line)
+                    match = re.search(r'''(?:^|[ \t])<<(-?)(['"])([A-Za-z_][A-Za-z_0-9]*)\2[ \t]*(?:\#.*)?\n$''', logical_line)
                     require(match is not None and heredoc is None,
-                            f"{step_id} needs one literal inline heredoc delimiter")
+                            f"{step_id} needs one quoted literal inline heredoc delimiter")
                     heredoc = (match[3], match[1] == "-")
             commands.append(words)
         require(not pending and heredoc is None, f"{step_id} has an unterminated quote or heredoc")
