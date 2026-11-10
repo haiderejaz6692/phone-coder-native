@@ -35,4 +35,5 @@ actor PhoneCoderPairingExchange {
         guard await approval(normalized) else { return nil }
         return try await store.create(name: normalized)
     }
+    func invalidate(token: String) { tokens.removeValue(forKey: token) }
 }

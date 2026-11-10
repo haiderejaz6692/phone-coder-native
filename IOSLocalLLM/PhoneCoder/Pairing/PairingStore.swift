@@ -57,6 +57,11 @@ enum PhoneCoderSecret {
     }
 }
 
+struct PhoneCoderClientSummary: Identifiable, Equatable, Sendable {
+    let id: UUID
+    let name: String
+}
+
 actor PhoneCoderPairingStore {
     private let storage: PhoneCoderPairingStorage
     private let random: () throws -> String
@@ -104,6 +109,9 @@ actor PhoneCoderPairingStore {
         try save(clients)
     }
     func revokeAll() throws { try save([]) }
+    func clients() throws -> [PhoneCoderClientSummary] {
+        try load().map { .init(id: $0.id, name: $0.name) }
+    }
     func rotate(id: UUID) throws -> PhoneCoderClientCredential {
         var clients = try load()
         guard let index = clients.firstIndex(where: { $0.id == id }) else { throw PhoneCoderPairingError.notFound }

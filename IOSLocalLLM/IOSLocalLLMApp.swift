@@ -9,7 +9,7 @@ struct PhoneCoderApp: App {
 
     var body: some Scene {
         WindowGroup {
-            PhoneCoderRootView()
+            PhoneCoderRootView(services: services)
                 .environmentObject(services.controller)
                 .task { handleScenePhase(scenePhase) }
                 .onReceive(DeviceSafetyMonitor.shared.objectWillChange) { _ in
@@ -117,7 +117,8 @@ final class PhoneCoderServerServices {
                 }
                 return .init(availableMemoryBytes: UInt64(MemoryAdvisor.availableMemoryForModel), thermal: thermal)
             })
-        let listener = PhoneCoderNetworkListener(server: server, cancelApproval: { [weak pairingApproval] in pairingApproval?.cancel() })
+        let savedPort = UInt16(exactly: AppSettings.shared.localAPIPort).flatMap { $0 >= 1024 ? $0 : nil } ?? 11434
+        let listener = PhoneCoderNetworkListener(server: server, port: savedPort, cancelApproval: { [weak pairingApproval] in pairingApproval?.cancel() })
         self.pairings = pairings; self.pairingExchange = pairingExchange
         self.pairingApproval = pairingApproval; self.activity = activity
         self.apiServer = server; self.listener = listener

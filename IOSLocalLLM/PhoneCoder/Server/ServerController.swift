@@ -149,7 +149,7 @@ final class PhoneCoderServerController: ObservableObject {
     private let setIdleTimerDisabled: @MainActor (Bool) -> Void
     private var phase: ScenePhase = .inactive
     private var epoch: UInt64 = 0
-    private var connectionCount = 0
+    @Published private(set) var connectionCount = 0
     private var listening = false
     private var transition: Task<Void, Never>?
     private var retry: Task<Void, Never>?

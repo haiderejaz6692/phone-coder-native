@@ -493,11 +493,16 @@ actor PhoneCoderAPIServer {
 final class PhoneCoderNetworkListener: PhoneCoderServerListening {
     let server: PhoneCoderAPIServer
     weak var controller: PhoneCoderServerController?
-    private let port: UInt16
+    private(set) var port: UInt16
     private let cancelApproval: @MainActor () -> Void
     private var sessionID: UUID?
     init(server: PhoneCoderAPIServer, port: UInt16 = 11434, cancelApproval: @escaping @MainActor () -> Void = {}) {
         self.server = server; self.port = port; self.cancelApproval = cancelApproval
+    }
+    func setPort(_ value: UInt16) throws {
+        guard value >= 1024 else { throw PhoneCoderAPIError.invalid("Use a port from 1024 through 65535.") }
+        guard sessionID == nil else { throw PhoneCoderAPIError.invalid("Stop the server before changing its port.") }
+        port = value
     }
     func start(sessionID: UUID) async throws {
         self.sessionID = sessionID

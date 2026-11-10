@@ -98,7 +98,7 @@ targets:
           # Phone Coder owns the native five-tab shell under PhoneCoder/App.
           # Retain the inference and safety services, while keeping the legacy
           # assistant, lens, voice, settings, and bridge UI surfaces excluded.
-          - "**/Views/**"
+          - "Views/**"
           - "**/ViewModels/**"
           - "**/TipsManager.swift"
           - "**/Services/Intents/**"
@@ -262,6 +262,7 @@ targets:
       - path: IOSLocalLLMTests/PhoneCoderInferenceCoordinatorTests.swift
       - path: IOSLocalLLMTests/PhoneCoderServerControllerTests.swift
       - path: IOSLocalLLMTests/PhoneCoderAPIServerTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderViewModelTests.swift
       - path: IOSLocalLLMTests/HighRiskServiceTests.swift
     dependencies:
       - target: PhoneCoder

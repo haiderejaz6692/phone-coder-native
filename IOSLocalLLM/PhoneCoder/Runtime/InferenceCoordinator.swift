@@ -225,6 +225,28 @@ actor PhoneCoderInferenceCoordinator {
         return session
     }
 
+    func unloadModel() async throws {
+        guard !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
+        guard !switching else { throw PhoneCoderRuntimeError.switchingModel }
+        switching = true
+        defer {
+            switching = false
+            let waiters = switchWaiters
+            switchWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+        modelSession = nil
+        let pending = queue
+        queue.removeAll()
+        pending.forEach { $0.resolve(.failure(PhoneCoderRuntimeError.cancelled)) }
+        let draining = worker
+        if let request = active?.request {
+            await cancel(requestID: request.id, sessionID: request.sessionID)
+        }
+        await draining?.value
+        await runtime.unload()
+    }
+
     private func checkAvailability() async throws {
         if case .unavailable(let error) = await runtime.liveAvailability() { throw error }
     }
