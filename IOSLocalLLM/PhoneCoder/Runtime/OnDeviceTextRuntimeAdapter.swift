@@ -21,16 +21,15 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
     }
 
     func liveAvailability() async -> PhoneCoderRuntimeAvailability {
-        if let refusal = safetyRefusal { return .unavailable(refusal) }
-        guard ModelResidency.shared.textRuntimeAvailable,
-              await MLXGenerationGate.shared.foregrounded else { return .unavailable(.residencyUnavailable) }
-        // A safety/lifecycle unload or selection change invalidates readiness
-        // even when the coordinator still holds the old session value.
-        if let session, (!service.hasUsableLocalRuntime || service.activeSelectionID != session.modelID
-                         || upstreamSessionID != service.runtimeSessionID) {
-            return .unavailable(.modelUnavailable)
-        }
-        return .available
+        let foregrounded = await MLXGenerationGate.shared.foregrounded
+        let usable = session.map {
+            service.hasUsableLocalRuntime && service.activeSelectionID == $0.modelID
+                && upstreamSessionID == service.runtimeSessionID
+        } ?? true
+        return PhoneCoderRuntimeMapping.availability(thermal: DeviceSafetyMonitor.shared.thermalState,
+            stopReason: DeviceSafetyMonitor.shared.stopReason,
+            textResidencyAvailable: ModelResidency.shared.textRuntimeAvailable,
+            foregrounded: foregrounded, sessionIsUsable: usable)
     }
 
     func load(modelID: String) async throws -> PhoneCoderModelSession {
@@ -61,7 +60,7 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
     func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession,
                   onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult {
         guard self.session == session, request.modelID == session.modelID else { throw PhoneCoderRuntimeError.staleSession }
-        guard activeRequestID == nil else { throw PhoneCoderRuntimeError.runtimeFailure }
+        guard activeRequestID == nil else { throw PhoneCoderRuntimeError.residencyUnavailable }
         guard request.messages.allSatisfy({ $0.imageThumbnailData == nil && $0.imageThumbnails.isEmpty }) else {
             throw PhoneCoderRuntimeError.modelUnavailable
         }
@@ -74,7 +73,7 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         let (stream, continuation) = AsyncThrowingStream<NativeEvent, Error>.makeStream(bufferingPolicy: .bufferingOldest(256))
         let emit: @Sendable (NativeEvent) -> Void = { event in
             if case .dropped = continuation.yield(event) {
-                continuation.finish(throwing: PhoneCoderRuntimeError.runtimeFailure)
+                continuation.finish(throwing: PhoneCoderRuntimeError.outputLimit)
             }
         }
         // Callbacks synchronously enqueue into one stream. Creating a Task per
@@ -82,11 +81,17 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         service.generate(messages: request.messages, maxTokensOverride: request.maxTokens,
                          temperatureOverride: request.temperature, topPOverride: request.topP,
                          onToken: { emit(.text($0)) },
-                         onGenerationResult: { emit(.result($0)) },
+                         onTerminal: { emit(.terminal($0)) },
                          onComplete: { _ in continuation.finish() })
-        var result: AssistantGenerationResult?
+        var terminal: AssistantGenerationOutcome?
         do {
             for try await event in stream {
+                // Terminal categories survive teardown; only text callbacks
+                // require a still-resident runtime before reaching consumers.
+                if case .terminal(let outcome) = event {
+                    terminal = outcome
+                    continue
+                }
                 if let refusal = safetyRefusal { throw refusal }
                 // Safety/image/lifecycle teardown may originate outside this
                 // adapter. Its synchronous epoch invalidation precedes cleanup.
@@ -99,7 +104,7 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
                 case .text(let text):
                     await onEvent(.init(requestID: request.id, sessionID: request.sessionID,
                                         modelSessionID: session.id, text: text))
-                case .result(let value): result = value
+                case .terminal: break
                 }
             }
         } catch {
@@ -107,10 +112,9 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
             throw error
         }
         await service.drainGeneration()
+        let result = try PhoneCoderRuntimeMapping.result(from: terminal ?? .unavailable)
         if let refusal = safetyRefusal { throw refusal }
         guard upstreamSessionID == service.runtimeSessionID else { throw PhoneCoderRuntimeError.staleSession }
-        guard let result else { throw PhoneCoderRuntimeError.runtimeFailure }
-        guard result.stopReason != .cancelled else { throw PhoneCoderRuntimeError.cancelled }
         return PhoneCoderGenerationResult(requestID: request.id, sessionID: request.sessionID,
                                           modelSessionID: session.id, promptTokens: result.promptTokenCount,
                                           completionTokens: result.completionTokenCount,
@@ -130,12 +134,8 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
     }
 
     private var safetyRefusal: PhoneCoderRuntimeError? {
-        if DeviceSafetyMonitor.shared.thermalState == .critical { return .thermal }
-        switch DeviceSafetyMonitor.shared.stopReason {
-        case .thermal: return .thermal
-        case .memoryPressure: return .memoryPressure
-        case nil: return nil
-        }
+        PhoneCoderRuntimeMapping.safetyRefusal(thermal: DeviceSafetyMonitor.shared.thermalState,
+                                              stopReason: DeviceSafetyMonitor.shared.stopReason)
     }
 
     private func installedTextModel(_ id: String) -> AssistantModel? {
@@ -148,6 +148,42 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
 
     private enum NativeEvent: Sendable {
         case text(String)
-        case result(AssistantGenerationResult)
+        case terminal(AssistantGenerationOutcome)
+    }
+}
+
+/// Production mapping seam: tests supply actual upstream outcome/state types,
+/// not preclassified Phone Coder errors or fabricated health flags.
+enum PhoneCoderRuntimeMapping {
+    static func result(from outcome: AssistantGenerationOutcome) throws -> AssistantGenerationResult {
+        switch outcome {
+        case .completed(let result):
+            guard result.stopReason != .cancelled else { throw PhoneCoderRuntimeError.cancelled }
+            return result
+        case .cancelled: throw PhoneCoderRuntimeError.cancelled
+        case .memoryPressure: throw PhoneCoderRuntimeError.memoryPressure
+        case .thermal: throw PhoneCoderRuntimeError.thermal
+        case .unavailable: throw PhoneCoderRuntimeError.modelUnavailable
+        case .failed: throw PhoneCoderRuntimeError.runtimeFailure
+        }
+    }
+
+    static func safetyRefusal(thermal: ProcessInfo.ThermalState,
+                              stopReason: DeviceSafetyMonitor.StopReason?) -> PhoneCoderRuntimeError? {
+        if thermal == .critical { return .thermal }
+        switch stopReason {
+        case .thermal: return .thermal
+        case .memoryPressure: return .memoryPressure
+        case nil: return nil
+        }
+    }
+
+    static func availability(thermal: ProcessInfo.ThermalState, stopReason: DeviceSafetyMonitor.StopReason?,
+                             textResidencyAvailable: Bool, foregrounded: Bool,
+                             sessionIsUsable: Bool) -> PhoneCoderRuntimeAvailability {
+        if let refusal = safetyRefusal(thermal: thermal, stopReason: stopReason) { return .unavailable(refusal) }
+        guard textResidencyAvailable, foregrounded else { return .unavailable(.residencyUnavailable) }
+        guard sessionIsUsable else { return .unavailable(.modelUnavailable) }
+        return .available
     }
 }

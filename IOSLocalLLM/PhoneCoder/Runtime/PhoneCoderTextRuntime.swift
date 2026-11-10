@@ -42,7 +42,7 @@ struct PhoneCoderGenerationResult: Equatable, Sendable {
 enum PhoneCoderRuntimeError: Error, Equatable, Sendable {
     case queueFull, duplicateRequest, cancelled, switchingModel
     case modelUnavailable, residencyUnavailable, memoryPressure, thermal
-    case runtimeFailure, staleSession
+    case runtimeFailure, staleSession, outputLimit
 }
 
 enum PhoneCoderRuntimeAvailability: Equatable, Sendable {

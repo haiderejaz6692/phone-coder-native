@@ -1,8 +1,89 @@
 import XCTest
 import CryptoKit
+import os
 @testable import PhoneCoder
 
 final class PhoneCoderInferenceCoordinatorTests: XCTestCase {
+    func testExternalNativeCancellationDoesNotReconstruct() async throws {
+        let outcomes = [CancellationError() as Error, LlamaCppError.cancelled, MLXGenerationGate.Cancelled()]
+            .map { AssistantGenerationOutcome.resolve(result: nil, error: $0, cancelled: false) }
+            + [.resolve(result: nil, cancelled: true)]
+        for outcome in outcomes {
+            let runtime = ControlledTextRuntime()
+            let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+                XCTFail("An upstream stop must never restart generation")
+                return runtime
+            })
+            let handle = try await coordinator.enqueue(request("external-stop")) { _ in }
+            await runtime.waitForStarts(1)
+            // No coordinator.cancel: exercise the production native-error and
+            // adapter classifiers at the expensive runtime boundary.
+            await runtime.finishFromUpstream(outcome)
+            await assertError(handle, .cancelled)
+            let operations = await runtime.operations
+            XCTAssertEqual(operations, ["load:model", "start:external-stop"])
+        }
+    }
+
+    func testNativeTerminalClassificationPreservesCancellationSafetyAndFaults() throws {
+        let result = AssistantGenerationResult(promptTokenCount: 2, completionTokenCount: 3, stopReason: .stop)
+        XCTAssertEqual(try PhoneCoderRuntimeMapping.result(from: .completed(result)), result)
+        let cases: [(AssistantGenerationOutcome, PhoneCoderRuntimeError)] = [
+            (.cancelled, .cancelled), (.memoryPressure, .memoryPressure), (.thermal, .thermal),
+            (.unavailable, .modelUnavailable), (.failed, .runtimeFailure),
+            (.resolve(result: nil, cancelled: false), .modelUnavailable),
+            (.resolve(result: result, cancelled: true), .cancelled),
+            (.resolve(result: nil, error: NSError(domain: "engine", code: 1), cancelled: false), .runtimeFailure),
+            (.resolve(result: nil, error: CancellationError(), cancelled: false, safetyStop: .memoryPressure), .memoryPressure),
+            (.resolve(result: nil, error: MLXGenerationGate.Cancelled(), cancelled: false, safetyStop: .thermal), .thermal)
+        ]
+        for (outcome, expected) in cases {
+            XCTAssertThrowsError(try PhoneCoderRuntimeMapping.result(from: outcome)) {
+                XCTAssertEqual($0 as? PhoneCoderRuntimeError, expected)
+            }
+        }
+        let cancelled = AssistantGenerationResult(promptTokenCount: 2, completionTokenCount: 0, stopReason: .cancelled)
+        XCTAssertEqual(AssistantGenerationOutcome.resolve(result: cancelled, cancelled: false), .cancelled)
+    }
+
+    func testNativeTerminalCallbackIsExactlyOnceAndPrecedesLegacyCompletion() {
+        let observations = OSAllocatedUnfairLock(initialState: [String]())
+        let completion = AssistantGenerationCompletion(onTerminal: { _ in
+            observations.withLock { $0.append("terminal") }
+        }, onComplete: { _ in observations.withLock { $0.append("legacy") } })
+        completion.finish(.cancelled, rate: 0)
+        completion.finish(.failed, rate: 0)
+        XCTAssertEqual(observations.withLock { $0 }, ["terminal", "legacy"])
+    }
+
+    @MainActor
+    func testProductionResidencyAndSafetyMappingUsesUpstreamStates() {
+        func residency(image: ImageGenerationService.State = .ready,
+                       lens: LensInferenceLoop.State = .unloaded,
+                       llama: LlamaCppVLMService.State = .unloaded,
+                       fast: FastVLMComponentStatus = .init()) -> Bool {
+            ModelResidency.textRuntimeAvailable(image: image, lens: lens, llama: llama,
+                                                fast: fast, fastGenerating: false)
+        }
+        XCTAssertTrue(residency()) // diffusion ready means installed, not resident
+        XCTAssertFalse(residency(image: .loading))
+        XCTAssertFalse(residency(image: .generating(0.5)))
+        XCTAssertFalse(residency(lens: .ready))
+        XCTAssertFalse(residency(llama: .generating))
+        XCTAssertFalse(residency(fast: .init(encoder: .ready)))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: nil,
+            textResidencyAvailable: residency(image: .generating(0.5)), foregrounded: true, sessionIsUsable: true),
+            .unavailable(.residencyUnavailable))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .critical, stopReason: nil,
+            textResidencyAvailable: true, foregrounded: true, sessionIsUsable: true), .unavailable(.thermal))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: .memoryPressure,
+            textResidencyAvailable: true, foregrounded: true, sessionIsUsable: true), .unavailable(.memoryPressure))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: nil,
+            textResidencyAvailable: true, foregrounded: false, sessionIsUsable: true), .unavailable(.residencyUnavailable))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: nil,
+            textResidencyAvailable: true, foregrounded: true, sessionIsUsable: false), .unavailable(.modelUnavailable))
+    }
+
     // Removing the active lease or changing FIFO admission must break this test.
     func testOneLeaseFIFOAndFourWaitingLimit() async throws {
         let runtime = ControlledTextRuntime()
@@ -322,6 +403,14 @@ private actor ControlledTextRuntime: PhoneCoderTextRuntime {
         pending?.resume(returning: .init(requestID: start.request.id, sessionID: start.request.sessionID,
                                         modelSessionID: modelSessionID ?? start.session.id, promptTokens: 1, completionTokens: 1,
                                         finishReason: .stop))
+    }
+    func finishFromUpstream(_ outcome: AssistantGenerationOutcome) {
+        do { _ = try PhoneCoderRuntimeMapping.result(from: outcome); succeed() }
+        catch {
+            let pending = completion
+            completion = nil
+            pending?.resume(throwing: error)
+        }
     }
     func fail(_ error: PhoneCoderRuntimeError) {
         let pending = completion

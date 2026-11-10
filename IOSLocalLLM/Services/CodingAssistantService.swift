@@ -20,6 +20,53 @@ struct AssistantGenerationResult: Sendable, Equatable {
     let stopReason: StopReason
 }
 
+/// Explicit local-generation terminal state. Missing metadata is unavailable,
+/// never evidence of an engine fault that a caller may safely retry.
+enum AssistantGenerationOutcome: Equatable, Sendable {
+    case completed(AssistantGenerationResult)
+    case cancelled, memoryPressure, thermal, unavailable, failed
+
+    static func resolve(result: AssistantGenerationResult?, error: Error? = nil,
+                        cancelled: Bool, safetyStop: DeviceSafetyMonitor.StopReason? = nil) -> Self {
+        switch safetyStop {
+        case .thermal: return .thermal
+        case .memoryPressure: return .memoryPressure
+        case nil: break
+        }
+        if let nativeError = error as? LlamaCppError, case .cancelled = nativeError { return .cancelled }
+        if cancelled || error is CancellationError || error is MLXGenerationGate.Cancelled
+            || result?.stopReason == .cancelled { return .cancelled }
+        if error != nil { return .failed }
+        guard let result else { return .unavailable }
+        return .completed(result)
+    }
+}
+
+/// Native completion paths may race cancellation. Publish one typed terminal
+/// before the legacy completion callback closes the consumer's token stream.
+final class AssistantGenerationCompletion: Sendable {
+    private let finished = OSAllocatedUnfairLock(initialState: false)
+    private let onTerminal: (@Sendable (AssistantGenerationOutcome) -> Void)?
+    private let onComplete: @Sendable (Double) -> Void
+
+    init(onTerminal: (@Sendable (AssistantGenerationOutcome) -> Void)?,
+         onComplete: @escaping @Sendable (Double) -> Void) {
+        self.onTerminal = onTerminal
+        self.onComplete = onComplete
+    }
+
+    func finish(_ outcome: AssistantGenerationOutcome, rate: Double) {
+        let first = finished.withLock { value in
+            guard !value else { return false }
+            value = true
+            return true
+        }
+        guard first else { return }
+        onTerminal?(outcome)
+        onComplete(rate)
+    }
+}
+
 // MARK: - Per-family Assistant execution policy
 
 /// Text generation has a very different memory envelope from image analysis,
@@ -2320,18 +2367,20 @@ final class CodingAssistantService: ObservableObject {
         // it (benchmark, compare, quality eval, titler) skip the default.
         onLogprobToken: (@Sendable (TokenLogprob) -> Void)? = nil,
         onGenerationResult: (@Sendable (AssistantGenerationResult) -> Void)? = nil,
+        onTerminal: (@Sendable (AssistantGenerationOutcome) -> Void)? = nil,
         onComplete: @escaping @Sendable (Double) -> Void
     ) {
+        let completion = AssistantGenerationCompletion(onTerminal: onTerminal, onComplete: onComplete)
 #if CORE_AI_SERVER_APP
         guard CoreAIInferenceService.shared.isReady else {
-            onComplete(0)
+            completion.finish(.unavailable, rate: 0)
             return
         }
         state = .generating
         let started = Date()
         generateTask?.cancel()
         generateTask = Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self else { completion.finish(.cancelled, rate: 0); return }
             do {
                 try await CoreAIInferenceService.shared.generate(
                     messages: messages,
@@ -2340,13 +2389,13 @@ final class CodingAssistantService: ObservableObject {
                     onToken: onToken
                 )
                 state = .ready
-                onComplete(Date().timeIntervalSince(started))
+                completion.finish(.unavailable, rate: Date().timeIntervalSince(started))
             } catch is CancellationError {
                 state = .ready
-                onComplete(0)
+                completion.finish(.cancelled, rate: 0)
             } catch {
                 state = .failed(error.localizedDescription)
-                onComplete(0)
+                completion.finish(.failed, rate: 0)
             }
             generateTask = nil
         }
@@ -2360,7 +2409,7 @@ final class CodingAssistantService: ObservableObject {
                 jsonMode: jsonMode,
                 forceNoThinking: forceNoThinking,
                 onToken: onToken,
-                onComplete: onComplete
+                onComplete: { rate in completion.finish(.unavailable, rate: rate) }
             )
             return
         }
@@ -2373,14 +2422,14 @@ final class CodingAssistantService: ObservableObject {
         if case .generating = state {
             let epoch = stopEpoch
             Task { @MainActor [weak self] in
-                guard let self else { onComplete(0); return }
+                guard let self else { completion.finish(.cancelled, rate: 0); return }
                 var waited = 0
                 while case .generating = self.state, waited < 40, self.stopEpoch == epoch {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                     waited += 1
                 }
                 guard self.stopEpoch == epoch, case .ready = self.state else {
-                    onComplete(0)
+                    completion.finish(self.stopEpoch != epoch ? .cancelled : .unavailable, rate: 0)
                     return
                 }
                 self.generate(
@@ -2398,6 +2447,7 @@ final class CodingAssistantService: ObservableObject {
                     onToken: onToken,
                     onLogprobToken: onLogprobToken,
                     onGenerationResult: onGenerationResult,
+                    onTerminal: onTerminal,
                     onComplete: onComplete
                 )
             }
@@ -2416,21 +2466,21 @@ final class CodingAssistantService: ObservableObject {
         if state != .ready || !hasRuntimeModel {
             let epoch = stopEpoch
             Task { [weak self] in
-                guard let self else { onComplete(0); return }
+                guard let self else { completion.finish(.cancelled, rate: 0); return }
                 if case .loading = state {
                     // Another caller is already loading — wait it out, with a
                     // deadline so a wedged load (network stall, HubApi hang)
                     // can't spin this poll forever and freeze the send.
                     let deadline = Date().addingTimeInterval(60)
                     while case .loading = self.state, self.stopEpoch == epoch {
-                        if Date() >= deadline { onComplete(0); return }
+                        if Date() >= deadline { completion.finish(.unavailable, rate: 0); return }
                         try? await Task.sleep(nanoseconds: 100_000_000)
                     }
                 } else if state != .ready {
                     await self.load()
                 }
                 // Stop while this send waited drops it, like a running decode.
-                guard self.stopEpoch == epoch else { onComplete(0); return }
+                guard self.stopEpoch == epoch else { completion.finish(.cancelled, rate: 0); return }
                 let isLoaded = self.activeModel.runtime == .llamaCpp
                     ? self.ggufModel != nil
                     : self.resolvedMLXContainer != nil
@@ -2450,15 +2500,21 @@ final class CodingAssistantService: ObservableObject {
                         onToken: onToken,
                         onLogprobToken: onLogprobToken,
                         onGenerationResult: onGenerationResult,
+                        onTerminal: onTerminal,
                         onComplete: onComplete
                     )
                 } else {
-                    onComplete(0)
+                    let outcome: AssistantGenerationOutcome = switch self.admissionRefusal {
+                    case .memory: .memoryPressure
+                    case .thermal: .thermal
+                    case nil: .unavailable
+                    }
+                    completion.finish(outcome, rate: 0)
                 }
             }
             return
         }
-        guard case .ready = state else { onComplete(0); return }
+        guard case .ready = state else { completion.finish(.unavailable, rate: 0); return }
 
         // Device-safety gate — refuse to start a fresh generation only when
         // the device is genuinely at .critical thermal state or under
@@ -2467,11 +2523,12 @@ final class CodingAssistantService: ObservableObject {
         let safety = DeviceSafetyMonitor.shared
         if let reason = safety.stopReason {
             ToastCenter.shared.error(reason.title, detail: reason.detail)
-            onComplete(0)
+            completion.finish(.resolve(result: nil, cancelled: false, safetyStop: reason), rate: 0)
             return
         }
 
         generateTask?.cancel()
+        let generationStopEpoch = stopEpoch
         state = .generating
         // User started inference — cancel any pending background
         // prefetch so it doesn't compete for disk bandwidth with
@@ -2805,7 +2862,9 @@ final class CodingAssistantService: ObservableObject {
                                 tokensPerSecond: rate
                             )
                         }
-                        onComplete(rate)
+                        completion.finish(.resolve(result: generationResult,
+                            cancelled: Task.isCancelled || !ownsState || service.stopEpoch != generationStopEpoch,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: rate)
                     }
                 } catch is CancellationError {
                     await MainActor.run {
@@ -2814,7 +2873,8 @@ final class CodingAssistantService: ObservableObject {
                             service.generateTask = nil
                             if case .generating = service.state { service.state = .ready }
                         }
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                     }
                 } catch LlamaCppError.cancelled {
                     await MainActor.run {
@@ -2830,7 +2890,8 @@ final class CodingAssistantService: ObservableObject {
                             "GGUF assistant generation cancelled",
                             category: "assistant"
                         )
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                     }
                 } catch {
                     await MainActor.run {
@@ -2850,14 +2911,16 @@ final class CodingAssistantService: ObservableObject {
                             "GGUF assistant generation failed · \(error.localizedDescription)",
                             category: "assistant"
                         )
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, error: error,
+                            cancelled: Task.isCancelled || service.stopEpoch != generationStopEpoch,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                     }
                 }
             }
             return
         }
 
-        guard let container = resolvedMLXContainer else { onComplete(0); return }
+        guard let container = resolvedMLXContainer else { completion.finish(.unavailable, rate: 0); return }
 
         let generationID = UUID()
         activeMLXGenerationID = generationID
@@ -3116,7 +3179,8 @@ final class CodingAssistantService: ObservableObject {
                         activeID: self?.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(rate)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: rate)
                         return
                     }
                     self?.activeMLXGenerationID = nil
@@ -3133,7 +3197,9 @@ final class CodingAssistantService: ObservableObject {
                         tokens: generatedTokens,
                         tokensPerSecond: rate
                     )
-                    onComplete(rate)
+                    completion.finish(.resolve(result: generationResult,
+                        cancelled: Task.isCancelled || self?.stopEpoch != generationStopEpoch,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: rate)
                     // Re-arm the background prefetch now that the LLM
                     // is idle again. If the user is between messages
                     // we'll prime the VLM's page cache for the next
@@ -3147,13 +3213,15 @@ final class CodingAssistantService: ObservableObject {
                         activeID: self?.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     self?.activeMLXGenerationID = nil
                     self?.generateTask = nil
                     if case .generating = self?.state { self?.state = .ready }
-                    onComplete(0)
+                    completion.finish(.resolve(result: nil, cancelled: true,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                 }
 
             } catch is MLXGenerationGate.Cancelled {
@@ -3163,26 +3231,30 @@ final class CodingAssistantService: ObservableObject {
                         activeID: self?.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     self?.activeMLXGenerationID = nil
                     self?.generateTask = nil
                     if case .generating = self?.state { self?.state = .ready }
-                    onComplete(0)
+                    completion.finish(.resolve(result: nil, cancelled: true,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                 }
 
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     guard AssistantGenerationOwnership.isCurrent(
                         activeID: self.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     self.activeMLXGenerationID = nil
@@ -3194,7 +3266,9 @@ final class CodingAssistantService: ObservableObject {
                     self.state = self.hasResidentRuntime
                         ? .ready
                         : .failed(error.localizedDescription)
-                    onComplete(0)
+                    completion.finish(.resolve(result: nil, error: error,
+                        cancelled: Task.isCancelled || self.stopEpoch != generationStopEpoch,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                 }
             }
         }

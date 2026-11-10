@@ -40,20 +40,28 @@ final class ModelResidency: ObservableObject {
     /// means installed on disk. Vision backends may retain weights when ready.
     /// No model loader or independently cached "healthy" flag lives here.
     var textRuntimeAvailable: Bool {
-        switch ImageGenerationService.shared.state {
+        Self.textRuntimeAvailable(image: ImageGenerationService.shared.state,
+            lens: LensInferenceLoop.shared.state, llama: LlamaCppVLMService.shared.state,
+            fast: FastVLMService.shared.componentStatus, fastGenerating: FastVLMService.shared.isGenerating)
+    }
+
+    /// Pure view of the actual upstream states, shared by live health and tests.
+    static func textRuntimeAvailable(image: ImageGenerationService.State, lens: LensInferenceLoop.State,
+                                     llama: LlamaCppVLMService.State, fast: FastVLMComponentStatus,
+                                     fastGenerating: Bool) -> Bool {
+        switch image {
         case .loading, .generating: return false
         default: break
         }
-        switch LensInferenceLoop.shared.state {
+        switch lens {
         case .unloaded: break
         default: return false
         }
-        switch LlamaCppVLMService.shared.state {
+        switch llama {
         case .unloaded: break
         default: return false
         }
-        let fast = FastVLMService.shared.componentStatus
-        return !FastVLMService.shared.isGenerating
+        return !fastGenerating
             && ![fast.encoder, fast.projector, fast.decoder, fast.tokenizer].contains {
                 $0.isReady || $0.isLoading
             }

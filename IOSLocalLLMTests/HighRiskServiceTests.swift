@@ -1,5 +1,9 @@
 import XCTest
+#if canImport(PhoneCoder)
+@testable import PhoneCoder
+#else
 @testable import IOSLocalLLM
+#endif
 
 // Focused regression coverage for the three services with the largest
 // persistence, download, and inference blast radius.
