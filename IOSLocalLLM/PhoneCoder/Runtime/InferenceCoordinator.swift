@@ -25,6 +25,10 @@ actor PhoneCoderInferenceCoordinator {
     private var cancelled = false
     private var committedOutput = false
     private var switching = false
+    private var lifecycleSuspended = false
+    private var lifecycleEpoch: UInt64 = 0
+    private var lifecycleDrain: Task<Void, Never>?
+    private var switchWaiters: [CheckedContinuation<Void, Never>] = []
 
     init(runtime: any PhoneCoderTextRuntime,
          reconstruct: @escaping @Sendable () async -> any PhoneCoderTextRuntime) {
@@ -36,7 +40,8 @@ actor PhoneCoderInferenceCoordinator {
 
     func state() async -> PhoneCoderRuntimeState {
         var availability = await runtime.liveAvailability()
-        if switching { availability = .unavailable(.switchingModel) }
+        if lifecycleSuspended { availability = .unavailable(.lifecycleUnavailable) }
+        else if switching { availability = .unavailable(.switchingModel) }
         else if modelSession == nil, availability == .available { availability = .unavailable(.modelUnavailable) }
         return PhoneCoderRuntimeState(availability: availability,
                                      modelSession: modelSession, activeRequestID: active?.request.id,
@@ -47,6 +52,7 @@ actor PhoneCoderInferenceCoordinator {
     /// scheduling Tasks created by callers. Cancellation uses both identities.
     func enqueue(_ request: PhoneCoderGenerationRequest,
                  onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) throws -> Task<PhoneCoderGenerationResult, Error> {
+        guard !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         guard !switching else { throw PhoneCoderRuntimeError.switchingModel }
         guard !([active].compactMap { $0 } + queue).contains(where: {
             $0.request.id == request.id && $0.request.sessionID == request.sessionID
@@ -113,12 +119,70 @@ actor PhoneCoderInferenceCoordinator {
         await cancellation?.value
     }
 
+    /// Closes admission and invalidates callbacks before any suspension point.
+    /// The returned barrier may outlive the iOS foreground transition: callers
+    /// must not hold a background assertion while awaiting native Metal work.
+    @discardableResult
+    func suspendForLifecycle() -> Task<Void, Never> {
+        lifecycleEpoch &+= 1
+        lifecycleSuspended = true
+        cancelled = true
+        let pending = queue
+        queue.removeAll()
+        pending.forEach { $0.resolve(.failure(PhoneCoderRuntimeError.cancelled)) }
+        if let request = active?.request, cancellation == nil {
+            let owner = runtime
+            cancellation = Task { await owner.cancel(requestID: request.id) }
+        }
+        let retiringWorker = worker
+        let retiringCancellation = cancellation
+        let previousDrain = lifecycleDrain
+        let drain = Task {
+            await previousDrain?.value
+            await retiringCancellation?.value
+            await retiringWorker?.value
+            await self.waitForModelSwitch()
+        }
+        lifecycleDrain = drain
+        return drain
+    }
+
+    /// Captures the suspension epoch synchronously. A newer suspension defeats
+    /// this resume even when native cancellation takes seconds to retire.
+    func resumeAfterLifecycle() -> Task<Bool, Never> {
+        let epoch = lifecycleEpoch
+        let drain = lifecycleDrain
+        return Task {
+            await drain?.value
+            return self.finishLifecycleResume(epoch: epoch)
+        }
+    }
+
+    private func finishLifecycleResume(epoch: UInt64) -> Bool {
+        guard epoch == lifecycleEpoch else { return false }
+        lifecycleSuspended = false
+        lifecycleDrain = nil
+        return true
+    }
+
+    private func waitForModelSwitch() async {
+        guard switching else { return }
+        await withCheckedContinuation { switchWaiters.append($0) }
+    }
+
     /// Reject admission immediately, invalidate callbacks, drain old work, then
     /// unload/load. Concurrent switches cannot interleave heavy allocations.
     func switchModel(to modelID: String) async throws -> PhoneCoderModelSession {
+        guard !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         guard !switching else { throw PhoneCoderRuntimeError.switchingModel }
+        let epoch = lifecycleEpoch
         switching = true
-        defer { switching = false }
+        defer {
+            switching = false
+            let waiters = switchWaiters
+            switchWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
         modelSession = nil
         let pending = queue
         queue.removeAll()
@@ -128,9 +192,13 @@ actor PhoneCoderInferenceCoordinator {
             await cancel(requestID: request.id, sessionID: request.sessionID)
         }
         await draining?.value
+        guard epoch == lifecycleEpoch, !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         await runtime.unload()
+        guard epoch == lifecycleEpoch, !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         try await checkAvailability()
+        guard epoch == lifecycleEpoch, !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         let session = try await runtime.load(modelID: modelID)
+        guard epoch == lifecycleEpoch, !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         guard session.modelID == modelID else { throw PhoneCoderRuntimeError.staleSession }
         modelSession = session
         return session
@@ -155,7 +223,7 @@ actor PhoneCoderInferenceCoordinator {
         work.resolve(cancelled ? .failure(PhoneCoderRuntimeError.cancelled) : outcome)
         active = nil
         worker = nil
-        if !switching, !queue.isEmpty { start(queue.removeFirst()) }
+        if !switching, !lifecycleSuspended, !queue.isEmpty { start(queue.removeFirst()) }
     }
 
     private func generate(_ work: Work) async throws -> PhoneCoderGenerationResult {
