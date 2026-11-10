@@ -7,7 +7,10 @@ final class PhoneCoderModelsModel: ObservableObject {
     @Published private(set) var loadedID: String?
     @Published private(set) var busy = false
     @Published var error: String?
-    init(coordinator: PhoneCoderInferenceCoordinator) { self.coordinator = coordinator }
+    private let onModelLoaded: @MainActor () async -> Void
+    init(coordinator: PhoneCoderInferenceCoordinator, onModelLoaded: @escaping @MainActor () async -> Void = {}) {
+        self.coordinator = coordinator; self.onModelLoaded = onModelLoaded
+    }
     func refresh() async {
         installed = await coordinator.installedModels()
         let state = await coordinator.state()
@@ -17,7 +20,10 @@ final class PhoneCoderModelsModel: ObservableObject {
         guard !busy else { return }
         busy = true; error = nil
         defer { busy = false }
-        do { _ = try await coordinator.switchModel(to: id) }
+        do {
+            _ = try await coordinator.switchModel(to: id)
+            await onModelLoaded()
+        }
         catch { self.error = phoneCoderError(error) }
         await refresh()
     }

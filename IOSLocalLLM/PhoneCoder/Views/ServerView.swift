@@ -23,12 +23,7 @@ final class PhoneCoderServerModel: ObservableObject {
         } catch { clients = []; self.error = phoneCoderError(error) }
     }
     func perform(_ action: PhoneCoderServerAction, openModels: () -> Void) {
-        switch action {
-        case .start: services.controller.startServing()
-        case .stop: services.controller.stopServing()
-        case .retry: services.controller.retryNow()
-        case .models: openModels()
-        }
+        action.perform(controller: services.controller, openModels: openModels)
     }
     func revoke(_ client: PhoneCoderClientSummary) async {
         do { try await services.pairings.revoke(id: client.id); error = nil; await refresh() }
@@ -60,6 +55,9 @@ struct PhoneCoderServerView: View {
                 Text(status.detail).foregroundStyle(.secondary)
                 Button(status.action.title) { model.perform(status.action, openModels: openModels) }
                     .buttonStyle(.borderedProminent).phoneCoderTarget()
+                if status.offersModels {
+                    Button("Open Models", action: openModels).phoneCoderTarget()
+                }
                 if controller.servingRequested, status.action != .stop {
                     Button("Stop server", role: .destructive) { controller.stopServing() }.phoneCoderTarget()
                 }

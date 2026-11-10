@@ -20,6 +20,7 @@ final class PhoneCoderChatModel: ObservableObject {
     @Published private(set) var messages: [ChatMessage] = []
     @Published private(set) var isGenerating = false
     @Published private(set) var error: String?
+    @Published private(set) var budgetError: LocalAPIStrictBudgetError?
     @Published private(set) var usage = ""
     @Published private(set) var modelName = "No text model loaded"
     @Published private(set) var context = "Load a model to see its context limit"
@@ -31,6 +32,7 @@ final class PhoneCoderChatModel: ObservableObject {
     private var conversationID = UUID()
     private var persistConversation = true
     private var active: PhoneCoderGenerationRequest?
+    var canRetry: Bool { !isGenerating && budgetError == nil && messages.contains { $0.role == .user } }
     init(coordinator: PhoneCoderInferenceCoordinator, history: any PhoneCoderChatHistory = PhoneCoderConversationHistory()) {
         self.coordinator = coordinator; self.history = history
     }
@@ -43,7 +45,7 @@ final class PhoneCoderChatModel: ObservableObject {
     }
     @discardableResult
     func send() -> Task<Void, Never> {
-        guard !isGenerating, !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return Task {} }
+        guard !isGenerating, budgetError == nil, !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return Task {} }
         guard draft.utf8.count <= 1_048_576 else {
             error = "This message exceeds the 1 MiB input limit. Send a smaller excerpt."
             return Task {}
@@ -54,7 +56,7 @@ final class PhoneCoderChatModel: ObservableObject {
     }
     @discardableResult
     func retry() -> Task<Void, Never> {
-        guard !isGenerating, messages.contains(where: { $0.role == .user }) else { return Task {} }
+        guard canRetry else { return Task {} }
         if messages.last?.role == .assistant { messages.removeLast() }
         return generate()
     }
@@ -86,6 +88,7 @@ final class PhoneCoderChatModel: ObservableObject {
                 finish(interrupted: false)
             } catch {
                 guard active?.id == requestID else { return }
+                budgetError = error as? LocalAPIStrictBudgetError
                 self.error = phoneCoderError(error)
                 finish(interrupted: true)
             }
@@ -119,13 +122,20 @@ final class PhoneCoderChatModel: ObservableObject {
         active = nil; isGenerating = false
     }
     func newConversation() {
-        stop(); conversationID = UUID(); messages = []; error = nil; usage = ""
+        stop(); conversationID = UUID(); messages = []; draft = ""; error = nil; budgetError = nil; usage = ""
         persistConversation = historyEnabled
+    }
+    func shortenLastInput() {
+        guard !isGenerating, budgetError != nil,
+              let index = messages.lastIndex(where: { $0.role == .user }) else { return }
+        draft = messages[index].content
+        messages.removeSubrange(index...)
+        budgetError = nil; error = nil
     }
     func open(_ conversation: StoredConversation) {
         stop(); conversationID = conversation.id
         messages = ConversationStore.shared.messages(for: conversation.id)
-        persistConversation = historyEnabled; error = nil; usage = ""
+        persistConversation = historyEnabled; error = nil; budgetError = nil; usage = ""
     }
 }
 
@@ -162,7 +172,10 @@ struct PhoneCoderChatView: View {
             Section {
                 PhoneCoderInlineError(message: model.error)
                 if !model.usage.isEmpty { Text(model.usage).font(.caption).foregroundStyle(.secondary) }
-                if !model.messages.isEmpty, !model.isGenerating {
+                if model.budgetError != nil {
+                    Button("Shorten last input", systemImage: "pencil") { model.shortenLastInput() }.phoneCoderTarget()
+                    Button("Start a new conversation", systemImage: "square.and.pencil") { model.newConversation() }.phoneCoderTarget()
+                } else if model.canRetry {
                     Button("Retry last response", systemImage: "arrow.clockwise") { model.retry() }.phoneCoderTarget()
                 }
             }
@@ -175,7 +188,7 @@ struct PhoneCoderChatView: View {
                     Button("Stop", systemImage: "stop.fill") { model.stop() }.phoneCoderTarget()
                 } else {
                     Button("Send", systemImage: "arrow.up.circle.fill") { model.send() }
-                        .disabled(model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).phoneCoderTarget()
+                        .disabled(model.budgetError != nil || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).phoneCoderTarget()
                 }
             }.padding().background(.regularMaterial)
         }

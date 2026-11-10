@@ -4,7 +4,16 @@ import UIKit
 enum PhoneCoderServerAction: Equatable {
     case start, stop, retry, models
     var title: String {
-        switch self { case .start: "Start server"; case .stop: "Stop server"; case .retry: "Retry connection"; case .models: "Open Models" }
+        switch self { case .start: "Start server"; case .stop: "Stop server"; case .retry: "Retry server"; case .models: "Open Models" }
+    }
+    @MainActor @discardableResult
+    func perform(controller: PhoneCoderServerController, openModels: () -> Void) -> Task<Void, Never> {
+        switch self {
+        case .start: return controller.startServing()
+        case .stop: return controller.stopServing()
+        case .retry: return controller.retryNow()
+        case .models: openModels(); return Task {}
+        }
     }
 }
 
@@ -14,7 +23,9 @@ struct PhoneCoderServerPresentation {
     let icon: String
     let tint: Color
     let action: PhoneCoderServerAction
+    let offersModels: Bool
     init(_ state: PhoneCoderServerState) {
+        offersModels = state == .lowMemory
         switch state {
         case .stopped: (title, detail, icon, tint, action) = ("Server off", "Load a text model, connect Tailscale, then start serving.", "power", .secondary, .start)
         case .starting: (title, detail, icon, tint, action) = ("Starting", "Opening the private network listener.", "hourglass", .blue, .stop)
@@ -24,8 +35,8 @@ struct PhoneCoderServerPresentation {
         case .recovering(let attempt, _): (title, detail, icon, tint, action) = ("Reconnecting", "Connection recovery attempt \(attempt). You can retry now.", "arrow.clockwise", .orange, .retry)
         case .pausedBackground: (title, detail, icon, tint, action) = ("Paused", "Keep Phone Coder open in the foreground to serve requests.", "pause.circle", .orange, .stop)
         case .coolingDown: (title, detail, icon, tint, action) = ("Cooling down", "Let the phone cool before retrying generation.", "thermometer", .orange, .retry)
-        case .lowMemory: (title, detail, icon, tint, action) = ("Memory pressure", "Close other apps or load a smaller model in Models.", "memorychip", .orange, .models)
-        case .authenticationError: (title, detail, icon, tint, action) = ("Authentication issue", "Check Tailscale access and pair the client again.", "key", .orange, .retry)
+        case .lowMemory: (title, detail, icon, tint, action) = ("Memory pressure", "Close other apps or load a smaller model in Models, then retry the server.", "memorychip", .orange, .retry)
+        case .authenticationError: (title, detail, icon, tint, action) = ("Credential store unavailable", "The server could not access its credential store. Serving was stopped. Unlock this device, then Start server to try again.", "key", .orange, .start)
         case .networkUnavailable: (title, detail, icon, tint, action) = ("Network unavailable", "Connect Tailscale on both devices, then retry.", "wifi.slash", .orange, .retry)
         case .modelUnavailable: (title, detail, icon, tint, action) = ("Load a model", "Download and load a compatible text model in Models.", "shippingbox", .orange, .models)
         }
@@ -72,6 +83,12 @@ struct PhoneCoderImagePresentation {
 }
 
 func phoneCoderError(_ error: Error) -> String {
+    if let budget = error as? LocalAPIStrictBudgetError {
+        let reason = budget.code == "context_length_exceeded"
+            ? "The conversation exceeds the model’s context budget, including runtime overhead. Shorten the last input or start a new conversation."
+            : "The requested output exceeds this model’s runtime limits. Load a model with valid output limits and start a new conversation."
+        return "\(budget.promptTokens) prompt tokens + \(budget.outputTokens) output tokens; \(budget.contextWindow)-token context. \(reason)"
+    }
     if let api = error as? PhoneCoderAPIError { return api.message }
     if let runtime = error as? PhoneCoderRuntimeError {
         switch runtime {

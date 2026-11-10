@@ -17,7 +17,8 @@ struct PhoneCoderRootView: View {
         self.selection = selection
         self.services = services
         _server = StateObject(wrappedValue: PhoneCoderServerModel(services: services))
-        _models = StateObject(wrappedValue: PhoneCoderModelsModel(coordinator: services.coordinator))
+        _models = StateObject(wrappedValue: PhoneCoderModelsModel(coordinator: services.coordinator,
+            onModelLoaded: { await services.controller.modelDidLoad() }))
         _chat = StateObject(wrappedValue: PhoneCoderChatModel(coordinator: services.coordinator))
         _settings = StateObject(wrappedValue: PhoneCoderSettingsModel())
         _approval = ObservedObject(wrappedValue: services.pairingApproval)

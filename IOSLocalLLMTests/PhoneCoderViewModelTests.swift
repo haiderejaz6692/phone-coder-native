@@ -203,6 +203,121 @@ final class PhoneCoderViewModelTests: XCTestCase {
         withExtendedLifetime(subscription) {}
     }
 
+    func testAuthenticationRecoveryRoutesStartAndRestoresServingIntent() async throws {
+        let fixture = RecoveryFixture()
+        await fixture.controller.handle(scenePhase: .active).value
+        _ = try await fixture.coordinator.switchModel(to: "model")
+        fixture.listener.failure = .authentication
+        await PhoneCoderServerPresentation(.stopped).action.perform(controller: fixture.controller, openModels: {}).value
+        XCTAssertEqual(fixture.controller.state, .authenticationError)
+        XCTAssertFalse(fixture.controller.servingRequested)
+        XCTAssertTrue(PhoneCoderServerPresentation(fixture.controller.state).detail.contains("credential store"))
+        fixture.listener.failure = nil
+        await PhoneCoderServerPresentation(fixture.controller.state).action.perform(controller: fixture.controller, openModels: {}).value
+        XCTAssertTrue(fixture.controller.servingRequested)
+        XCTAssertEqual(fixture.controller.state, .ready)
+        XCTAssertEqual(fixture.listener.starts, 2)
+        await PhoneCoderServerAction.stop.perform(controller: fixture.controller, openModels: {}).value
+        XCTAssertEqual(fixture.controller.state, .stopped)
+    }
+
+    func testMissingModelRecoveryLoadsAndStartsOnlyCurrentServingIntent() async {
+        let fixture = RecoveryFixture()
+        await fixture.controller.handle(scenePhase: .active).value
+        await PhoneCoderServerAction.start.perform(controller: fixture.controller, openModels: {}).value
+        XCTAssertEqual(fixture.controller.state, .modelUnavailable)
+        XCTAssertEqual(fixture.listener.starts, 0)
+        var openedModels = false
+        await PhoneCoderServerPresentation(fixture.controller.state).action.perform(controller: fixture.controller, openModels: { openedModels = true }).value
+        XCTAssertTrue(openedModels)
+        let models = PhoneCoderModelsModel(coordinator: fixture.coordinator,
+            onModelLoaded: { await fixture.controller.modelDidLoad() })
+        await models.load("model")
+        XCTAssertEqual(fixture.controller.state, .ready)
+        XCTAssertEqual(fixture.listener.starts, 1)
+        await fixture.controller.stopServing().value
+        await models.load("replacement")
+        XCTAssertFalse(fixture.controller.servingRequested)
+        XCTAssertEqual(fixture.listener.starts, 1, "A successful load cannot undo a newer Stop intent")
+        await fixture.controller.handle(scenePhase: .background).value
+        await fixture.controller.startServing().value
+        await fixture.controller.modelDidLoad()
+        XCTAssertEqual(fixture.listener.starts, 1, "A load callback cannot start background serving")
+    }
+
+    func testLowMemoryRecoveryRoutesExplicitRetryAfterRemediation() async throws {
+        let fixture = RecoveryFixture()
+        await fixture.controller.handle(scenePhase: .active).value
+        _ = try await fixture.coordinator.switchModel(to: "model")
+        await fixture.runtime.setAvailability(.unavailable(.memoryPressure))
+        await PhoneCoderServerAction.start.perform(controller: fixture.controller, openModels: {}).value
+        XCTAssertEqual(fixture.controller.state, .lowMemory)
+        XCTAssertTrue(fixture.controller.servingRequested)
+        XCTAssertEqual(fixture.listener.starts, 0)
+        let presentation = PhoneCoderServerPresentation(fixture.controller.state)
+        XCTAssertEqual(presentation.action, .retry)
+        XCTAssertTrue(presentation.offersModels)
+        await fixture.runtime.setAvailability(.available)
+        await presentation.action.perform(controller: fixture.controller, openModels: {}).value
+        XCTAssertEqual(fixture.controller.state, .ready)
+        XCTAssertEqual(fixture.listener.starts, 1)
+        await fixture.controller.stopServing().value
+    }
+
+    func testStrictContextFailureBlocksUnchangedRetryAndCanShortenLastInput() async throws {
+        let runtime = ViewModelRuntime(contextWindow: 80)
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        _ = try await coordinator.switchModel(to: "model")
+        let model = PhoneCoderChatModel(coordinator: coordinator, history: ViewModelHistory())
+        model.draft = "seed"
+        await model.send().value
+        let priorTokens = model.messages.reduce(0) { $0 + $1.content.utf8.count }
+        model.draft = String(repeating: "x", count: 60)
+        await model.send().value
+        XCTAssertEqual(model.budgetError?.promptTokens, priorTokens + 60)
+        XCTAssertEqual(model.budgetError?.outputTokens, 8)
+        XCTAssertEqual(model.budgetError?.contextWindow, 80)
+        XCTAssertTrue(model.error?.contains("\(priorTokens + 60) prompt tokens") ?? false)
+        XCTAssertTrue(model.error?.contains("8 output tokens") ?? false)
+        XCTAssertTrue(model.error?.contains("80-token context") ?? false)
+        XCTAssertFalse(model.canRetry)
+        await model.retry().value
+        let attempts = await runtime.requestIDs.count
+        XCTAssertEqual(attempts, 2, "Identical overflow must not be submitted again")
+        model.shortenLastInput()
+        XCTAssertEqual(model.draft, String(repeating: "x", count: 60))
+        XCTAssertEqual(model.messages.count, 2, "Edit preserves earlier conversation turns")
+        model.draft = "x"
+        await model.send().value
+        XCTAssertNil(model.budgetError)
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.messages.last?.role, .assistant)
+    }
+
+    func testAccumulatedHistoryOverflowNeedsNewConversationToRestoreSendability() async throws {
+        let runtime = ViewModelRuntime(contextWindow: 80)
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        _ = try await coordinator.switchModel(to: "model")
+        let model = PhoneCoderChatModel(coordinator: coordinator, history: ViewModelHistory())
+        model.draft = String(repeating: "a", count: 30)
+        await model.send().value
+        model.draft = "b"
+        await model.send().value
+        XCTAssertNotNil(model.budgetError)
+        model.draft = "Extra text cannot repair an already full transcript"
+        await model.send().value
+        let countBeforeReset = await runtime.requestIDs.count
+        XCTAssertEqual(countBeforeReset, 2)
+        model.newConversation()
+        XCTAssertNil(model.budgetError)
+        model.draft = "new"
+        await model.send().value
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.messages.count, 2)
+        let requests = await runtime.requestIDs.count
+        XCTAssertEqual(requests, 3)
+    }
+
     func testPortCannotChangeWhileListenerIsActive() async throws {
         let runtime = ViewModelRuntime()
         let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
@@ -237,15 +352,20 @@ private actor ViewModelRuntime: PhoneCoderTextRuntime {
     var requestIDs: [PhoneCoderRequestID] = []
     var cancelledIDs: Set<PhoneCoderRequestID> = []
     private let holdGeneration: Bool
+    private let contextWindow: Int?
+    private var availability: PhoneCoderRuntimeAvailability = .available
     private var requestWaiters: [CheckedContinuation<Void, Never>] = []
     private var generationWaiter: CheckedContinuation<Void, Never>?
-    init(holdGeneration: Bool = false) { self.holdGeneration = holdGeneration }
+    init(holdGeneration: Bool = false, contextWindow: Int? = nil) {
+        self.holdGeneration = holdGeneration; self.contextWindow = contextWindow
+    }
+    func setAvailability(_ value: PhoneCoderRuntimeAvailability) { availability = value }
     func waitForRequest() async {
         if !requestIDs.isEmpty { return }
         await withCheckedContinuation { requestWaiters.append($0) }
     }
     func installedModels() -> [PhoneCoderModelDescriptor] { [.init(id: "model", displayName: "Model")] }
-    func liveAvailability() -> PhoneCoderRuntimeAvailability { .available }
+    func liveAvailability() -> PhoneCoderRuntimeAvailability { availability }
     func load(modelID: String) -> PhoneCoderModelSession { .init(id: UUID(), modelID: modelID) }
     func cancel(requestID: PhoneCoderRequestID) {
         cancelledIDs.insert(requestID)
@@ -255,6 +375,12 @@ private actor ViewModelRuntime: PhoneCoderTextRuntime {
     func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession,
                   onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult {
         requestIDs.append(request.id)
+        if request.strictAPI, let contextWindow {
+            _ = try LocalAPIStrictInput.outputTokens(requested: 8,
+                promptTokens: request.messages.reduce(0) { $0 + $1.content.utf8.count },
+                limits: .init(contextWindow: contextWindow, maximumOutputTokens: 8, defaultOutputTokens: 8,
+                              limitSource: .runtime, tokenCountMode: .exact))
+        }
         await onEvent(.init(requestID: request.id, sessionID: request.sessionID, modelSessionID: session.id,
                             text: "<tool_call>literal text</tool_call>"))
         let waiters = requestWaiters; requestWaiters = []
@@ -265,6 +391,41 @@ private actor ViewModelRuntime: PhoneCoderTextRuntime {
         return .init(requestID: request.id, sessionID: request.sessionID, modelSessionID: session.id,
                      promptTokens: 12, completionTokens: 8, finishReason: .stop)
     }
+}
+
+@MainActor
+private final class RecoveryFixture {
+    let runtime: ViewModelRuntime
+    let coordinator: PhoneCoderInferenceCoordinator
+    let listener: RecoveryListener
+    let controller: PhoneCoderServerController
+    init() {
+        let runtime = ViewModelRuntime()
+        self.runtime = runtime
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        self.coordinator = coordinator
+        let listener = RecoveryListener()
+        self.listener = listener
+        controller = PhoneCoderServerController(listener: listener,
+            inference: PhoneCoderInferenceLifecycle(coordinator: coordinator, ledger: .init(sessionID: UUID())),
+            intent: RecoveryIntent(), clock: PhoneCoderContinuousServerClock(), setIdleTimerDisabled: { _ in })
+    }
+}
+
+@MainActor
+private final class RecoveryListener: PhoneCoderServerListening {
+    var starts = 0
+    var failure: PhoneCoderListenerError?
+    func start(sessionID: UUID) async throws {
+        starts += 1
+        if let failure { throw failure }
+    }
+    func stop() {}
+}
+
+@MainActor
+private final class RecoveryIntent: PhoneCoderServingIntentStore {
+    var servingRequested = false
 }
 
 private final class ViewModelPairingStorage: PhoneCoderPairingStorage {

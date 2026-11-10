@@ -204,6 +204,19 @@ final class PhoneCoderServerController: ObservableObject {
         return beginStart(attempt: 0)
     }
 
+    /// Model selection can repair a start that never opened a listener.
+    /// Consult current foreground/serving intent so a late successful load
+    /// cannot undo Stop or backgrounding. A live listener only needs health.
+    func modelDidLoad() async {
+        let captured = epoch
+        // A start may already hold an unavailable snapshot just as loading
+        // finishes. Join that attempt before deciding whether it needs retry.
+        if state == .starting { await transition?.value }
+        guard captured == epoch, phase == .active, servingRequested, state == .modelUnavailable else { return }
+        if listening { await refreshHealth() }
+        else { await retryNow().value }
+    }
+
     func updateConnectionCount(_ count: Int, sessionID: UUID) {
         guard self.sessionID == sessionID, listening, phase == .active, servingRequested else { return }
         connectionCount = max(0, count)
