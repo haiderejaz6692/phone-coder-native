@@ -255,6 +255,16 @@ try:
             reject(run(verify, output), "credential content")
         print("PASS: credential content is rejected without exposing values")
 
+        # Documentation/setup placeholders are intentionally embedded in the
+        # app binary. They are instructions for the owner to substitute a
+        # runtime-generated local key, not bundled credentials.
+        placeholder = app_fixture(temp / "credential-placeholder")
+        (placeholder / "setup.txt").write_bytes(
+            b"AIDER_API_KEY=YOUR_LOCAL_API_KEY aider --model local"
+        )
+        success(run(package, placeholder, temp / "credential-placeholder.ipa"))
+        print("PASS: documented local API-key placeholder is not treated as a credential")
+
         # ZIP can preserve both spellings even when an Apple filesystem would
         # map them to the same path. Test member and ancestor collision keys.
         for label, descendant in [("members", ""), ("file-parent", "/child"),

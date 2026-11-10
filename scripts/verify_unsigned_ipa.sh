@@ -33,7 +33,7 @@ SECRET = re.compile(
     rb"github_pat_[A-Za-z0-9_]{50,}|glpat-[A-Za-z0-9_-]{20,}|"
     rb"hf_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|"
     rb"-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----|"
-    rb'''(?i:(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)["']?\s*[:=]\s*["']?[A-Za-z0-9_+/=-]{8,})'''
+    rb'''(?i:(?:api[_-]?key|access[_-]?token|client[_-]?secret|password)["']?\s*[:=]\s*["']?(?!YOUR_LOCAL_API_KEY\b)[A-Za-z0-9_+/=-]{8,})'''
 )
 # Public Mach-O/signing formats: Apple's mach-o/{loader,fat}.h and cs_blobs.h.
 # Include byte-swapped 32/64-bit headers and both universal table widths.
