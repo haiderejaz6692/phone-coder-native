@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import zipfile
 
 root = Path(sys.argv[1])
@@ -35,6 +36,22 @@ def success(result):
 
 def reject(result, reason):
     check(result.returncode != 0, f"accepted {reason}")
+
+def diagnose_unicode_archive(output, expected_name):
+    """Print non-secret ZIP filename evidence only after an unexpected acceptance."""
+    if not output.exists() or "\u017f" not in expected_name:
+        return
+    with zipfile.ZipFile(output) as archive:
+        for info in archive.infolist():
+            if "credential" not in info.filename.lower() and "weight" not in info.filename.lower():
+                continue
+            folded = unicodedata.normalize(
+                "NFD", unicodedata.normalize("NFD", info.filename).casefold())
+            print("DIAGNOSTIC member repr:", repr(info.filename))
+            print("DIAGNOSTIC code points:", " ".join(f"U+{ord(c):04X}" for c in info.filename))
+            print("DIAGNOSTIC folded repr:", repr(folded))
+            print("DIAGNOSTIC flag bits:", hex(info.flag_bits))
+            print("DIAGNOSTIC extra hex:", info.extra.hex())
 
 def app_fixture(parent):
     app = parent / "Phone Coder.app"
@@ -186,7 +203,10 @@ try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"forbidden fixture")
             output = temp / f"forbidden-{index}.ipa"
-            reject(run(package, dirty, output), name)
+            packaged = run(package, dirty, output)
+            if packaged.returncode == 0:
+                diagnose_unicode_archive(output, name)
+            reject(packaged, name)
             check(not output.exists() and not Path(str(output) + ".sha256").exists(),
                   f"published rejected {name}")
             raw_zip(dirty, output)
