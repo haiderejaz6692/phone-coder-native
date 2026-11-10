@@ -174,8 +174,59 @@ private enum ContractDecoder {
             guard row["type"] as? String == "function", let name = row["name"] as? String, !name.isEmpty, names.insert(name).inserted else { throw PhoneCoderAPIError.invalid("Invalid or duplicate tool") }
             if let description = row["description"], !(description is String) { throw PhoneCoderAPIError.invalid("Invalid tool description") }
             let parameters = row["parameters"] ?? ["type": "object", "properties": [:]]
-            guard let schema = parameters as? [String: Any], schema["type"] as? String == "object", JSONSerialization.isValidJSONObject(schema), let encoded = try? JSONSerialization.data(withJSONObject: schema, options: [.sortedKeys]), let json = String(data: encoded, encoding: .utf8) else { throw PhoneCoderAPIError.invalid("Invalid tool schema") }
+            guard let schema = parameters as? [String: Any], schema["type"] as? String == "object" else { throw PhoneCoderAPIError.invalid("Invalid tool schema") }
+            try validateSchema(schema, depth: 0)
+            guard let encoded = try? JSONSerialization.data(withJSONObject: schema, options: [.sortedKeys]), let json = String(data: encoded, encoding: .utf8) else { throw PhoneCoderAPIError.invalid("Invalid tool schema") }
             return LocalAPIToolDefinition(name: name, description: row["description"] as? String, parametersJSON: json)
+        }
+    }
+
+    // Deliberately limited JSON Schema subset. Unknown constraints fail closed.
+    private static func validateSchema(_ schema: [String: Any], depth: Int) throws {
+        guard depth <= 32, let type = schema["type"] as? String,
+              ["object", "array", "string", "number", "integer", "boolean", "null"].contains(type) else {
+            throw PhoneCoderAPIError.invalid("Invalid schema type or depth")
+        }
+        var allowed: Set<String> = ["type", "description", "enum"]
+        if type == "object" { allowed.formUnion(["properties", "required", "additionalProperties"]) }
+        if type == "array" { allowed.insert("items") }
+        try keys(schema, allowed: allowed)
+        if let description = schema["description"], !(description is String) { throw PhoneCoderAPIError.invalid("Invalid schema description") }
+        if let value = schema["enum"] {
+            guard let values = value as? [Any], !values.isEmpty, values.allSatisfy({ schemaValue($0, matches: type) }) else { throw PhoneCoderAPIError.invalid("Invalid schema enum") }
+        }
+        if type == "object" {
+            var properties: [String: Any] = [:]
+            if let value = schema["properties"] {
+                guard let object = value as? [String: Any] else { throw PhoneCoderAPIError.invalid("Invalid schema properties") }
+                properties = object
+                for value in object.values {
+                    guard let child = value as? [String: Any] else { throw PhoneCoderAPIError.invalid("Invalid property schema") }
+                    try validateSchema(child, depth: depth + 1)
+                }
+            }
+            if let value = schema["required"] {
+                guard let required = value as? [String], Set(required).count == required.count, required.allSatisfy({ properties[$0] != nil }) else { throw PhoneCoderAPIError.invalid("Invalid required properties") }
+            }
+            if let value = schema["additionalProperties"] {
+                guard let n = value as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() else { throw PhoneCoderAPIError.invalid("Invalid additionalProperties") }
+            }
+        }
+        if type == "array" {
+            guard let child = schema["items"] as? [String: Any] else { throw PhoneCoderAPIError.invalid("Array items schema required") }
+            try validateSchema(child, depth: depth + 1)
+        }
+    }
+
+    private static func schemaValue(_ value: Any, matches type: String) -> Bool {
+        switch type {
+        case "string": return value is String
+        case "number": return number(value) != nil
+        case "integer": return number(value).map { $0.isFinite && $0.rounded() == $0 } ?? false
+        case "boolean": return (value as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() } ?? false
+        case "null": return value is NSNull
+        // Composite enums are excluded from the supported subset.
+        default: return false
         }
     }
 }
