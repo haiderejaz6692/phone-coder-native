@@ -48,7 +48,7 @@ enum PhoneCoderStreamEvent: Equatable, Sendable {
     case responseFunctionArgumentsDone(PhoneCoderCompletionContext, itemID: String, outputIndex: Int, arguments: String)
     case responseItemDone(PhoneCoderCompletionContext, outputIndex: Int, item: PhoneCoderResponseItem)
     case responseCompleted(PhoneCoderCompletionContext, usage: PhoneCoderUsage, output: [PhoneCoderResponseItem] = [])
-    case responseError(PhoneCoderAPIError)
+    case responseError(PhoneCoderAPIError, param: String? = nil)
     case error(PhoneCoderAPIError)
     case done
 }
@@ -95,12 +95,18 @@ enum PhoneCoderAPIEncoder {
             name = "response.output_item.done"; object = ["response_id": c.id, "output_index": index, "item": item.object]
         case let .responseCompleted(c, usage, output):
             name = "response.completed"; object = ["response": response(c, status: "completed", usage: usage, output: output)]
-        case .responseError(let error): name = "error"; object = ["error": ["code": error.code, "message": error.message]]
+        case let .responseError(error, param): name = "error"; object = ["code": error.code, "message": error.message, "param": param as Any? ?? NSNull()]
         case .error(let error): name = "error"; object = ["error": ["code": error.code, "message": error.message]]
         case .done: name = nil; object = nil
         }
         var body = object
         if let name { body?["type"] = name }
+        switch event {
+        case .chatStart, .chatText, .chatFinish, .chatUsage, .error, .done:
+            break
+        default:
+            body?["sequence_number"] = id
+        }
         let payload: String
         if let body {
             guard let text = String(data: try encoded(body), encoding: .utf8) else { throw PhoneCoderAPIError.invalid("Invalid UTF-8") }

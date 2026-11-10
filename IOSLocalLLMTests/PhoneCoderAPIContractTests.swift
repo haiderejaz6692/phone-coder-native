@@ -113,6 +113,43 @@ final class PhoneCoderAPIContractTests: XCTestCase {
         XCTAssertEqual(((nonstream["output"] as? [[String: Any]])?.first)?["call_id"] as? String, "call-1")
     }
 
+    func testResponsesEventsCarrySSESequenceAndTopLevelErrorFields() throws {
+        let c = PhoneCoderCompletionContext(id: "r", model: "m", created: 1)
+        let item = PhoneCoderResponseItem.message(id: "i", text: "hi")
+        let error = PhoneCoderAPIError.invalid("bad input")
+        let events: [PhoneCoderStreamEvent] = [
+            .responseCreated(c), .responseInProgress(c),
+            .responseMessageAdded(c, itemID: "i", outputIndex: 0),
+            .responseContentPartAdded(c, itemID: "i", outputIndex: 0, contentIndex: 0),
+            .responseTextDelta(c, itemID: "i", outputIndex: 0, contentIndex: 0, delta: "hi"),
+            .responseTextDone(c, itemID: "i", outputIndex: 0, contentIndex: 0, text: "hi"),
+            .responseContentPartDone(c, itemID: "i", outputIndex: 0, contentIndex: 0, text: "hi"),
+            .responseFunctionAdded(c, itemID: "f", outputIndex: 1, callID: "call", name: "read"),
+            .responseFunctionArgumentsDelta(c, itemID: "f", outputIndex: 1, delta: "{}"),
+            .responseFunctionArgumentsDone(c, itemID: "f", outputIndex: 1, arguments: "{}"),
+            .responseItemDone(c, outputIndex: 0, item: item),
+            .responseCompleted(c, usage: PhoneCoderUsage(inputTokens: 1, outputTokens: 1)),
+            .responseError(error), .responseError(error, param: "input")
+        ]
+        for (offset, event) in events.enumerated() {
+            let id = offset + 10
+            let frame = try XCTUnwrap(String(data: PhoneCoderAPIEncoder.sse(id: id, event: event), encoding: .utf8))
+            XCTAssertTrue(frame.hasPrefix("id: \(id)\n"))
+            let line = try XCTUnwrap(frame.components(separatedBy: "\n").first { $0.hasPrefix("data: ") })
+            let body = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(line.dropFirst(6).utf8)) as? [String: Any])
+            XCTAssertEqual(body["sequence_number"] as? Int, id)
+        }
+        let absent = try payload(.responseError(error))
+        XCTAssertEqual(absent["type"] as? String, "error")
+        XCTAssertEqual(absent["code"] as? String, "invalid_request")
+        XCTAssertEqual(absent["message"] as? String, "bad input")
+        XCTAssertTrue(absent["param"] is NSNull)
+        XCTAssertNil(absent["error"])
+        let present = try payload(.responseError(error, param: "input"))
+        XCTAssertEqual(present["param"] as? String, "input")
+        XCTAssertNil(try payload(.chatText(c, "hi"))["sequence_number"])
+    }
+
     private func payload(_ event: PhoneCoderStreamEvent) throws -> [String: Any] {
         let frame = try XCTUnwrap(String(data: PhoneCoderAPIEncoder.sse(id: 1, event: event), encoding: .utf8))
         let line = try XCTUnwrap(frame.components(separatedBy: "\n").first { $0.hasPrefix("data: ") })
