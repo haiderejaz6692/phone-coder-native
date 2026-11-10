@@ -15,6 +15,7 @@ import yaml
 root = Path(sys.argv[1])
 original = yaml.load((root / ".github/workflows/phone-coder-ios.yml").read_text(), Loader=yaml.BaseLoader)
 original_codeql = (root / ".github/workflows/codeql.yml").read_text()
+original_source_release = (root / ".github/workflows/source-release.yml").read_text()
 original_lock = (root / "Podfile.lock").read_text()
 
 def replace_command(workflow, step_id, command, replacement):
@@ -52,6 +53,7 @@ with tempfile.TemporaryDirectory() as temporary:
     shutil.copyfile(root / "scripts/validate_phone_coder_workflows.sh", fixture / "scripts/validate_phone_coder_workflows.sh")
     shutil.copyfile(root / ".github/workflows/validate.yml", fixture / ".github/workflows/validate.yml")
     shutil.copyfile(root / ".github/workflows/codeql.yml", fixture / ".github/workflows/codeql.yml")
+    shutil.copyfile(root / ".github/workflows/source-release.yml", fixture / ".github/workflows/source-release.yml")
     shutil.copyfile(root / "Podfile", fixture / "Podfile")
     shutil.copyfile(root / "Podfile.lock", fixture / "Podfile.lock")
 
@@ -62,6 +64,14 @@ with tempfile.TemporaryDirectory() as temporary:
     baseline = validate(original)
     assert baseline.returncode == 0, baseline.stdout + baseline.stderr
     print("PASS: unchanged workflow is accepted")
+    prefixed_branch = copy.deepcopy(original)
+    prefixed_branch["on"]["push"]["branches"].append("codex/**")
+    result = validate(prefixed_branch)
+    if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+        failures.append("reserved feature-branch prefix")
+        print("FAIL: accepted reserved feature-branch prefix")
+    else:
+        print("PASS: rejects reserved feature-branch prefix")
     for name, old, new in [
         ("stale CodeQL product identity", "PhoneCoder.xcworkspace", "OnDeviceLAS.xcworkspace"),
         ("full native CodeQL build", "./scripts/build_native_frameworks.sh --llama-only", "./scripts/build_native_frameworks.sh"),
@@ -86,6 +96,22 @@ with tempfile.TemporaryDirectory() as temporary:
     else:
         print("PASS: rejects stale Podfile checksum")
     (fixture / "Podfile.lock").write_text(original_lock)
+    for name, old, new in [
+        ("retired source artifact name", "phone-coder-${version}-source.tar.gz", "ios-local-llm-${version}-source.tar.gz"),
+        ("retired source archive root", "phone-coder-${version}/", "ios-local-llm-${version}/"),
+        ("retired source release title", "Phone Coder $RELEASE_TAG", "iOS Local LLM $RELEASE_TAG"),
+    ]:
+        assert original_source_release.count(old) == 1
+        (fixture / ".github/workflows/source-release.yml").write_text(
+            original_source_release.replace(old, new)
+        )
+        result = validate(original)
+        if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+            failures.append(name)
+            print(f"FAIL: accepted {name}")
+        else:
+            print(f"PASS: rejects {name}")
+        (fixture / ".github/workflows/source-release.yml").write_text(original_source_release)
     for name, step_id, command, replacement in mutations:
         changed = copy.deepcopy(original)
         replace_command(changed, step_id, command, replacement)

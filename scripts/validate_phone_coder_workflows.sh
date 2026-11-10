@@ -45,6 +45,8 @@ try:
     workflow = read_workflow(workflow_path)
     require(set(workflow["on"]) == {"push", "pull_request", "workflow_dispatch"},
             "build must use ordinary push/PR/manual events only")
+    require(workflow["on"]["push"]["branches"] == ["main"],
+            "feature branches must build through pull requests, not a reserved prefix")
     require(workflow["permissions"] == {"contents": "read"}, "build permissions must be read-only")
     require(set(workflow["jobs"]) == {"phone-coder-ios"}, "expected one Phone Coder build job")
     job = workflow["jobs"]["phone-coder-ios"]
@@ -240,6 +242,23 @@ try:
     lock_text = (root / "Podfile.lock").read_text(encoding="utf-8")
     require(f"PODFILE CHECKSUM: {podfile_checksum}" in lock_text,
             "Podfile.lock checksum must match Podfile for deployment installs")
+
+    source_release = read_workflow(root / ".github/workflows/source-release.yml")
+    require(source_release["on"] == {"push": {"tags": ["v[0-9]+.[0-9]+.[0-9]+"]}},
+            "source releases must run only for semantic-version tags")
+    release_job = source_release["jobs"]["source-release"]
+    release_steps = {step.get("id", step.get("name")): step for step in release_job["steps"]}
+    package_script = release_steps["package"]["run"]
+    publish_script = release_steps["Publish GitHub release"]["run"]
+    require('artifact="phone-coder-${version}-source.tar.gz"' in package_script,
+            "source archive must use Phone Coder naming")
+    require('--prefix="phone-coder-${version}/"' in package_script,
+            "source archive root must use Phone Coder naming")
+    require('--title "Phone Coder $RELEASE_TAG"' in publish_script,
+            "GitHub source release must use Phone Coder naming")
+    release_text = (root / ".github/workflows/source-release.yml").read_text(encoding="utf-8")
+    require("ios-local-llm" not in release_text.lower(),
+            "source release must not publish the retired product name")
 except (KeyError, TypeError, ValueError, AttributeError):
     sys.exit("FAIL: missing or invalid workflow configuration")
 print("PASS: Phone Coder CI pins, test gates, unsigned packaging, metadata, and artifact allowlist")
