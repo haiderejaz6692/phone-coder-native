@@ -60,7 +60,7 @@ actor PhoneCoderRequestLedger {
         if let record = records[id] {
             guard record.ownerClientID == ownerClientID else { throw Self.notFound }
             guard record.fingerprint == fingerprint else { throw Self.conflict }
-            guard sessionID == self.sessionID, record.sessionID == sessionID else { throw Self.staleSession }
+            guard sessionID == self.sessionID, isReadable(record) else { throw Self.staleSession }
             return .existing
         }
         if let previous = tombstones[id] {
@@ -152,7 +152,7 @@ actor PhoneCoderRequestLedger {
         }
         guard record.ownerClientID == ownerClientID else { throw Self.notFound }
         guard record.fingerprint == fingerprint else { throw Self.conflict }
-        guard record.sessionID == sessionID else { throw Self.staleSession }
+        guard isReadable(record) else { throw Self.staleSession }
         let last = eventID ?? 0
         guard last >= 0 && last < record.nextID else { throw PhoneCoderAPIError.invalid("Invalid event ID") }
         if let first = record.events.first, last < first.id - 1 { throw Self.expired }
@@ -195,7 +195,7 @@ actor PhoneCoderRequestLedger {
         }
         guard record.ownerClientID == ownerClientID else { throw Self.notFound }
         guard record.fingerprint == fingerprint else { throw Self.conflict }
-        guard record.sessionID == sessionID else { throw Self.staleSession }
+        guard isReadable(record) else { throw Self.staleSession }
         return record.responseBody
     }
 
@@ -205,7 +205,7 @@ actor PhoneCoderRequestLedger {
         if let record = records[id] {
             guard record.ownerClientID == ownerClientID else { throw Self.notFound }
             guard record.fingerprint == fingerprint else { throw Self.conflict }
-            guard record.sessionID == sessionID else { throw Self.staleSession }
+            guard isReadable(record) else { throw Self.staleSession }
             return true
         }
         if let old = tombstones[id] {
@@ -214,6 +214,12 @@ actor PhoneCoderRequestLedger {
             throw Self.expired
         }
         return false
+    }
+
+    /// Rotation invalidates execution, not bounded replay of terminal results.
+    /// Callers must verify owner and fingerprint before consulting this predicate.
+    private func isReadable(_ record: Record) -> Bool {
+        record.sessionID == sessionID || record.terminal != nil
     }
 
     private func cancelInternal(id: PhoneCoderRequestID, reason: PhoneCoderCancellationReason) -> Bool {

@@ -46,7 +46,9 @@ final class PhoneCoderRequestLedgerTests: XCTestCase {
         catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "replay_expired") }
     }
 
-    func testOwnedPayloadCannotReplayAcrossSessionAndTerminalFramesShareBudget() async throws {
+    // Catches rejecting terminal payload/lookup reads after rotation or granting
+    // fresh execution ownership for a retained ID; preserves the byte-budget guard.
+    func testOwnedTerminalPayloadReplaysAcrossSessionAndTerminalFramesShareBudget() async throws {
         let session = UUID(), owner = UUID()
         let hash = SHA256.hash(data: Data("body".utf8))
         let ledger = PhoneCoderRequestLedger(sessionID: session, outputByteLimit: 256)
@@ -60,9 +62,97 @@ final class PhoneCoderRequestLedgerTests: XCTestCase {
         let next = PhoneCoderRequestID(rawValue: "next-session")
         _ = try await ledger.begin(id: next, fingerprint: hash, sessionID: session, deadline: .now, ownerClientID: owner)
         try await ledger.finish(id: next, terminal: .completed, sessionID: session, responseBody: Data("{}".utf8))
+        let newSession = UUID()
+        await ledger.setSessionID(newSession)
+        let payload = try await ledger.responseBody(id: next, fingerprint: hash, ownerClientID: owner)
+        XCTAssertEqual(payload, Data("{}".utf8))
+        let retained = try await ledger.existing(id: next, fingerprint: hash, ownerClientID: owner)
+        XCTAssertTrue(retained)
+        let replay = try await ledger.begin(id: next, fingerprint: hash, sessionID: newSession, deadline: .now, ownerClientID: owner)
+        XCTAssertEqual(replay, .existing, "A retained terminal ID must never become an execution owner")
+    }
+
+    // Catches applying the current-session execution guard to a completed stream,
+    // losing retained sequence IDs, or leaving a terminal reattachment open.
+    func testCompletedStreamReplaysRetainedEventsAndEndsAfterSessionRotation() async throws {
+        let owner = UUID()
+        let ledger = PhoneCoderRequestLedger(sessionID: session)
+        _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline, ownerClientID: owner)
+        _ = try await ledger.append(id: id, event: .chatText(context, "first"), sessionID: session)
+        _ = try await ledger.append(id: id, event: .chatText(context, "second"), sessionID: session)
+        try await ledger.finish(id: id, terminal: .completed, sessionID: session, finalEvents: [.done])
         await ledger.setSessionID(UUID())
-        do { _ = try await ledger.responseBody(id: next, fingerprint: hash, ownerClientID: owner); XCTFail("Session payload replay") }
-        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "stale_session") }
+        let stream = try await ledger.attach(id: id, fingerprint: fingerprint, after: 1, ownerClientID: owner)
+        let events = await terminalEvents(in: stream)
+        XCTAssertEqual(events.map(\.id), [2, 3])
+        XCTAssertEqual(events.map(\.event), [.chatText(context, "second"), .done])
+    }
+
+    // Catches rejecting interrupted terminal records after rotation, changing the
+    // cancellation outcome, or registering terminal reattachments as live work.
+    func testBackgroundAndSessionEndedCancellationReplayWithoutLiveSubscribers() async throws {
+        for reason in [PhoneCoderCancellationReason.serverStopped, .sessionEnded] {
+            let owner = UUID(), newSession = UUID()
+            let ledger = PhoneCoderRequestLedger(sessionID: session, subscriberLimit: 1)
+            _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline,
+                ownerClientID: owner, terminalEvents: { _ in [.done] })
+            _ = try await ledger.append(id: id, event: .chatText(context, "partial"), sessionID: session)
+            if reason == .serverStopped { await ledger.cancelAll(reason: .serverStopped) }
+            await ledger.setSessionID(newSession)
+            let first = try await ledger.attach(id: id, fingerprint: fingerprint, after: nil, ownerClientID: owner)
+            let second = try await ledger.attach(id: id, fingerprint: fingerprint, after: nil, ownerClientID: owner)
+            let events = await terminalEvents(in: first)
+            let repeated = await terminalEvents(in: second)
+            XCTAssertEqual(events.map(\.event), [.chatText(context, "partial"), .done])
+            XCTAssertEqual(repeated, events)
+            let terminal = try await ledger.terminal(id: id, ownerClientID: owner)
+            XCTAssertEqual(terminal, .cancelled(reason))
+            let replay = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: newSession, deadline: deadline, ownerClientID: owner)
+            XCTAssertEqual(replay, .existing)
+        }
+    }
+
+    // Catches moving terminal-read permission ahead of owner/fingerprint checks,
+    // including leaking a conflict to a caller who does not own the record.
+    func testTerminalReplayAcrossRotationStillEnforcesOwnerAndFingerprint() async throws {
+        let owner = UUID(), other = UUID(), newSession = UUID()
+        let ledger = PhoneCoderRequestLedger(sessionID: session)
+        let different = SHA256.hash(data: Data("different".utf8))
+        _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline, ownerClientID: owner)
+        try await ledger.finish(id: id, terminal: .completed, sessionID: session, finalEvents: [.done], responseBody: Data("{}".utf8))
+        await ledger.setSessionID(newSession)
+        for (client, hash, expected) in [
+            (Optional(other), fingerprint, "request_not_found"),
+            (Optional(other), different, "request_not_found"),
+            (nil, fingerprint, "request_not_found"),
+            (Optional(owner), different, "request_conflict")
+        ] {
+            await assertAPIError(expected) { _ = try await ledger.existing(id: self.id, fingerprint: hash, ownerClientID: client) }
+            await assertAPIError(expected) { _ = try await ledger.attach(id: self.id, fingerprint: hash, after: nil, ownerClientID: client) }
+            await assertAPIError(expected) { _ = try await ledger.responseBody(id: self.id, fingerprint: hash, ownerClientID: client) }
+            await assertAPIError(expected) {
+                _ = try await ledger.begin(id: self.id, fingerprint: hash, sessionID: newSession, deadline: self.deadline, ownerClientID: client)
+            }
+        }
+    }
+
+    // Catches retaining cross-session payloads past the completed-record bound,
+    // dropping tombstone enforcement, or granting ownership to an evicted ID.
+    func testCrossSessionTerminalReplayStillExpiresWhenEvicted() async throws {
+        let owner = UUID(), newSession = UUID()
+        let ledger = PhoneCoderRequestLedger(sessionID: session, completedRecordLimit: 1)
+        _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline, ownerClientID: owner)
+        try await ledger.finish(id: id, terminal: .completed, sessionID: session, finalEvents: [.done], responseBody: Data("{}".utf8))
+        await ledger.setSessionID(newSession)
+        let other = PhoneCoderRequestID(rawValue: "replacement")
+        _ = try await ledger.begin(id: other, fingerprint: fingerprint, sessionID: newSession, deadline: deadline, ownerClientID: owner)
+        try await ledger.finish(id: other, terminal: .completed, sessionID: newSession)
+        await assertAPIError("replay_expired") { _ = try await ledger.existing(id: self.id, fingerprint: self.fingerprint, ownerClientID: owner) }
+        await assertAPIError("replay_expired") { _ = try await ledger.attach(id: self.id, fingerprint: self.fingerprint, after: nil, ownerClientID: owner) }
+        await assertAPIError("replay_expired") { _ = try await ledger.responseBody(id: self.id, fingerprint: self.fingerprint, ownerClientID: owner) }
+        await assertAPIError("replay_expired") {
+            _ = try await ledger.begin(id: self.id, fingerprint: self.fingerprint, sessionID: newSession, deadline: self.deadline, ownerClientID: owner)
+        }
     }
 
     private let id = PhoneCoderRequestID(rawValue: "request")
@@ -202,15 +292,51 @@ final class PhoneCoderRequestLedgerTests: XCTestCase {
         XCTAssertFalse(cancelled)
     }
 
+    // Catches using terminal-read permission for stale admission or writes, and
+    // granting a fresh execution lease for the prior session's retained ID.
     func testSessionChangeRejectsStaleBeginsAndCallbacks() async throws {
         let ledger = PhoneCoderRequestLedger(sessionID: session)
         _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline)
-        await ledger.setSessionID(UUID())
-        do { _ = try await ledger.begin(id: PhoneCoderRequestID(rawValue: "new"), fingerprint: fingerprint, sessionID: session, deadline: deadline); XCTFail("Expected stale session") }
-        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "stale_session") }
-        do { _ = try await ledger.append(id: id, event: .done, sessionID: session); XCTFail("Expected stale callback") }
-        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "stale_session") }
+        let newSession = UUID()
+        await ledger.setSessionID(newSession)
+        for requestID in [id, PhoneCoderRequestID(rawValue: "new")] {
+            await assertAPIError("stale_session") {
+                _ = try await ledger.begin(id: requestID, fingerprint: self.fingerprint, sessionID: self.session, deadline: self.deadline)
+            }
+        }
+        for callbackSession in [session, newSession] {
+            await assertAPIError("stale_session") {
+                _ = try await ledger.append(id: self.id, event: .done, sessionID: callbackSession)
+            }
+            await assertAPIError("stale_session") {
+                try await ledger.finish(id: self.id, terminal: .completed, sessionID: callbackSession)
+            }
+        }
+        let replay = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: newSession, deadline: deadline)
+        XCTAssertEqual(replay, .existing)
+        let fresh = try await ledger.begin(id: .init(rawValue: "fresh"), fingerprint: fingerprint, sessionID: newSession, deadline: deadline)
+        XCTAssertEqual(fresh, .owner)
         let terminal = try await ledger.terminal(id: id)
         XCTAssertEqual(terminal, .cancelled(.sessionEnded))
+    }
+
+    private func assertAPIError(_ code: String, file: StaticString = #filePath, line: UInt = #line,
+                                operation: () async throws -> Void) async {
+        do { try await operation(); XCTFail("Expected \(code)", file: file, line: line) }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, code, file: file, line: line) }
+        catch { XCTFail("Unexpected error: \(error)", file: file, line: line) }
+    }
+
+    private func terminalEvents(in stream: AsyncStream<PhoneCoderRequestLedger.SequencedEvent>) async -> [PhoneCoderRequestLedger.SequencedEvent] {
+        let ended = expectation(description: "Retained terminal replay ends without waiting for new work")
+        let reader = Task {
+            var events: [PhoneCoderRequestLedger.SequencedEvent] = []
+            for await event in stream { events.append(event) }
+            ended.fulfill()
+            return events
+        }
+        await fulfillment(of: [ended], timeout: 2)
+        reader.cancel() // Also release a stuck iterator if the terminal-close assertion failed.
+        return await reader.value
     }
 }
