@@ -872,11 +872,10 @@ public struct FastVLMConfiguration: Decodable, Sendable {
             // differently. Try each variant in turn; default to 3072 (the
             // FastViT-HD output dim used by the 0.5B/1.5B/7B family) so a
             // missing field doesn't kill the whole load.
-            self.hiddenSize =
-                (try? c.decodeIfPresent(Int.self, forKey: .mmHiddenSize)).flatMap { $0 }
-                ?? (try? c.decodeIfPresent(Int.self, forKey: .visionHiddenSize)).flatMap { $0 }
-                ?? (try? c.decodeIfPresent(Int.self, forKey: .mmProjectorDim)).flatMap { $0 }
-                ?? 3072
+            let mmHiddenSize: Int? = try? c.decodeIfPresent(Int.self, forKey: .mmHiddenSize)
+            let visionHiddenSize: Int? = try? c.decodeIfPresent(Int.self, forKey: .visionHiddenSize)
+            let mmProjectorDim: Int? = try? c.decodeIfPresent(Int.self, forKey: .mmProjectorDim)
+            self.hiddenSize = mmHiddenSize ?? visionHiddenSize ?? mmProjectorDim ?? 3072
         }
     }
 
