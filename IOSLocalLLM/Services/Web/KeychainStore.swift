@@ -77,6 +77,43 @@ public enum KeychainStore {
         SecItemDelete(q as CFDictionary)
     }
 
+    public struct CheckedError: Error {
+        public let status: OSStatus
+    }
+
+    public static func setChecked(_ value: String, account: String, serviceName: String) throws {
+        let data = Data(value.utf8)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: serviceName,
+                                    kSecAttrAccount as String: account]
+        let status = SecItemUpdate(query as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        if status == errSecItemNotFound {
+            var attributes = query
+            attributes[kSecValueData as String] = data
+            attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            let addStatus = SecItemAdd(attributes as CFDictionary, nil)
+            guard addStatus == errSecSuccess else { throw CheckedError(status: addStatus) }
+        } else if status != errSecSuccess {
+            throw CheckedError(status: status)
+        }
+    }
+
+    public static func getChecked(account: String, serviceName: String) throws -> String? {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: serviceName,
+                                    kSecAttrAccount as String: account,
+                                    kSecReturnData as String: true,
+                                    kSecMatchLimit as String: kSecMatchLimitOne]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw CheckedError(status: status) }
+        guard let data = item as? Data, let value = String(data: data, encoding: .utf8) else {
+            throw CheckedError(status: errSecDecode)
+        }
+        return value
+    }
+
     /// Removes every web-tool API key stored under this service namespace.
     static func deleteAll() {
         for account in knownAccounts {

@@ -258,6 +258,7 @@ targets:
       - path: IOSLocalLLMTests/PhoneCoderRootNavigationTests.swift
       - path: IOSLocalLLMTests/PhoneCoderAPIContractTests.swift
       - path: IOSLocalLLMTests/PhoneCoderRequestLedgerTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderPairingTests.swift
     dependencies:
       - target: PhoneCoder
     settings:
