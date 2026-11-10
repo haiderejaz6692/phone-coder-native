@@ -69,6 +69,36 @@ final class PhoneCoderRequestLedgerTests: XCTestCase {
         catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "replay_expired") }
     }
 
+    func testEvictedRecordRetainsOnlyBoundedFingerprintTombstone() async throws {
+        let ledger = PhoneCoderRequestLedger(sessionID: session, completedRecordLimit: 1)
+        let different = SHA256.hash(data: Data("different".utf8))
+        let second = PhoneCoderRequestID(rawValue: "second")
+        let third = PhoneCoderRequestID(rawValue: "third")
+        _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline)
+        _ = try await ledger.append(id: id, event: .chatText(context, "private payload"))
+        try await ledger.finish(id: id, terminal: .completed)
+        _ = try await ledger.begin(id: second, fingerprint: fingerprint, sessionID: session, deadline: deadline)
+        try await ledger.finish(id: second, terminal: .completed)
+
+        do { _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline); XCTFail("Eviction must not grant ownership") }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "replay_expired") }
+        do { _ = try await ledger.begin(id: id, fingerprint: different, sessionID: session, deadline: deadline); XCTFail("Expected conflict") }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "request_conflict") }
+        do { _ = try await ledger.attach(id: id, fingerprint: fingerprint, after: nil); XCTFail("Evicted payload must not be replayable") }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "replay_expired") }
+        do { _ = try await ledger.attach(id: id, fingerprint: different, after: nil); XCTFail("Expected conflict") }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "request_conflict") }
+        do { _ = try await ledger.terminal(id: id); XCTFail("Terminal record must be evicted") }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "replay_expired") }
+
+        _ = try await ledger.begin(id: third, fingerprint: fingerprint, sessionID: session, deadline: deadline)
+        try await ledger.finish(id: third, terminal: .completed)
+        let reused = try await ledger.begin(id: id, fingerprint: different, sessionID: session, deadline: deadline)
+        XCTAssertEqual(reused, .owner)
+        do { _ = try await ledger.begin(id: second, fingerprint: fingerprint, sessionID: session, deadline: deadline); XCTFail("Newest tombstone must remain") }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "replay_expired") }
+    }
+
     func testExpiryAndOutputLimitTerminateOnce() async throws {
         let ledger = PhoneCoderRequestLedger(sessionID: session, outputByteLimit: 1)
         _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline)

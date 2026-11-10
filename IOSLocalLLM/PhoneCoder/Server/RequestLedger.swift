@@ -36,6 +36,9 @@ actor PhoneCoderRequestLedger {
     private let outputByteLimit: Int
     private var records: [PhoneCoderRequestID: Record] = [:]
     private var completedIDs: [PhoneCoderRequestID] = []
+    // Evicted responses retain only bounded identity metadata, never events.
+    private var tombstones: [PhoneCoderRequestID: SHA256.Digest] = [:]
+    private var tombstoneIDs: [PhoneCoderRequestID] = []
 
     init(sessionID: UUID, replayEventLimit: Int = 256, completedRecordLimit: Int = 128, outputByteLimit: Int = 8_388_608) {
         precondition(replayEventLimit > 0 && completedRecordLimit > 0 && outputByteLimit > 0)
@@ -51,11 +54,16 @@ actor PhoneCoderRequestLedger {
             guard sessionID == self.sessionID, record.sessionID == sessionID else { throw Self.staleSession }
             return .existing
         }
+        if let previousFingerprint = tombstones[id] {
+            guard previousFingerprint == fingerprint else { throw Self.conflict }
+            throw Self.expired
+        }
         guard sessionID == self.sessionID else { throw Self.staleSession }
         records[id] = Record(fingerprint: fingerprint, sessionID: sessionID, deadline: deadline)
         return .owner
     }
 
+    /// Convenience for synchronous owners; inference callbacks must pass their captured session ID.
     func append(id: PhoneCoderRequestID, event: PhoneCoderStreamEvent) throws -> SequencedEvent {
         try append(id: id, event: event, sessionID: sessionID)
     }
@@ -80,6 +88,7 @@ actor PhoneCoderRequestLedger {
         return sequenced
     }
 
+    /// Convenience for synchronous owners; inference callbacks must pass their captured session ID.
     func finish(id: PhoneCoderRequestID, terminal: PhoneCoderTerminalResult) throws {
         try finish(id: id, terminal: terminal, sessionID: sessionID)
     }
@@ -98,7 +107,10 @@ actor PhoneCoderRequestLedger {
     }
 
     func attach(id: PhoneCoderRequestID, fingerprint: SHA256.Digest, after eventID: Int?) throws -> AsyncStream<SequencedEvent> {
-        guard var record = records[id] else { throw Self.expired }
+        guard var record = records[id] else {
+            if let previousFingerprint = tombstones[id], previousFingerprint != fingerprint { throw Self.conflict }
+            throw Self.expired
+        }
         guard record.fingerprint == fingerprint else { throw Self.conflict }
         let last = eventID ?? 0
         guard last >= 0 && last < record.nextID else { throw PhoneCoderAPIError.invalid("Invalid event ID") }
@@ -150,7 +162,14 @@ actor PhoneCoderRequestLedger {
         records[id] = record
         completedIDs.append(id)
         while completedIDs.count > completedRecordLimit {
-            records.removeValue(forKey: completedIDs.removeFirst())
+            let evictedID = completedIDs.removeFirst()
+            if let evicted = records.removeValue(forKey: evictedID) {
+                tombstones[evictedID] = evicted.fingerprint
+                tombstoneIDs.append(evictedID)
+            }
+            if tombstoneIDs.count > completedRecordLimit {
+                tombstones.removeValue(forKey: tombstoneIDs.removeFirst())
+            }
         }
     }
 
