@@ -37,7 +37,7 @@ for relative_path in IOSLocalLLM/BrandingRegression.swift README.md docs/brandin
   git -C "$test_root" add -- "$relative_path"
   run_validator
   [[ "$status" != 0 ]] || fail "retired branding escaped enforcement in $relative_path"
-  grep -Fq "$relative_path" "$test_root/validation-output" || fail 'validator must identify the offending product file'
+  grep -Fiq "$relative_path" "$test_root/validation-output" || fail 'validator must identify the offending product file'
   cp "$test_root/original" "$test_root/$relative_path"
   git -C "$test_root" add -- "$relative_path"
 done
