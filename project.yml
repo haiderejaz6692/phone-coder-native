@@ -256,6 +256,7 @@ targets:
       - path: IOSLocalLLMTests/URLSafetyValidatorTests.swift
       - path: IOSLocalLLMTests/PhoneCoderAppIdentityTests.swift
       - path: IOSLocalLLMTests/PhoneCoderRootNavigationTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderAPIContractTests.swift
     dependencies:
       - target: PhoneCoder
     settings:
