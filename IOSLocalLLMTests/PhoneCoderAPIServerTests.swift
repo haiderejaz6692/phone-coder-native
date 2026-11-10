@@ -7,6 +7,61 @@ import XCTest
 
 @MainActor
 final class PhoneCoderAPIServerTests: XCTestCase {
+    func testDeleteDuringEveryAdmissionWindowCannotRestartCancelledWork() async throws {
+        for checkpoint in PhoneCoderAPIServer.AdmissionCheckpoint.allCases {
+            let barrier = APIAdmissionBarrier(checkpoint)
+            let fixture = try await APIServerFixture.make(held: true, admissionCheckpoint: { await barrier.visit($0) })
+            defer { fixture.close() }
+            let id = UUID().uuidString
+            let body = Data(#"{"model":"test-model","messages":[{"role":"user","content":"x"}],"stream":true}"#.utf8)
+            let original = Task { try await fixture.exchange(method: "POST", path: "/v1/chat/completions", id: id, body: body) }
+            await barrier.waitForEntry()
+            let stranger = try await fixture.store.create(name: "Stranger")
+            let denied = try await fixture.exchange(method: "DELETE", path: "/v1/requests/\(id)", id: id, bearer: stranger.bearer)
+            XCTAssertTrue(denied.hasPrefix("HTTP/1.1 404"))
+            let cancelled = try await fixture.exchange(method: "DELETE", path: "/v1/requests/\(id)", id: id)
+            XCTAssertTrue(cancelled.hasPrefix("HTTP/1.1 200"))
+            await barrier.release()
+            let response = try await original.value
+            XCTAssertTrue(response.contains("request_cancelled"))
+            XCTAssertFalse(response.contains("\"finish_reason\":\"stop\""))
+            let started = await fixture.runtime.startedCount
+            if checkpoint != .enqueued { XCTAssertEqual(started, 0) }
+            let replay = try await fixture.exchange(method: "POST", path: "/v1/chat/completions", id: id, body: body)
+            XCTAssertTrue(replay.contains("request_cancelled"))
+            let afterReplay = await fixture.runtime.startedCount
+            XCTAssertEqual(afterReplay, started)
+        }
+    }
+
+    func testAcceptanceRequiresTheActualOverlayPathNotOnlyCGNATAddresses() {
+        func path(_ name: String, _ kind: PhoneCoderConnectionPath.Interface.Kind) -> PhoneCoderConnectionPath {
+            .init(satisfied: true, usedInterfaces: [.init(name: name, kind: kind)])
+        }
+        XCTAssertTrue(PhoneCoderNetworkExposure.accepts(local: "127.0.0.1", peer: "127.0.0.1", path: path("lo0", .loopback)))
+        XCTAssertTrue(PhoneCoderNetworkExposure.accepts(local: "::1", peer: "::1", path: .init(satisfied: true, usedInterfaces: [])))
+        XCTAssertTrue(PhoneCoderNetworkExposure.accepts(local: "100.100.1.1", peer: "100.100.1.2", path: path("utun4", .other)))
+        XCTAssertTrue(PhoneCoderNetworkExposure.accepts(local: "fd7a:115c:a1e0::1", peer: "fd7a:115c:a1e0::2", path: path("utun3", .other)))
+        for (name, kind) in [("pdp_ip0", PhoneCoderConnectionPath.Interface.Kind.cellular), ("en0", .wifi), ("en1", .wired), ("awdl0", .other), ("ipsec0", .other), ("utun3", .cellular)] {
+            XCTAssertFalse(PhoneCoderNetworkExposure.accepts(local: "100.100.1.1", peer: "100.100.1.2", path: path(name, kind)))
+        }
+        XCTAssertFalse(PhoneCoderNetworkExposure.accepts(local: "100.100.1.1", peer: "100.100.1.2", path: .init(satisfied: true, usedInterfaces: [])))
+        XCTAssertFalse(PhoneCoderNetworkExposure.accepts(local: "100.100.1.1", peer: "100.100.1.2", path: .init(satisfied: false, usedInterfaces: [.init(name: "utun4", kind: .other)])))
+        XCTAssertFalse(PhoneCoderNetworkExposure.accepts(local: "192.168.1.2", peer: "100.100.1.2", path: path("utun4", .other)))
+        XCTAssertFalse(PhoneCoderNetworkExposure.accepts(local: "100.100.1.1", peer: "100.100.1.2", path: .init(satisfied: true,
+            usedInterfaces: [.init(name: "utun4", kind: .other), .init(name: "pdp_ip0", kind: .cellular)])))
+    }
+
+    func testBoundedRepeatedStopPrefixesRemainCorrectAcrossManyChunks() {
+        let stop = String(repeating: "a", count: 255) + "b"
+        var buffer = PhoneCoderStopBuffer(stops: [stop])
+        var visible = ""
+        for _ in 0..<1024 { visible += buffer.consume(String(repeating: "a", count: 256)) }
+        visible += buffer.consume("bhidden")
+        XCTAssertTrue(buffer.stopped)
+        XCTAssertEqual(visible.count, 1024 * 256 - 255)
+        XCTAssertEqual(buffer.finish(), "")
+    }
     func testAuthenticationPrecedesBodyAndRotationRevokesPreviousCredential() async throws {
         let fixture = try await APIServerFixture.make()
         defer { fixture.close() }
@@ -316,6 +371,7 @@ private actor APITestRuntime: PhoneCoderTextRuntime {
     private var started: [CheckedContinuation<Void, Never>] = []
     private var continuation: CheckedContinuation<Void, Error>?
     private var held: Bool
+    private var cancelledIDs = Set<PhoneCoderRequestID>()
     private let output: [String]
     private var availability: PhoneCoderRuntimeAvailability = .available
     init(held: Bool, output: [String]) { self.held = held; self.output = output }
@@ -333,8 +389,10 @@ private actor APITestRuntime: PhoneCoderTextRuntime {
         return .init(prompt: .init(tokens: 7, mode: .exact), limits: value.limits, outputTokens: output)
     }
     func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession, onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult {
+        guard !cancelledIDs.contains(request.id) else { throw PhoneCoderRuntimeError.cancelled }
         startedCount += 1
         for text in output { await onEvent(.init(requestID: request.id, sessionID: request.sessionID, modelSessionID: session.id, text: text)) }
+        guard !cancelledIDs.contains(request.id) else { throw PhoneCoderRuntimeError.cancelled }
         if held {
             try await withCheckedThrowingContinuation { continuation in
                 self.continuation = continuation
@@ -343,7 +401,10 @@ private actor APITestRuntime: PhoneCoderTextRuntime {
         } else { started.forEach { $0.resume() }; started.removeAll() }
         return .init(requestID: request.id, sessionID: request.sessionID, modelSessionID: session.id, promptTokens: 7, completionTokens: 3, finishReason: .stop)
     }
-    func cancel(requestID: PhoneCoderRequestID) async { continuation?.resume(throwing: PhoneCoderRuntimeError.cancelled); continuation = nil }
+    func cancel(requestID: PhoneCoderRequestID) async {
+        cancelledIDs.insert(requestID)
+        continuation?.resume(throwing: PhoneCoderRuntimeError.cancelled); continuation = nil
+    }
     func release() { held = false; continuation?.resume(); continuation = nil }
     func waitUntilStarted() async {
         if continuation != nil || (!held && startedCount > 0) { return }
@@ -373,13 +434,15 @@ private final class APIServerFixture {
         coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
         ledger = PhoneCoderRequestLedger(sessionID: session)
     }
-    static func make(held: Bool = false, output: [String] = ["hello ", "🙂"], limits: PhoneCoderHTTPLimits = .init()) async throws -> APIServerFixture {
+    static func make(held: Bool = false, output: [String] = ["hello ", "🙂"], limits: PhoneCoderHTTPLimits = .init(),
+                     admissionCheckpoint: @escaping @Sendable (PhoneCoderAPIServer.AdmissionCheckpoint) async -> Void = { _ in }) async throws -> APIServerFixture {
         let fixture = APIServerFixture(held: held, output: output)
         fixture.client = try await fixture.store.create(name: "Ubuntu")
         _ = try await fixture.coordinator.switchModel(to: "test-model")
         fixture.server = PhoneCoderAPIServer(coordinator: fixture.coordinator, ledger: fixture.ledger,
             pairings: fixture.store, exchange: fixture.pairing, activity: PhoneCoderServerActivityStore(url: nil),
-            limits: limits, approval: { [weak fixture] name in fixture?.approvedNames.append(name); return fixture?.shouldApprove ?? false })
+            limits: limits, approval: { [weak fixture] name in fixture?.approvedNames.append(name); return fixture?.shouldApprove ?? false },
+            admissionCheckpoint: admissionCheckpoint)
         fixture.server.gate.open(sessionID: fixture.session)
         fixture.port = try await fixture.server.start(port: 0, sessionID: fixture.session)
         return fixture
@@ -404,6 +467,25 @@ private final class APIServerFixture {
         try await socket.send(request(method: method, path: path, id: id, bearer: bearer, extra: extra, body: body), fragmentBytes: fragmentBytes)
         return try await socket.read()
     }
+}
+
+private actor APIAdmissionBarrier {
+    let checkpoint: PhoneCoderAPIServer.AdmissionCheckpoint
+    private var entered = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    private var resume: CheckedContinuation<Void, Never>?
+    init(_ checkpoint: PhoneCoderAPIServer.AdmissionCheckpoint) { self.checkpoint = checkpoint }
+    func visit(_ checkpoint: PhoneCoderAPIServer.AdmissionCheckpoint) async {
+        guard self.checkpoint == checkpoint else { return }
+        await withCheckedContinuation { continuation in
+            entered = true; resume = continuation; waiter?.resume(); waiter = nil
+        }
+    }
+    func waitForEntry() async {
+        if entered { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+    func release() { resume?.resume(); resume = nil }
 }
 
 private final class APIWireClient: @unchecked Sendable {

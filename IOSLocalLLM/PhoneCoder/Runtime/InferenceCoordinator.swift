@@ -69,6 +69,7 @@ actor PhoneCoderInferenceCoordinator {
     /// scheduling Tasks created by callers. Cancellation uses both identities.
     func enqueue(_ request: PhoneCoderGenerationRequest,
                  onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) throws -> Task<PhoneCoderGenerationResult, Error> {
+        try request.cancellationSignal?.check()
         guard !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         guard !switching else { throw PhoneCoderRuntimeError.switchingModel }
         if request.strictAPI {
@@ -230,17 +231,18 @@ actor PhoneCoderInferenceCoordinator {
 
     private func checkLease(_ lease: UUID) throws {
         guard active?.lease == lease, !cancelled, !switching else { throw PhoneCoderRuntimeError.cancelled }
+        try active?.request.cancellationSignal?.check()
     }
 
     private func run(_ work: Work) async {
         let outcome: Result<PhoneCoderGenerationResult, Error>
         do { outcome = .success(try await generate(work)) }
-        catch { outcome = .failure(cancelled ? PhoneCoderRuntimeError.cancelled : error) }
+        catch { outcome = .failure(cancelled || work.request.cancellationSignal?.isCancelled == true ? PhoneCoderRuntimeError.cancelled : error) }
         // Native cancellation can itself suspend after generate has returned.
         // Keep the lease until that path has drained too.
         await cancellation?.value
         cancellation = nil
-        work.resolve(cancelled ? .failure(PhoneCoderRuntimeError.cancelled) : outcome)
+        work.resolve(cancelled || work.request.cancellationSignal?.isCancelled == true ? .failure(PhoneCoderRuntimeError.cancelled) : outcome)
         active = nil
         worker = nil
         if !switching, !lifecycleSuspended, !queue.isEmpty { start(queue.removeFirst()) }
@@ -281,7 +283,8 @@ actor PhoneCoderInferenceCoordinator {
                 // Only runtime faults qualify. Admission, cancellation, stale
                 // identity, and any committed output permanently forbid retry.
                 guard error as? PhoneCoderRuntimeError == .runtimeFailure,
-                      attempt == 0, !committedOutput, !cancelled, !switching else { throw error }
+                      attempt == 0, !committedOutput, !cancelled, !switching,
+                      work.request.cancellationSignal?.isCancelled != true else { throw error }
                 modelSession = nil
                 await runtime.unload()
                 try checkLease(work.lease)
@@ -296,6 +299,7 @@ actor PhoneCoderInferenceCoordinator {
 
     private func deliver(_ event: PhoneCoderRuntimeEvent, lease: UUID) async {
         guard let work = active, work.lease == lease, !cancelled, !switching,
+              work.request.cancellationSignal?.isCancelled != true,
               event.modelSessionID == modelSession?.id,
               event.requestID == work.request.id, event.sessionID == work.request.sessionID else { return }
         // Conservatively committed BEFORE awaiting a consumer/ledger. Even a

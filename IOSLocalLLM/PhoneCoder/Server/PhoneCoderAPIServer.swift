@@ -9,6 +9,7 @@ struct PhoneCoderDeviceFacts: Sendable {
 }
 
 actor PhoneCoderAPIServer {
+    enum AdmissionCheckpoint: CaseIterable, Equatable, Sendable { case ledgerBegan, beforeEnqueue, enqueued }
     enum Event: Sendable {
         case connections(Int, sessionID: UUID)
         case failed(PhoneCoderListenerError, sessionID: UUID)
@@ -23,6 +24,7 @@ actor PhoneCoderAPIServer {
     private let limits: PhoneCoderHTTPLimits
     private let approval: @MainActor @Sendable (String) async -> Bool
     private let deviceFacts: @MainActor @Sendable () -> PhoneCoderDeviceFacts
+    private let admissionCheckpoint: @Sendable (AdmissionCheckpoint) async -> Void
     private var listener: NWListener?
     private var sessionID: UUID?
     private var ready: CheckedContinuation<UInt16, Error>?
@@ -31,7 +33,11 @@ actor PhoneCoderAPIServer {
     private struct Job {
         let sessionID: UUID
         let owner: UUID
-        let task: Task<Void, Never>
+        let fingerprint: SHA256.Digest
+        let admission: Task<Void, Error>
+        let cancellationSignal: PhoneCoderRequestCancellation
+        var cancellation: PhoneCoderCancellationReason?
+        var task: Task<Void, Never>?
         let deadline: Task<Void, Never>
     }
     private var jobs: [PhoneCoderRequestID: Job] = [:]
@@ -41,10 +47,12 @@ actor PhoneCoderAPIServer {
          pairings: PhoneCoderPairingStore, exchange: PhoneCoderPairingExchange,
          activity: PhoneCoderServerActivityStore, limits: PhoneCoderHTTPLimits = .init(),
          approval: @escaping @MainActor @Sendable (String) async -> Bool,
-         deviceFacts: @escaping @MainActor @Sendable () -> PhoneCoderDeviceFacts = { .init() }) {
+         deviceFacts: @escaping @MainActor @Sendable () -> PhoneCoderDeviceFacts = { .init() },
+         admissionCheckpoint: @escaping @Sendable (AdmissionCheckpoint) async -> Void = { _ in }) {
         self.coordinator = coordinator; self.ledger = ledger; self.pairings = pairings
         self.exchange = exchange; self.activity = activity; self.limits = limits
         self.approval = approval; self.deviceFacts = deviceFacts
+        self.admissionCheckpoint = admissionCheckpoint
     }
 
     func setEventHandler(_ handler: @escaping @Sendable (Event) -> Void) { onEvent = handler }
@@ -91,6 +99,8 @@ actor PhoneCoderAPIServer {
         // The lifecycle facade also cancels the ledger; both paths are
         // idempotent and never wait for native Metal retirement here.
         for (id, job) in jobs where oldSession == nil || job.sessionID == oldSession {
+            job.cancellationSignal.cancel()
+            jobs[id]?.cancellation = .serverStopped
             job.deadline.cancel()
             Task { [ledger, coordinator] in
                 await coordinator.markOutputCommitted(requestID: id, sessionID: job.sessionID)
@@ -255,12 +265,19 @@ actor PhoneCoderAPIServer {
         case ("DELETE", let path) where path.hasPrefix("/v1/requests/"):
             let id = try Self.requestID(head)
             guard path == "/v1/requests/" + id.rawValue else { throw PhoneCoderHTTPFailure(400, "invalid_request_id", "Header and path request IDs must match.") }
+            let changed: Bool
             if let job = jobs[id], job.owner == client.id {
+                // Save intent before any actor hop. The ledger may not yet be
+                // exposed, or coordinator admission may still be in flight.
+                let newlyCancelled = job.cancellation == nil
+                job.cancellationSignal.cancel()
+                jobs[id]?.cancellation = .client
                 await coordinator.markOutputCommitted(requestID: id, sessionID: job.sessionID)
-            }
-            let changed = try await ledger.cancelOwned(id: id, ownerClientID: client.id, reason: .client)
-            if changed, let job = jobs[id] {
+                changed = (try? await ledger.cancelOwned(id: id, ownerClientID: client.id, reason: .client)) ?? newlyCancelled
                 Task { [coordinator] in await coordinator.cancel(requestID: id, sessionID: job.sessionID) }
+            } else {
+                // Missing IDs and another client's IDs share the same failure.
+                changed = try await ledger.cancelOwned(id: id, ownerClientID: client.id, reason: .client)
             }
             try await json(socket, ["id": id.rawValue, "cancelled": changed])
         default: throw PhoneCoderHTTPFailure(404, "route_not_found", "Route is not supported.")
@@ -294,39 +311,32 @@ actor PhoneCoderAPIServer {
             generation.maxTokens = preflight.outputTokens
             countMode = preflight.prompt.mode.rawValue
             try requireSession(sessionID)
-            let responses = decoded.isResponses
-            let result = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: sessionID,
-                deadline: .now.advanced(by: .seconds(limits.requestSeconds)), ownerClientID: client.id,
-                terminalEvents: { terminal in
-                    guard let error = PhoneCoderWireFailure.terminal(terminal) else { return [] }
-                    return [responses ? .responseError(error) : .error(error), .done]
-                })
-            if result == .owner {
-                let pipeline = PhoneCoderResponsePipeline(request: decoded, generation: generation, preflight: preflight,
-                    parser: capabilities.toolParser, client: client, ledger: ledger, coordinator: coordinator, activity: activity)
-                do {
-                    try requireSession(sessionID)
-                    let pending = try await coordinator.enqueue(generation) { event in await pipeline.consume(event) }
-                    let ownerTask = Task { [weak self] in
-                        let outcome: Result<PhoneCoderGenerationResult, Error>
-                        do { outcome = .success(try await pending.value) } catch { outcome = .failure(error) }
-                        await pipeline.finish(outcome)
-                        await self?.jobEnded(id, sessionID: sessionID)
-                    }
-                    let seconds = limits.requestSeconds
-                    let deadline = Task { [weak self] in
-                        do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
-                        await self?.expire(id, owner: client.id, sessionID: sessionID)
-                    }
-                    jobs[id] = Job(sessionID: sessionID, owner: client.id, task: ownerTask, deadline: deadline)
-                    onEvent?(.activity(sessionID: sessionID))
-                } catch {
-                    await coordinator.markOutputCommitted(requestID: id, sessionID: sessionID)
-                    try? await ledger.finish(id: id, terminal: .failed(PhoneCoderWireFailure.map(error).error), sessionID: sessionID)
-                    throw error
+            let admission: Task<Void, Error>
+            if let job = jobs[id] {
+                guard job.owner == client.id else { throw PhoneCoderHTTPFailure(404, "request_not_found", "Request is not available to this client.") }
+                guard job.fingerprint == fingerprint else { throw PhoneCoderHTTPFailure(409, "request_conflict", "Request ID belongs to a different body.") }
+                admission = job.admission
+            } else {
+                // Reserve ownership synchronously, before begin can publish a
+                // record. Socket cancellation never cancels this owner task.
+                let cancellationSignal = PhoneCoderRequestCancellation()
+                generation.cancellationSignal = cancellationSignal
+                let prepared = generation
+                admission = Task { [self] in
+                    try await admit(decoded, generation: prepared, preflight: preflight,
+                        parser: capabilities.toolParser, client: client, fingerprint: fingerprint)
                 }
+                let seconds = limits.requestSeconds
+                let deadline = Task { [weak self] in
+                    do { try await Task.sleep(for: .seconds(seconds)) } catch { return }
+                    await self?.expire(id, owner: client.id, sessionID: sessionID)
+                }
+                jobs[id] = Job(sessionID: sessionID, owner: client.id, fingerprint: fingerprint,
+                    admission: admission, cancellationSignal: cancellationSignal, cancellation: nil, task: nil, deadline: deadline)
             }
+            try await admission.value
         }
+
         let stream = try await ledger.attach(id: id, fingerprint: fingerprint, after: after, ownerClientID: client.id)
         try requireSession(sessionID)
         if decoded.stream {
@@ -347,8 +357,76 @@ actor PhoneCoderAPIServer {
         }
     }
 
+    private func admit(_ decoded: PhoneCoderDecodedRequest, generation: PhoneCoderGenerationRequest,
+                       preflight: PhoneCoderRuntimePreflight, parser: ModelToolParser,
+                       client: PhoneCoderAuthContext, fingerprint: SHA256.Digest) async throws {
+        let id = generation.id, session = generation.sessionID
+        var ownsRecord = false
+        do {
+            try requireSession(session)
+            let responses = decoded.isResponses
+            let result = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session,
+                deadline: .now.advanced(by: .seconds(limits.requestSeconds)), ownerClientID: client.id,
+                terminalEvents: { terminal in
+                    guard let error = PhoneCoderWireFailure.terminal(terminal) else { return [] }
+                    return [responses ? .responseError(error) : .error(error), .done]
+                })
+            guard result == .owner else { jobEnded(id, sessionID: session); return }
+            ownsRecord = true
+            await admissionCheckpoint(.ledgerBegan)
+            guard await admissionIsLive(id, owner: client.id, sessionID: session) else {
+                jobEnded(id, sessionID: session); return
+            }
+            let pipeline = PhoneCoderResponsePipeline(request: decoded, generation: generation, preflight: preflight,
+                parser: parser, client: client, ledger: ledger, coordinator: coordinator, activity: activity)
+            await admissionCheckpoint(.beforeEnqueue)
+            guard await admissionIsLive(id, owner: client.id, sessionID: session) else {
+                jobEnded(id, sessionID: session); return
+            }
+            let pending = try await coordinator.enqueue(generation) { await pipeline.consume($0) }
+            await admissionCheckpoint(.enqueued)
+            // Install the drain/terminal owner even if cancellation won while
+            // enqueue was suspended. Cancellation must never orphan its handle.
+            jobs[id]?.task = Task { [weak self] in
+                let outcome: Result<PhoneCoderGenerationResult, Error>
+                do { outcome = .success(try await pending.value) } catch { outcome = .failure(error) }
+                await pipeline.finish(outcome)
+                await self?.jobEnded(id, sessionID: session)
+            }
+            if !(await admissionIsLive(id, owner: client.id, sessionID: session)) {
+                Task { [coordinator] in await coordinator.cancel(requestID: id, sessionID: session) }
+            }
+            onEvent?(.activity(sessionID: session))
+        } catch {
+            if ownsRecord {
+                await coordinator.markOutputCommitted(requestID: id, sessionID: session)
+                try? await ledger.finish(id: id, terminal: .failed(PhoneCoderWireFailure.map(error).error), sessionID: session)
+            }
+            jobEnded(id, sessionID: session)
+            throw error
+        }
+    }
+
+    /// Check both authorities after suspension; cancellation intent survives
+    /// even when DELETE reached the coordinator before this job was enqueued.
+    private func admissionIsLive(_ id: PhoneCoderRequestID, owner: UUID, sessionID: UUID) async -> Bool {
+        let terminal: PhoneCoderTerminalResult?
+        do { terminal = try await ledger.terminal(id: id, ownerClientID: owner) }
+        catch { return false }
+        guard let job = jobs[id], job.owner == owner, job.sessionID == sessionID else { return false }
+        let reason = job.cancellation ?? (self.sessionID == sessionID && gate.isOpen(sessionID) ? nil : .serverStopped)
+        if let reason {
+            await coordinator.markOutputCommitted(requestID: id, sessionID: sessionID)
+            _ = try? await ledger.cancelOwned(id: id, ownerClientID: owner, reason: reason)
+            return false
+        }
+        return terminal == nil
+    }
+
     private func expire(_ id: PhoneCoderRequestID, owner: UUID, sessionID: UUID) async {
         guard jobs[id]?.sessionID == sessionID else { return }
+        jobs[id]?.cancellationSignal.cancel()
+        jobs[id]?.cancellation = .deadline
         await coordinator.markOutputCommitted(requestID: id, sessionID: sessionID)
         _ = try? await ledger.cancelOwned(id: id, ownerClientID: owner, reason: .deadline)
         Task { [coordinator] in await coordinator.cancel(requestID: id, sessionID: sessionID) }

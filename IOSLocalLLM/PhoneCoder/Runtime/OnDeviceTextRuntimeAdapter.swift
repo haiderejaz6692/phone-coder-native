@@ -59,6 +59,7 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
 
     func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession,
                   onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult {
+        try request.cancellationSignal?.check()
         guard self.session == session, request.modelID == session.modelID else { throw PhoneCoderRuntimeError.staleSession }
         guard activeRequestID == nil else { throw PhoneCoderRuntimeError.residencyUnavailable }
         guard request.messages.allSatisfy({ $0.imageThumbnailData == nil && $0.imageThumbnails.isEmpty }) else {
@@ -79,6 +80,8 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         }
         // Callbacks synchronously enqueue into one stream. Creating a Task per
         // token would reorder tokens and allow completion to overtake output.
+        // No MainActor suspension separates this check from native admission.
+        try request.cancellationSignal?.check()
         service.generate(messages: request.messages, maxTokensOverride: request.maxTokens,
                          temperatureOverride: request.temperature, topPOverride: request.topP,
                          strictLocalAPI: request.strictAPI,

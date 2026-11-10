@@ -80,8 +80,63 @@ struct PhoneCoderHTTPHead: Sendable {
     private static var malformed: PhoneCoderHTTPFailure { .init(400, "invalid_http", "Malformed or unsupported HTTP request.") }
 }
 
+/// Snapshot only the interfaces actually used by this accepted connection,
+/// not the unrelated interfaces available elsewhere on the device.
+struct PhoneCoderConnectionPath: Sendable {
+    struct Interface: Sendable {
+        enum Kind: Equatable, Sendable { case loopback, other, cellular, wifi, wired, unknown }
+        let name: String
+        let kind: Kind
+    }
+    let satisfied: Bool
+    let usedInterfaces: [Interface]
+
+    init(satisfied: Bool, usedInterfaces: [Interface]) {
+        self.satisfied = satisfied; self.usedInterfaces = usedInterfaces
+    }
+    init(_ path: NWPath) {
+        satisfied = path.status == .satisfied
+        usedInterfaces = path.availableInterfaces.filter { path.usesInterfaceType($0.type) }.map { interface in
+            let kind: Interface.Kind
+            switch interface.type {
+            case .loopback: kind = .loopback
+            case .other: kind = .other
+            case .cellular: kind = .cellular
+            case .wifi: kind = .wifi
+            case .wiredEthernet: kind = .wired
+            @unknown default: kind = .unknown
+            }
+            return .init(name: interface.name, kind: kind)
+        }
+    }
+}
+
 enum PhoneCoderNetworkExposure {
     static func allows(host: String) -> Bool { addressKind(host) != nil }
+
+    static func accepts(local: String, peer: String, path: PhoneCoderConnectionPath) -> Bool {
+        guard path.satisfied else { return false }
+        if addressKind(local) == .loopback, addressKind(peer) == .loopback {
+            // Loopback is intrinsically on-device and may have no enumerated
+            // interface in a simulator's Network.framework path snapshot.
+            return true
+        }
+        guard addressKind(local) == .tailnet, addressKind(peer) == .tailnet,
+              !path.usedInterfaces.isEmpty else { return false }
+        // A carrier CGNAT address alone is never an overlay credential. Require
+        // the actual accepted path to use only Darwin tunnel interfaces.
+        return path.usedInterfaces.allSatisfy {
+            let suffix = $0.name.dropFirst(4)
+            return $0.kind == .other && $0.name.hasPrefix("utun") && !suffix.isEmpty
+                && suffix.utf8.allSatisfy { (48...57).contains($0) }
+        }
+    }
+
+    static func accepts(_ path: NWPath?) -> Bool {
+        guard let path, case .hostPort(let local, _) = path.localEndpoint,
+              case .hostPort(let remote, _) = path.remoteEndpoint else { return false }
+        return accepts(local: String(describing: local), peer: String(describing: remote), path: .init(path))
+    }
 
     static func advertises(host: String, interface: String) -> Bool {
         guard addressKind(host) == .tailnet else { return false }
@@ -222,8 +277,7 @@ final class PhoneCoderHTTPSocket: @unchecked Sendable {
             once.installTimer(timeout(after: limits.headerSeconds, once: once))
             connection.start(queue: .global(qos: .userInitiated))
         }
-        guard PhoneCoderNetworkExposure.allows(endpoint: connection.currentPath?.remoteEndpoint),
-              PhoneCoderNetworkExposure.allows(endpoint: connection.currentPath?.localEndpoint) else {
+        guard PhoneCoderNetworkExposure.accepts(connection.currentPath) else {
             connection.cancel()
             throw PhoneCoderHTTPFailure(403, "network_not_allowed", "Use the paired tailnet connection.")
         }

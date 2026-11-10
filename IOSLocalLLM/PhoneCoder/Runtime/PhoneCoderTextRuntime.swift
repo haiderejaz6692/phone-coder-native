@@ -1,5 +1,15 @@
 import Foundation
 
+/// One signal per admission, with no registry or retained payload. The lock
+/// gives cancellation a synchronous happens-before edge across actor hops.
+final class PhoneCoderRequestCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    func check() throws { if isCancelled { throw PhoneCoderRuntimeError.cancelled } }
+}
+
 struct PhoneCoderModelDescriptor: Equatable, Sendable {
     let id: String
     let displayName: String
@@ -23,6 +33,7 @@ struct PhoneCoderGenerationRequest: Sendable {
     var topP: Double? = nil
     var strictAPI = false
     var expectedModelSessionID: UUID? = nil
+    var cancellationSignal: PhoneCoderRequestCancellation? = nil
 }
 
 struct PhoneCoderRuntimeCapabilities: Sendable {

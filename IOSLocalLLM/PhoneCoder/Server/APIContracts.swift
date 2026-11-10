@@ -17,6 +17,9 @@ struct PhoneCoderAPIError: Error, Equatable, Sendable {
 
 struct PhoneCoderChatRequest: Equatable, Sendable {
     static let maximumBodyBytes = 1_048_576
+    /// Resource bound shared by both endpoints: at most four nonempty stop
+    /// strings, each at most 256 UTF-8 bytes, including multi-byte characters.
+    static let maximumStopBytes = 256
     let model: String
     let messages: [ChatMessage]
     let stream: Bool
@@ -162,7 +165,9 @@ private enum ContractDecoder {
             if let string = value as? String { stop = [string] }
             else if let strings = value as? [String] { stop = strings }
             else { throw PhoneCoderAPIError.invalid("Invalid stop") }
-            guard (1...4).contains(stop.count), stop.allSatisfy({ !$0.isEmpty }) else { throw PhoneCoderAPIError.invalid("Invalid stop") }
+            guard (1...4).contains(stop.count), stop.allSatisfy({ !$0.isEmpty && $0.utf8.count <= PhoneCoderChatRequest.maximumStopBytes }) else {
+                throw PhoneCoderAPIError.invalid("stop requires one to four nonempty strings, each at most 256 UTF-8 bytes")
+            }
         }
         return (stream, usage, tokens, temperature, topP, stop)
     }

@@ -76,6 +76,45 @@ final class ModelDownloadCenterServiceTests: XCTestCase {
 }
 
 final class CodingAssistantServicePolicyTests: XCTestCase {
+    func testLlamaTokenizerInputPreservesEmbeddedNULAndUTF8Suffix() throws {
+        let input = "prefix\u{0}用户🙂suffix"
+        let prompt = LocalAPIStrictInput.prompt(messages: [ChatMessage(role: .system, content: input), ChatMessage(role: .user, content: "go")], template: .chatML, thinking: false)
+        let observed = try LlamaCppTokenizationInput.withUTF8(prompt) { pointer, length in
+            Data(bytes: pointer, count: Int(length))
+        }
+        XCTAssertEqual(observed, Data(prompt.utf8))
+        XCTAssertTrue(String(decoding: observed, as: UTF8.self).contains(input))
+        XCTAssertGreaterThan(observed.count, Int(prompt.withCString { strlen($0) }))
+    }
+
+    func testStrictXMLRejectsInvalidAndCoercedArgumentsWithoutDiagnosticContent() {
+        let tools = [LocalAPIToolDefinition(name: "private_tool_name", description: nil,
+            parametersJSON: #"{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"],"additionalProperties":false}"#)]
+        for value in ["sensitive-input", "TRUE", "1.5", "01", "1"] {
+            let output = "<tool_call><function=private_tool_name><parameter=count>\(value)</parameter></function></tool_call>"
+            var logs: [String] = []
+            let parsed = LocalAPIToolCalling.parseResult(output, tools: tools, parallelToolCalls: true,
+                strictPrivacy: true, diagnostic: { logs.append($0) })
+            XCTAssertTrue(parsed.calls.isEmpty)
+            XCTAssertNotNil(parsed.failure)
+            XCTAssertTrue(logs.isEmpty)
+            if case .malformed(_, let preview) = parsed.failure { XCTAssertTrue(preview.isEmpty) }
+        }
+        let output = #"<tool_call>{"name":"private_tool_name","arguments":{"count":"sensitive-input"}}</tool_call>"#
+        var logs: [String] = []
+        let parsed = LocalAPIToolCalling.parseResult(output, tools: tools, parallelToolCalls: true,
+            strictPrivacy: true, diagnostic: { logs.append($0) })
+        XCTAssertTrue(parsed.calls.isEmpty)
+        XCTAssertNotNil(parsed.failure)
+        XCTAssertTrue(logs.isEmpty)
+        let textTool = LocalAPIToolDefinition(name: "lookup", description: nil,
+            parametersJSON: #"{"type":"object","properties":{"key":{"type":"string"}},"required":["key"],"additionalProperties":false}"#)
+        let valid = LocalAPIToolCalling.parseResult("<tool_call><function=lookup><parameter=key>text</parameter></function></tool_call>",
+            tools: [textTool], parallelToolCalls: true, strictPrivacy: true, diagnostic: { logs.append($0) })
+        XCTAssertEqual(valid.calls.count, 1)
+        XCTAssertNil(valid.failure)
+        XCTAssertTrue(logs.isEmpty)
+    }
     func testStrictAPIPromptPreservesEveryTurnWithoutChatSanitizing() throws {
         XCTAssertFalse(LocalAPIStrictInput.usesJSONMode(strictAPI: true, explicit: true, global: true))
         XCTAssertTrue(LocalAPIStrictInput.usesJSONMode(strictAPI: false, explicit: false, global: true))

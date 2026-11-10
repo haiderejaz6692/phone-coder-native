@@ -3,6 +3,17 @@ import XCTest
 @testable import PhoneCoder
 
 final class PhoneCoderAPIContractTests: XCTestCase {
+    func testStopSequencesHaveAnExplicitUTF8ResourceBound() throws {
+        for stop in [String(repeating: "a", count: 257), String(repeating: "🙂", count: 65), String(repeating: "a", count: 900_000)] {
+            let chat = try JSONSerialization.data(withJSONObject: ["model": "m", "messages": [["role": "user", "content": "x"]], "stop": stop])
+            XCTAssertThrowsError(try PhoneCoderChatRequest.decode(chat))
+            let responses = try JSONSerialization.data(withJSONObject: ["model": "m", "input": "x", "stop": [stop]])
+            XCTAssertThrowsError(try PhoneCoderResponsesRequest.decode(responses))
+        }
+        let stop = String(repeating: "🙂", count: 64)
+        let data = try JSONSerialization.data(withJSONObject: ["model": "m", "input": "x", "stop": [stop]])
+        XCTAssertEqual(try PhoneCoderResponsesRequest.decode(data).stop, [stop])
+    }
     private func data(_ json: String) -> Data { Data(json.utf8) }
 
     func testChatTextAndGenerationOptions() throws {

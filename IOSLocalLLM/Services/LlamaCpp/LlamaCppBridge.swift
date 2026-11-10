@@ -3,6 +3,15 @@ import UIKit
 import CoreImage
 import os   // OSAllocatedUnfairLock
 
+/// llama_tokenize accepts a byte count, so embedded NUL is input data rather
+/// than a terminator. Both the sizing and output passes use this same buffer.
+enum LlamaCppTokenizationInput {
+    static func withUTF8<Result>(_ prompt: String, _ body: (UnsafePointer<CChar>, Int32) throws -> Result) throws -> Result {
+        guard let length = Int32(exactly: prompt.utf8.count) else { throw LlamaCppError.promptTooLong(prompt.utf8.count) }
+        return try prompt.withCString { pointer in try body(pointer, length) }
+    }
+}
+
 struct LlamaCppTextGenerationResult: Sendable, Equatable {
     enum StopReason: Sendable, Equatable {
         case stop
@@ -286,15 +295,15 @@ final class LlamaCppVLM: @unchecked Sendable {
     func tokenCount(for prompt: String) throws -> Int {
         guard let m = model else { throw LlamaCppError.contextInitFailed }
         let vocab = llama_model_get_vocab(m)
-        let required: Int32 = prompt.withCString { ptr in
-            llama_tokenize(vocab, ptr, Int32(strlen(ptr)), nil, 0, true, true)
+        let required: Int32 = try LlamaCppTokenizationInput.withUTF8(prompt) { ptr, length in
+            llama_tokenize(vocab, ptr, length, nil, 0, true, true)
         }
         guard required < 0 else { throw LlamaCppError.tokenizeFailed(required) }
         var tokens = [llama_token](repeating: 0, count: Int(-required))
-        let written: Int32 = prompt.withCString { ptr in
+        let written: Int32 = try LlamaCppTokenizationInput.withUTF8(prompt) { ptr, length in
             tokens.withUnsafeMutableBufferPointer { buffer in
                 llama_tokenize(
-                    vocab, ptr, Int32(strlen(ptr)), buffer.baseAddress,
+                    vocab, ptr, length, buffer.baseAddress,
                     Int32(buffer.count), true, true
                 )
             }
@@ -345,15 +354,15 @@ final class LlamaCppVLM: @unchecked Sendable {
         // cue. Tokenize that text; add_special=true still supplies BOS.
         let formattedPrompt = prompt
 
-        let required: Int32 = formattedPrompt.withCString { ptr in
-            llama_tokenize(vocab, ptr, Int32(strlen(ptr)), nil, 0, true, true)
+        let required: Int32 = try LlamaCppTokenizationInput.withUTF8(formattedPrompt) { ptr, length in
+            llama_tokenize(vocab, ptr, length, nil, 0, true, true)
         }
         guard required < 0 else { throw LlamaCppError.tokenizeFailed(required) }
         var tokens = [llama_token](repeating: 0, count: Int(-required))
-        let written: Int32 = formattedPrompt.withCString { ptr in
+        let written: Int32 = try LlamaCppTokenizationInput.withUTF8(formattedPrompt) { ptr, length in
             tokens.withUnsafeMutableBufferPointer { buffer in
                 llama_tokenize(
-                    vocab, ptr, Int32(strlen(ptr)), buffer.baseAddress,
+                    vocab, ptr, length, buffer.baseAddress,
                     Int32(buffer.count), true, true
                 )
             }
