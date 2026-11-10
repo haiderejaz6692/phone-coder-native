@@ -1700,7 +1700,8 @@ enum LocalAPIToolCalling {
         validateSchemas: Bool = true,
         parser: ModelToolParser = .hermes,
         maximumCalls: Int? = nil,
-        attemptRepair: Bool = true
+        attemptRepair: Bool = true,
+        strictPrivacy: Bool = false
     ) -> LocalAPIToolCallParseResult {
         let toolsByName = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
         guard !toolsByName.isEmpty else {
@@ -1796,7 +1797,8 @@ enum LocalAPIToolCalling {
                 validateSchemas: validateSchemas,
                 parser: parser,
                 maximumCalls: maximumCalls,
-                attemptRepair: false
+                attemptRepair: false,
+                strictPrivacy: strictPrivacy
             )
             if !repairedCalls.calls.isEmpty { return repairedCalls }
         }
@@ -1804,6 +1806,9 @@ enum LocalAPIToolCalling {
         // tool call. Dropping it turned one extra key into a 502 and told the
         // caller to shorten their prompt, which never helped.
         if parsedCalls.isEmpty, !schemaRejectedCalls.isEmpty {
+            if strictPrivacy {
+                return LocalAPIToolCallParseResult(calls: [], failure: .malformed(dialect: dialect, rawPreview: ""), dialect: dialect)
+            }
             RuntimeLogCenter.emit(
                 "Tool call arguments did not match the declared schema; forwarding unvalidated · "
                     + "tools=\(schemaRejectedCalls.map(\.name).joined(separator: ","))",
@@ -1817,12 +1822,12 @@ enum LocalAPIToolCalling {
             )
         }
         if parsedCalls.isEmpty, let unavailable = unavailableToolNames.first {
-            RuntimeLogCenter.emit(
+            if !strictPrivacy { RuntimeLogCenter.emit(
                 "Tool call named unavailable tool · parser=\(parser.rawValue) · "
                     + "tool=\(unavailable) · tools=\(tools.map(\.name).joined(separator: ","))",
                 level: .error,
                 subsystem: "api"
-            )
+            ) }
             return LocalAPIToolCallParseResult(
                 calls: [],
                 failure: .unavailableTool(unavailable),
@@ -1831,15 +1836,15 @@ enum LocalAPIToolCalling {
         }
         if parsedCalls.isEmpty, foundToolEnvelope {
             let detectedDialect = dialect == "none" ? "unknown" : dialect
-            let rawPreview = String(output.prefix(200))
-            RuntimeLogCenter.emit(
+            let rawPreview = strictPrivacy ? "" : String(output.prefix(200))
+            if !strictPrivacy { RuntimeLogCenter.emit(
                 "Tool call parsing failed · parser=\(parser.rawValue) · "
                     + "dialect=\(detectedDialect) · "
                     + "tools=\(tools.map(\.name).joined(separator: ",")) · "
                     + "raw=\(output.prefix(600))",
                 level: .error,
                 subsystem: "api"
-            )
+            ) }
             return LocalAPIToolCallParseResult(
                 calls: [],
                 failure: .malformed(

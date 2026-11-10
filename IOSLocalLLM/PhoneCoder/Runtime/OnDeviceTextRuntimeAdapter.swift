@@ -68,6 +68,7 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         guard service.state == .ready, service.activeExecutionLocation == .localDownloaded else {
             throw PhoneCoderRuntimeError.modelUnavailable
         }
+        if request.strictAPI { _ = try await preflight(request, session: session) }
         activeRequestID = request.id
         defer { activeRequestID = nil }
         let (stream, continuation) = AsyncThrowingStream<NativeEvent, Error>.makeStream(bufferingPolicy: .bufferingOldest(256))
@@ -80,6 +81,7 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         // token would reorder tokens and allow completion to overtake output.
         service.generate(messages: request.messages, maxTokensOverride: request.maxTokens,
                          temperatureOverride: request.temperature, topPOverride: request.topP,
+                         strictLocalAPI: request.strictAPI,
                          onToken: { emit(.text($0)) },
                          onTerminal: { emit(.terminal($0)) },
                          onComplete: { _ in continuation.finish() })
@@ -126,6 +128,21 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         await service.cancelAndDrainInference()
     }
 
+    func capabilities(session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimeCapabilities {
+        guard self.session == session, upstreamSessionID == service.runtimeSessionID,
+              service.hasUsableLocalRuntime else { throw PhoneCoderRuntimeError.staleSession }
+        return .init(limits: service.localAPIStrictRuntimeLimits,
+                     toolParser: ModelCapabilityProfile.resolve(for: service.activeModel).toolParser)
+    }
+
+    func preflight(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimePreflight {
+        let capabilities = try await capabilities(session: session)
+        if case .unavailable(let error) = await liveAvailability() { throw error }
+        let prompt = service.localAPIStrictPromptBound(messages: request.messages)
+        let output = try LocalAPIStrictInput.outputTokens(requested: request.maxTokens, promptTokens: prompt.tokens, limits: capabilities.limits)
+        return .init(prompt: prompt, limits: capabilities.limits, outputTokens: output)
+    }
+
     func unload() async {
         session = nil
         upstreamSessionID = nil
@@ -165,6 +182,7 @@ enum PhoneCoderRuntimeMapping {
         case .thermal: throw PhoneCoderRuntimeError.thermal
         case .unavailable: throw PhoneCoderRuntimeError.modelUnavailable
         case .failed: throw PhoneCoderRuntimeError.runtimeFailure
+        case .rejected(let error): throw error
         }
     }
 

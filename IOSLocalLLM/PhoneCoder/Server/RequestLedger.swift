@@ -23,10 +23,13 @@ actor PhoneCoderRequestLedger {
         let fingerprint: SHA256.Digest
         let sessionID: UUID
         let deadline: ContinuousClock.Instant
+        let ownerClientID: UUID?
+        let terminalEvents: (@Sendable (PhoneCoderTerminalResult) -> [PhoneCoderStreamEvent])?
         var nextID = 1
         var outputBytes = 0
         var events: [SequencedEvent] = []
         var terminal: PhoneCoderTerminalResult?
+        var responseBody: Data?
         var subscribers: [UUID: AsyncStream<SequencedEvent>.Continuation] = [:]
     }
 
@@ -38,7 +41,8 @@ actor PhoneCoderRequestLedger {
     private var records: [PhoneCoderRequestID: Record] = [:]
     private var completedIDs: [PhoneCoderRequestID] = []
     // Evicted responses retain only bounded identity metadata, never events.
-    private var tombstones: [PhoneCoderRequestID: SHA256.Digest] = [:]
+    private struct Tombstone { let fingerprint: SHA256.Digest; let ownerClientID: UUID? }
+    private var tombstones: [PhoneCoderRequestID: Tombstone] = [:]
     private var tombstoneIDs: [PhoneCoderRequestID] = []
 
     init(sessionID: UUID, replayEventLimit: Int = 256, completedRecordLimit: Int = 128, outputByteLimit: Int = 8_388_608, subscriberLimit: Int = 8) {
@@ -50,18 +54,23 @@ actor PhoneCoderRequestLedger {
         self.outputByteLimit = outputByteLimit
     }
 
-    func begin(id: PhoneCoderRequestID, fingerprint: SHA256.Digest, sessionID: UUID, deadline: ContinuousClock.Instant) throws -> BeginResult {
+    func begin(id: PhoneCoderRequestID, fingerprint: SHA256.Digest, sessionID: UUID, deadline: ContinuousClock.Instant,
+               ownerClientID: UUID? = nil,
+               terminalEvents: (@Sendable (PhoneCoderTerminalResult) -> [PhoneCoderStreamEvent])? = nil) throws -> BeginResult {
         if let record = records[id] {
+            guard record.ownerClientID == ownerClientID else { throw Self.notFound }
             guard record.fingerprint == fingerprint else { throw Self.conflict }
             guard sessionID == self.sessionID, record.sessionID == sessionID else { throw Self.staleSession }
             return .existing
         }
-        if let previousFingerprint = tombstones[id] {
-            guard previousFingerprint == fingerprint else { throw Self.conflict }
+        if let previous = tombstones[id] {
+            guard previous.ownerClientID == ownerClientID else { throw Self.notFound }
+            guard previous.fingerprint == fingerprint else { throw Self.conflict }
             throw Self.expired
         }
         guard sessionID == self.sessionID else { throw Self.staleSession }
-        records[id] = Record(fingerprint: fingerprint, sessionID: sessionID, deadline: deadline)
+        records[id] = Record(fingerprint: fingerprint, sessionID: sessionID, deadline: deadline,
+                             ownerClientID: ownerClientID, terminalEvents: terminalEvents)
         return .owner
     }
 
@@ -76,7 +85,8 @@ actor PhoneCoderRequestLedger {
         guard record.sessionID == sessionID else { throw Self.staleSession }
         guard record.terminal == nil else { throw Self.terminalError }
         let bytes = try PhoneCoderAPIEncoder.sse(id: record.nextID, event: event).count
-        guard bytes <= outputByteLimit - record.outputBytes else {
+        let terminalReserve = record.terminalEvents == nil ? 0 : min(1024, outputByteLimit)
+        guard bytes <= outputByteLimit - terminalReserve - record.outputBytes else {
             complete(id: id, terminal: .cancelled(.outputLimit))
             throw Self.outputLimit
         }
@@ -107,25 +117,42 @@ actor PhoneCoderRequestLedger {
         try finish(id: id, terminal: terminal, sessionID: sessionID)
     }
 
-    func finish(id: PhoneCoderRequestID, terminal: PhoneCoderTerminalResult, sessionID: UUID) throws {
+    func finish(id: PhoneCoderRequestID, terminal: PhoneCoderTerminalResult, sessionID: UUID,
+                finalEvents: [PhoneCoderStreamEvent] = [], responseBody: Data? = nil) throws {
         guard sessionID == self.sessionID else { throw Self.staleSession }
         guard let record = records[id] else { throw Self.expired }
         guard record.sessionID == sessionID else { throw Self.staleSession }
         guard record.terminal == nil else { throw Self.terminalError }
-        complete(id: id, terminal: terminal)
+        var bytes = responseBody?.count ?? 0
+        for (index, event) in (finalEvents + (record.terminalEvents?(terminal) ?? [])).enumerated() {
+            bytes += try PhoneCoderAPIEncoder.sse(id: record.nextID + index, event: event).count
+        }
+        guard bytes <= outputByteLimit - record.outputBytes else {
+            complete(id: id, terminal: .cancelled(.outputLimit))
+            throw Self.outputLimit
+        }
+        // One actor turn publishes the final wire value and terminal frames.
+        // Lifecycle cancellation cannot land between a success frame and finish.
+        complete(id: id, terminal: terminal, finalEvents: finalEvents, responseBody: responseBody)
     }
 
-    func terminal(id: PhoneCoderRequestID) throws -> PhoneCoderTerminalResult? {
+    func terminal(id: PhoneCoderRequestID, ownerClientID: UUID? = nil) throws -> PhoneCoderTerminalResult? {
         guard let record = records[id] else { throw Self.expired }
+        guard record.ownerClientID == ownerClientID else { throw Self.notFound }
         return record.terminal
     }
 
-    func attach(id: PhoneCoderRequestID, fingerprint: SHA256.Digest, after eventID: Int?) throws -> AsyncStream<SequencedEvent> {
+    func attach(id: PhoneCoderRequestID, fingerprint: SHA256.Digest, after eventID: Int?, ownerClientID: UUID? = nil) throws -> AsyncStream<SequencedEvent> {
         guard var record = records[id] else {
-            if let previousFingerprint = tombstones[id], previousFingerprint != fingerprint { throw Self.conflict }
+            if let previous = tombstones[id] {
+                guard previous.ownerClientID == ownerClientID else { throw Self.notFound }
+                if previous.fingerprint != fingerprint { throw Self.conflict }
+            }
             throw Self.expired
         }
+        guard record.ownerClientID == ownerClientID else { throw Self.notFound }
         guard record.fingerprint == fingerprint else { throw Self.conflict }
+        guard record.sessionID == sessionID else { throw Self.staleSession }
         let last = eventID ?? 0
         guard last >= 0 && last < record.nextID else { throw PhoneCoderAPIError.invalid("Invalid event ID") }
         if let first = record.events.first, last < first.id - 1 { throw Self.expired }
@@ -148,19 +175,61 @@ actor PhoneCoderRequestLedger {
 
     @discardableResult
     func cancel(id: PhoneCoderRequestID, reason: PhoneCoderCancellationReason) -> Bool {
+        guard records[id]?.ownerClientID == nil else { return false }
+        return cancelInternal(id: id, reason: reason)
+    }
+
+    @discardableResult
+    func cancelOwned(id: PhoneCoderRequestID, ownerClientID: UUID?, reason: PhoneCoderCancellationReason) throws -> Bool {
+        guard let record = records[id], record.ownerClientID == ownerClientID else { throw Self.notFound }
+        return cancelInternal(id: id, reason: reason)
+    }
+
+    func responseBody(id: PhoneCoderRequestID, fingerprint: SHA256.Digest, ownerClientID: UUID?) throws -> Data? {
+        guard let record = records[id] else {
+            if let previous = tombstones[id] {
+                guard previous.ownerClientID == ownerClientID else { throw Self.notFound }
+                guard previous.fingerprint == fingerprint else { throw Self.conflict }
+            }
+            throw Self.expired
+        }
+        guard record.ownerClientID == ownerClientID else { throw Self.notFound }
+        guard record.fingerprint == fingerprint else { throw Self.conflict }
+        guard record.sessionID == sessionID else { throw Self.staleSession }
+        return record.responseBody
+    }
+
+    /// Read-only identity lookup before current model health is checked. An
+    /// existing response must remain replayable while its model is unavailable.
+    func existing(id: PhoneCoderRequestID, fingerprint: SHA256.Digest, ownerClientID: UUID?) throws -> Bool {
+        if let record = records[id] {
+            guard record.ownerClientID == ownerClientID else { throw Self.notFound }
+            guard record.fingerprint == fingerprint else { throw Self.conflict }
+            guard record.sessionID == sessionID else { throw Self.staleSession }
+            return true
+        }
+        if let old = tombstones[id] {
+            guard old.ownerClientID == ownerClientID else { throw Self.notFound }
+            guard old.fingerprint == fingerprint else { throw Self.conflict }
+            throw Self.expired
+        }
+        return false
+    }
+
+    private func cancelInternal(id: PhoneCoderRequestID, reason: PhoneCoderCancellationReason) -> Bool {
         guard let record = records[id], record.terminal == nil else { return false }
         complete(id: id, terminal: .cancelled(reason))
         return true
     }
 
     func cancelAll(reason: PhoneCoderCancellationReason) {
-        for id in Array(records.keys) { _ = cancel(id: id, reason: reason) }
+        for id in Array(records.keys) { _ = cancelInternal(id: id, reason: reason) }
     }
 
     /// Called by the owner at a chosen clock instant; no wall-clock timer is retained.
     func expire(now: ContinuousClock.Instant = .now) {
         for (id, record) in records where record.terminal == nil && record.deadline <= now {
-            _ = cancel(id: id, reason: .deadline)
+                _ = cancelInternal(id: id, reason: .deadline)
         }
     }
 
@@ -170,8 +239,21 @@ actor PhoneCoderRequestLedger {
         sessionID = newSessionID
     }
 
-    private func complete(id: PhoneCoderRequestID, terminal: PhoneCoderTerminalResult) {
+    private func complete(id: PhoneCoderRequestID, terminal: PhoneCoderTerminalResult,
+                          finalEvents: [PhoneCoderStreamEvent] = [], responseBody: Data? = nil) {
         guard var record = records[id], record.terminal == nil else { return }
+        let events = finalEvents + (record.terminalEvents?(terminal) ?? [])
+        for event in events {
+            guard let bytes = try? PhoneCoderAPIEncoder.sse(id: record.nextID, event: event).count,
+                  bytes <= outputByteLimit - record.outputBytes else { break }
+            let sequenced = SequencedEvent(id: record.nextID, event: event)
+            record.nextID += 1; record.outputBytes += bytes
+            record.events.append(sequenced)
+            if record.events.count > replayEventLimit { record.events.removeFirst() }
+            for continuation in record.subscribers.values { continuation.yield(sequenced) }
+        }
+        record.responseBody = responseBody
+        record.outputBytes += responseBody?.count ?? 0
         record.terminal = terminal
         for continuation in record.subscribers.values { continuation.finish() }
         record.subscribers.removeAll()
@@ -180,7 +262,7 @@ actor PhoneCoderRequestLedger {
         while completedIDs.count > completedRecordLimit {
             let evictedID = completedIDs.removeFirst()
             if let evicted = records.removeValue(forKey: evictedID) {
-                tombstones[evictedID] = evicted.fingerprint
+                tombstones[evictedID] = Tombstone(fingerprint: evicted.fingerprint, ownerClientID: evicted.ownerClientID)
                 tombstoneIDs.append(evictedID)
             }
             if tombstoneIDs.count > completedRecordLimit {
@@ -194,6 +276,7 @@ actor PhoneCoderRequestLedger {
     }
 
     private static let conflict = PhoneCoderAPIError(code: "request_conflict", message: "Request ID belongs to a different body.")
+    private static let notFound = PhoneCoderAPIError(code: "request_not_found", message: "Request is not available to this client.")
     private static let expired = PhoneCoderAPIError(code: "replay_expired", message: "Request replay is no longer available.")
     private static let staleSession = PhoneCoderAPIError(code: "stale_session", message: "Request session is no longer active.")
     private static let terminalError = PhoneCoderAPIError(code: "request_finished", message: "Request has already finished.")

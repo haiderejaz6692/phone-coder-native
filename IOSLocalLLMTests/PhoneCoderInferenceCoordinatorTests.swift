@@ -4,6 +4,42 @@ import os
 @testable import PhoneCoder
 
 final class PhoneCoderInferenceCoordinatorTests: XCTestCase {
+    func testStrictAPIRequiresExplicitLoadedSessionAndPreservesPreflightLimits() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        var input = request("strict")
+        input.strictAPI = true
+        do { _ = try await coordinator.enqueue(input) { _ in }; XCTFail("API must never autoload") }
+        catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .staleSession) }
+        let untouched = await runtime.operations
+        XCTAssertTrue(untouched.isEmpty)
+        let loaded = try await coordinator.switchModel(to: "model")
+        input.expectedModelSessionID = loaded.id
+        let limits = try await coordinator.capabilities()
+        XCTAssertEqual(limits.limits.maximumOutputTokens, 64)
+        let prepared = try await coordinator.preflight(input)
+        XCTAssertEqual(prepared.prompt.mode, .conservativeApproximation)
+        XCTAssertEqual(prepared.outputTokens, 32)
+        input.maxTokens = 65
+        do { _ = try await coordinator.preflight(input); XCTFail("Output cannot be silently clamped") }
+        catch { XCTAssertEqual((error as? LocalAPIStrictBudgetError)?.code, "output_tokens_exceeded") }
+        var oversized = PhoneCoderGenerationRequest(id: input.id, sessionID: sessionID, modelID: "model",
+            messages: [ChatMessage(role: .system, content: String(repeating: "s", count: 600))])
+        oversized.strictAPI = true; oversized.expectedModelSessionID = loaded.id
+        do { _ = try await coordinator.preflight(oversized); XCTFail("System input cannot be dropped to fit") }
+        catch { XCTAssertEqual((error as? LocalAPIStrictBudgetError)?.code, "context_length_exceeded") }
+        _ = try await coordinator.switchModel(to: "model")
+        do { _ = try await coordinator.enqueue(input) { _ in }; XCTFail("Stale preflight cannot generate") }
+        catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .staleSession) }
+    }
+
+    func testStrictBudgetRejectionSurvivesNativeOutcomeMapping() {
+        let refusal = LocalAPIStrictBudgetError(code: "context_length_exceeded", promptTokens: 900, outputTokens: 32, contextWindow: 512)
+        XCTAssertThrowsError(try PhoneCoderRuntimeMapping.result(from: .rejected(refusal))) {
+            XCTAssertEqual($0 as? LocalAPIStrictBudgetError, refusal)
+        }
+    }
+
     func testLifecycleDrainWaitsForInFlightModelSwitchAndRejectsItsLateSession() async throws {
         let runtime = ControlledTextRuntime()
         let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
@@ -458,6 +494,16 @@ private actor ControlledTextRuntime: PhoneCoderTextRuntime {
         cancellationRelease = nil
     }
     func installedModels() async -> [PhoneCoderModelDescriptor] { [] }
+    func capabilities(session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimeCapabilities {
+        .init(limits: .init(contextWindow: 512, maximumOutputTokens: 64, defaultOutputTokens: 32,
+                           limitSource: .runtime, tokenCountMode: .conservativeApproximation), toolParser: .hermes)
+    }
+    func preflight(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimePreflight {
+        let capability = try await capabilities(session: session)
+        let count = LocalAPIStrictInput.upperBound(prompt: LocalAPIStrictInput.prompt(messages: request.messages, template: .chatML, thinking: false))
+        let output = try LocalAPIStrictInput.outputTokens(requested: request.maxTokens, promptTokens: count.tokens, limits: capability.limits)
+        return .init(prompt: count, limits: capability.limits, outputTokens: output)
+    }
     func liveAvailability() async -> PhoneCoderRuntimeAvailability { availability }
     func setAvailability(_ value: PhoneCoderRuntimeAvailability) { availability = value }
     func load(modelID: String) async throws -> PhoneCoderModelSession {

@@ -261,6 +261,7 @@ targets:
       - path: IOSLocalLLMTests/PhoneCoderPairingTests.swift
       - path: IOSLocalLLMTests/PhoneCoderInferenceCoordinatorTests.swift
       - path: IOSLocalLLMTests/PhoneCoderServerControllerTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderAPIServerTests.swift
       - path: IOSLocalLLMTests/HighRiskServiceTests.swift
     dependencies:
       - target: PhoneCoder

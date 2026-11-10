@@ -38,6 +38,23 @@ actor PhoneCoderInferenceCoordinator {
 
     func installedModels() async -> [PhoneCoderModelDescriptor] { await runtime.installedModels() }
 
+    func capabilities() async throws -> PhoneCoderRuntimeCapabilities {
+        guard !lifecycleSuspended, !switching, let session = modelSession else { throw PhoneCoderRuntimeError.modelUnavailable }
+        let value = try await runtime.capabilities(session: session)
+        guard modelSession == session, !switching, !lifecycleSuspended else { throw PhoneCoderRuntimeError.staleSession }
+        return value
+    }
+
+    func preflight(_ request: PhoneCoderGenerationRequest) async throws -> PhoneCoderRuntimePreflight {
+        guard !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
+        guard !switching else { throw PhoneCoderRuntimeError.switchingModel }
+        guard let session = modelSession, session.modelID == request.modelID,
+              request.expectedModelSessionID == session.id else { throw PhoneCoderRuntimeError.staleSession }
+        let result = try await runtime.preflight(request, session: session)
+        guard modelSession == session, !switching, !lifecycleSuspended else { throw PhoneCoderRuntimeError.staleSession }
+        return result
+    }
+
     func state() async -> PhoneCoderRuntimeState {
         var availability = await runtime.liveAvailability()
         if lifecycleSuspended { availability = .unavailable(.lifecycleUnavailable) }
@@ -54,6 +71,9 @@ actor PhoneCoderInferenceCoordinator {
                  onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) throws -> Task<PhoneCoderGenerationResult, Error> {
         guard !lifecycleSuspended else { throw PhoneCoderRuntimeError.lifecycleUnavailable }
         guard !switching else { throw PhoneCoderRuntimeError.switchingModel }
+        if request.strictAPI {
+            guard modelSession?.id == request.expectedModelSessionID, modelSession?.modelID == request.modelID else { throw PhoneCoderRuntimeError.staleSession }
+        }
         guard !([active].compactMap { $0 } + queue).contains(where: {
             $0.request.id == request.id && $0.request.sessionID == request.sessionID
         }) else { throw PhoneCoderRuntimeError.duplicateRequest }
@@ -230,6 +250,8 @@ actor PhoneCoderInferenceCoordinator {
         for attempt in 0...1 {
             do {
                 try checkLease(work.lease)
+                if attempt == 0, work.request.strictAPI,
+                   modelSession?.id != work.request.expectedModelSessionID { throw PhoneCoderRuntimeError.staleSession }
                 if attempt > 0, committedOutput { throw PhoneCoderRuntimeError.runtimeFailure }
                 try await checkAvailability()
                 try checkLease(work.lease)

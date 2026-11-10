@@ -24,6 +24,7 @@ struct AssistantGenerationResult: Sendable, Equatable {
 /// never evidence of an engine fault that a caller may safely retry.
 enum AssistantGenerationOutcome: Equatable, Sendable {
     case completed(AssistantGenerationResult)
+    case rejected(LocalAPIStrictBudgetError)
     case cancelled, memoryPressure, thermal, unavailable, failed
 
     static func resolve(result: AssistantGenerationResult?, error: Error? = nil,
@@ -36,6 +37,7 @@ enum AssistantGenerationOutcome: Equatable, Sendable {
         if let nativeError = error as? LlamaCppError, case .cancelled = nativeError { return .cancelled }
         if cancelled || error is CancellationError || error is MLXGenerationGate.Cancelled
             || result?.stopReason == .cancelled { return .cancelled }
+        if let error = error as? LocalAPIStrictBudgetError { return .rejected(error) }
         if error != nil { return .failed }
         guard let result else { return .unavailable }
         return .completed(result)
@@ -407,6 +409,25 @@ final class CodingAssistantService: ObservableObject {
                 DeviceSafetyMonitor.shared.recommendedMaxTokens
             )
         )
+    }
+
+    var localAPIStrictRuntimeLimits: LocalAPIRuntimeLimits {
+        let profile = ModelCapabilityProfile.resolve(for: activeModel)
+        let context = activeModel.runtime == .llamaCpp
+            ? Int(Self.importedGGUFContextTokens(repoID: activeModel.repoID))
+            : MLXAssistantExecutionProfile.resolve(repoID: activeModel.repoID,
+                catalogContextLength: activeModel.contextWindowTokens,
+                supportsThinking: activeModel.supportsThinking).maxContextTokens
+        let maximum = min(localAPIEffectiveMaximumOutputTokens,
+                          activeModel.runtime == .llamaCpp ? context / 4 : max(1, context - 16))
+        return .init(contextWindow: context, maximumOutputTokens: maximum,
+                     defaultOutputTokens: min(profile.defaultOutputTokens, maximum),
+                     limitSource: .runtime, tokenCountMode: .conservativeApproximation)
+    }
+
+    func localAPIStrictPromptBound(messages: [ChatMessage]) -> LocalAPITokenCount {
+        LocalAPIStrictInput.upperBound(prompt: LocalAPIStrictInput.prompt(messages: messages,
+            template: activeModel.chatTemplate, thinking: resolvedThinkingEnabled(forceNoThinking: false)))
     }
 
     enum ServiceState: Equatable {
@@ -2354,6 +2375,7 @@ final class CodingAssistantService: ObservableObject {
         maxTokensOverride: Int? = nil,
         temperatureOverride: Double? = nil,
         topPOverride: Double? = nil,
+        strictLocalAPI: Bool = false,
         samplerConfig: SamplerConfig? = nil,
         jsonMode: Bool = false,
         toolConstraint: MLXToolCallConstraintConfiguration? = nil,
@@ -2371,6 +2393,20 @@ final class CodingAssistantService: ObservableObject {
         onComplete: @escaping @Sendable (Double) -> Void
     ) {
         let completion = AssistantGenerationCompletion(onTerminal: onTerminal, onComplete: onComplete)
+        if strictLocalAPI {
+            guard activeExecutionLocation == .localDownloaded, state == .ready, hasUsableLocalRuntime else {
+                completion.finish(.unavailable, rate: 0)
+                return
+            }
+            do {
+                _ = try LocalAPIStrictInput.outputTokens(requested: maxTokensOverride,
+                    promptTokens: localAPIStrictPromptBound(messages: messages).tokens,
+                    limits: localAPIStrictRuntimeLimits)
+            } catch let error as LocalAPIStrictBudgetError {
+                completion.finish(.rejected(error), rate: 0)
+                return
+            } catch { completion.finish(.failed, rate: 0); return }
+        }
 #if CORE_AI_SERVER_APP
         guard CoreAIInferenceService.shared.isReady else {
             completion.finish(.unavailable, rate: 0)
@@ -2644,7 +2680,7 @@ final class CodingAssistantService: ObservableObject {
         // --- JSON Mode (Feature #2) ---
         // Inject JSON-output instructions into the last system message.
         var effectiveMessages = messages
-        let useJSONMode = jsonMode || s.jsonModeEnabled
+        let useJSONMode = LocalAPIStrictInput.usesJSONMode(strictAPI: strictLocalAPI, explicit: jsonMode, global: s.jsonModeEnabled)
         if useJSONMode {
             let jsonHint = s.jsonSchemaHint.isEmpty
                 ? "Respond with valid JSON only. No markdown fences, no commentary."
@@ -2668,7 +2704,7 @@ final class CodingAssistantService: ObservableObject {
         // per-token cost; this cap bounds the count.
         let isImportedGGUF = activeModel.runtime == .llamaCpp
         let messagesForRuntime: [ChatMessage]
-        if isImportedGGUF {
+        if isImportedGGUF && !strictLocalAPI {
             // Imported recurrent Gemma models do not accept system turns, but
             // long-conversation memory must not disappear with the rest of the
             // system prompt. Recast only our bounded memory record as ordinary
@@ -2695,7 +2731,7 @@ final class CodingAssistantService: ObservableObject {
                 deviceContextCap: executionProfile.maxContextTokens,
                 requestedOutputTokens: safeMaxTokens
             )
-        let trimmedMessages = Self.trimToInputBudget(messagesForRuntime, maxTokens: inputBudget)
+        let trimmedMessages = strictLocalAPI ? messagesForRuntime : Self.trimToInputBudget(messagesForRuntime, maxTokens: inputBudget)
 
         // Expose estimated input token count so the UI can render context-window bar.
         estimatedInputTokens = trimmedMessages.map {
@@ -2707,7 +2743,9 @@ final class CodingAssistantService: ObservableObject {
         // Non-ChatML models (Llama, Gemma, Phi) now get proper formatting.
         let template = activeModel.chatTemplate
         let enableThinking = resolvedThinkingEnabled(forceNoThinking: forceNoThinking)
-        let manualPrompt: String? = template.supportsThinking
+        let manualPrompt: String? = strictLocalAPI
+            ? LocalAPIStrictInput.prompt(messages: trimmedMessages, template: template, thinking: enableThinking)
+            : template.supportsThinking
             ? trimmedMessages.formattedWithTemplate(template, enableThinking: enableThinking)
             : trimmedMessages.formattedWithTemplate(template)
 
@@ -2753,6 +2791,7 @@ final class CodingAssistantService: ObservableObject {
                 safeMaxTokens,
                 Self.importedGGUFMaxOutputTokens(repoID: activeModel.repoID)
             )
+            let strictLimits = localAPIStrictRuntimeLimits
             let ggufPrompt: String = {
                 if let manualPrompt, !manualPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     return manualPrompt
@@ -2821,6 +2860,11 @@ final class CodingAssistantService: ObservableObject {
                         rate = completedRate.withLock { $0 }
                         generationResult = nil
                     } else {
+                        if strictLocalAPI {
+                            let exact = try ggufModel.tokenCount(for: ggufPrompt)
+                            _ = try LocalAPIStrictInput.outputTokens(requested: ggufMaxTokens,
+                                promptTokens: exact, limits: strictLimits)
+                        }
                         let result = try ggufModel.generateText(
                             // Imported GGUFs are standalone community models.
                             // Use the app chat template (not a bare role: transcript)
@@ -2905,10 +2949,10 @@ final class CodingAssistantService: ObservableObject {
                             // "not loaded or busy" until the user reloads it.
                             service.state = service.hasResidentRuntime
                                 ? .ready
-                                : .failed(error.localizedDescription)
+                                : .failed(strictLocalAPI ? "Local API generation failed." : error.localizedDescription)
                         }
                         Diagnostics.shared.error(
-                            "GGUF assistant generation failed · \(error.localizedDescription)",
+                            strictLocalAPI ? "GGUF local API generation failed." : "GGUF assistant generation failed · \(error.localizedDescription)",
                             category: "assistant"
                         )
                         completion.finish(.resolve(result: nil, error: error,
@@ -2921,6 +2965,7 @@ final class CodingAssistantService: ObservableObject {
         }
 
         guard let container = resolvedMLXContainer else { completion.finish(.unavailable, rate: 0); return }
+        let strictLimits = localAPIStrictRuntimeLimits
 
         let generationID = UUID()
         activeMLXGenerationID = generationID
@@ -3017,9 +3062,9 @@ final class CodingAssistantService: ObservableObject {
                         // `UserInput.tools` through the tokenizer's own chat
                         // template. A manually formatted prompt cannot carry
                         // tool schemas or correlate tool results.
-                        let useManualPrompt = nativeTools.isEmpty
+                        let useManualPrompt = strictLocalAPI || (nativeTools.isEmpty
                             && !template.format.hasPrefix("generic")
-                            && !useVisionChat
+                            && !useVisionChat)
                         var userInput: UserInput
                         if useManualPrompt, let manualPrompt {
                             userInput = UserInput(prompt: manualPrompt)
@@ -3085,6 +3130,10 @@ final class CodingAssistantService: ObservableObject {
                             }
                         }
                         let lmInput = try await generationContext.processor.prepare(input: userInput)
+                        if strictLocalAPI {
+                            _ = try LocalAPIStrictInput.outputTokens(requested: safeMaxTokens,
+                                promptTokens: lmInput.text.tokens.size, limits: strictLimits)
+                        }
                         let cache = generationContext.model.newCache(parameters: params)
 
                         let generationStream: AsyncStream<Generation>
@@ -3265,7 +3314,7 @@ final class CodingAssistantService: ObservableObject {
                     // the model was still loaded and could recover.
                     self.state = self.hasResidentRuntime
                         ? .ready
-                        : .failed(error.localizedDescription)
+                        : .failed(strictLocalAPI ? "Local API generation failed." : error.localizedDescription)
                     completion.finish(.resolve(result: nil, error: error,
                         cancelled: Task.isCancelled || self.stopEpoch != generationStopEpoch,
                         safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)

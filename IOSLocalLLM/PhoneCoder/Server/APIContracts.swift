@@ -9,6 +9,7 @@ struct PhoneCoderRequestID: RawRepresentable, Hashable, Codable, Sendable {
 struct PhoneCoderAPIError: Error, Equatable, Sendable {
     let code: String
     let message: String
+    var details: [String: Int]? = nil
 
     static func invalid(_ message: String) -> Self { .init(code: "invalid_request", message: message) }
     static let bodyTooLarge = Self(code: "body_too_large", message: "Request body is too large.")

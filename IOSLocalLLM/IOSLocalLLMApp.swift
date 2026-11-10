@@ -67,8 +67,8 @@ final class PhoneCoderAppDelegate: NSObject, UIApplicationDelegate {
     }
 }
 
-/// One graph for the native server and local UI. Task 6 installs its transport
-/// at this composition point; Tasks 6/7 must share these actor instances.
+/// One graph for the native server and local UI. Every consumer shares these
+/// authentication, request, runtime and lifecycle authorities.
 @MainActor
 final class PhoneCoderServerServices {
     static let shared = PhoneCoderServerServices()
@@ -77,9 +77,15 @@ final class PhoneCoderServerServices {
     let coordinator: PhoneCoderInferenceCoordinator
     let inferenceLifecycle: PhoneCoderInferenceLifecycle
     let controller: PhoneCoderServerController
+    let pairings: PhoneCoderPairingStore
+    let pairingExchange: PhoneCoderPairingExchange
+    let pairingApproval: PhoneCoderPairingApproval
+    let activity: PhoneCoderServerActivityStore
+    let apiServer: PhoneCoderAPIServer
+    let listener: PhoneCoderNetworkListener
 
     private init() {
-        let ledger = PhoneCoderRequestLedger(sessionID: UUID())
+        let ledger = PhoneCoderRequestLedger(sessionID: UUID(), completedRecordLimit: 16, outputByteLimit: 2_097_152)
         let coordinator = PhoneCoderInferenceCoordinator.shared
         let lifecycle = PhoneCoderInferenceLifecycle(coordinator: coordinator, ledger: ledger) {
             // Signal native load/generation cancellation after queue closure. Existing
@@ -94,18 +100,32 @@ final class PhoneCoderServerServices {
         self.ledger = ledger
         self.coordinator = coordinator
         self.inferenceLifecycle = lifecycle
-        controller = PhoneCoderServerController(listener: PhoneCoderUnconfiguredListener(),
+        let pairings = PhoneCoderPairingStore()
+        let pairingExchange = PhoneCoderPairingExchange(store: pairings)
+        let pairingApproval = PhoneCoderPairingApproval()
+        let activity = PhoneCoderServerActivityStore(url: PhoneCoderServerActivityStore.defaultURL)
+        let server = PhoneCoderAPIServer(coordinator: coordinator, ledger: ledger, pairings: pairings,
+            exchange: pairingExchange, activity: activity,
+            approval: { [weak pairingApproval] name in await pairingApproval?.request(name: name) ?? false },
+            deviceFacts: {
+                let thermal: String = switch DeviceSafetyMonitor.shared.thermalState {
+                case .nominal: "nominal"
+                case .fair: "fair"
+                case .serious: "serious"
+                case .critical: "critical"
+                @unknown default: "unknown"
+                }
+                return .init(availableMemoryBytes: UInt64(MemoryAdvisor.availableMemoryForModel), thermal: thermal)
+            })
+        let listener = PhoneCoderNetworkListener(server: server, cancelApproval: { [weak pairingApproval] in pairingApproval?.cancel() })
+        self.pairings = pairings; self.pairingExchange = pairingExchange
+        self.pairingApproval = pairingApproval; self.activity = activity
+        self.apiServer = server; self.listener = listener
+        controller = PhoneCoderServerController(listener: listener,
             inference: lifecycle, intent: PhoneCoderDefaultsServingIntent(defaults: .standard),
             clock: PhoneCoderContinuousServerClock(),
             setIdleTimerDisabled: { UIApplication.shared.isIdleTimerDisabled = $0 })
+        listener.controller = controller
         _ = lifecycle.suspend()
     }
-}
-
-/// Fail closed until the authenticated transport is composed in Task 6. This
-/// must never be replaced with a no-op listener that advertises false readiness.
-@MainActor
-private final class PhoneCoderUnconfiguredListener: PhoneCoderServerListening {
-    func start(sessionID: UUID) async throws { throw PhoneCoderListenerError.networkUnavailable }
-    func stop() {}
 }

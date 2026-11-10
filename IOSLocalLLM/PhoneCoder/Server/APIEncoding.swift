@@ -95,8 +95,16 @@ enum PhoneCoderAPIEncoder {
             name = "response.output_item.done"; object = ["response_id": c.id, "output_index": index, "item": item.object]
         case let .responseCompleted(c, usage, output):
             name = "response.completed"; object = ["response": response(c, status: "completed", usage: usage, output: output)]
-        case let .responseError(error, param): name = "error"; object = ["code": error.code, "message": error.message, "param": param as Any? ?? NSNull()]
-        case .error(let error): name = "error"; object = ["error": ["code": error.code, "message": error.message]]
+        case let .responseError(error, param):
+            name = "error"
+            var fields: [String: Any] = ["code": error.code, "message": error.message, "param": param as Any? ?? NSNull()]
+            if let details = error.details { fields["details"] = details }
+            object = fields
+        case .error(let error):
+            name = "error"
+            var fields: [String: Any] = ["code": error.code, "message": error.message]
+            if let details = error.details { fields["details"] = details }
+            object = ["error": fields]
         case .done: name = nil; object = nil
         }
         var body = object

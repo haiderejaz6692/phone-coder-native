@@ -76,6 +76,41 @@ final class ModelDownloadCenterServiceTests: XCTestCase {
 }
 
 final class CodingAssistantServicePolicyTests: XCTestCase {
+    func testStrictAPIPromptPreservesEveryTurnWithoutChatSanitizing() throws {
+        XCTAssertFalse(LocalAPIStrictInput.usesJSONMode(strictAPI: true, explicit: true, global: true))
+        XCTAssertTrue(LocalAPIStrictInput.usesJSONMode(strictAPI: false, explicit: false, global: true))
+        let messages = [ChatMessage(role: .system, content: "system-unique"),
+                        ChatMessage(role: .assistant, content: "<think>literal previous output</think>"),
+                        ChatMessage(role: .user, content: "用户🙂")]
+        let prompt = LocalAPIStrictInput.prompt(messages: messages, template: .chatML, thinking: false)
+        XCTAssertTrue(prompt.contains("<|im_start|>system\nsystem-unique<|im_end|>"))
+        XCTAssertTrue(prompt.contains("<think>literal previous output</think>"))
+        XCTAssertTrue(prompt.contains("用户🙂"))
+        XCTAssertFalse(prompt.contains("JSON MODE"))
+        let gemma = LocalAPIStrictInput.prompt(messages: messages, template: .gemma, thinking: false)
+        XCTAssertEqual(gemma.components(separatedBy: "system-unique").count - 1, 1)
+        let count = LocalAPIStrictInput.upperBound(prompt: prompt)
+        XCTAssertGreaterThanOrEqual(count.tokens, prompt.utf8.count)
+        XCTAssertEqual(count.mode, .conservativeApproximation)
+    }
+
+    func testStrictBudgetRejectsInsteadOfClampingOrTrimming() throws {
+        let limits = LocalAPIRuntimeLimits(contextWindow: 100, maximumOutputTokens: 30, defaultOutputTokens: 20, limitSource: .runtime, tokenCountMode: .exact)
+        XCTAssertEqual(try LocalAPIStrictInput.outputTokens(requested: nil, promptTokens: 60, limits: limits), 20)
+        XCTAssertThrowsError(try LocalAPIStrictInput.outputTokens(requested: 31, promptTokens: 10, limits: limits)) { error in
+            XCTAssertEqual((error as? LocalAPIStrictBudgetError)?.code, "output_tokens_exceeded")
+        }
+        XCTAssertThrowsError(try LocalAPIStrictInput.outputTokens(requested: 30, promptTokens: 80, limits: limits)) { error in
+            let budget = error as? LocalAPIStrictBudgetError
+            XCTAssertEqual(budget?.code, "context_length_exceeded")
+            XCTAssertEqual(budget?.promptTokens, 80)
+            XCTAssertEqual(budget?.outputTokens, 30)
+            XCTAssertEqual(budget?.contextWindow, 100)
+        }
+        let rejected = LocalAPIStrictBudgetError(code: "context_length_exceeded", promptTokens: 80, outputTokens: 30, contextWindow: 100)
+        XCTAssertEqual(AssistantGenerationOutcome.resolve(result: nil, error: rejected, cancelled: false), .rejected(rejected))
+    }
+
     func testStaleMLXGenerationCannotPublishOverCurrentGeneration() {
         let current = UUID()
         let stale = UUID()

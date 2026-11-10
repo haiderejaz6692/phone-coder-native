@@ -21,6 +21,19 @@ struct PhoneCoderGenerationRequest: Sendable {
     var maxTokens: Int? = nil
     var temperature: Double? = nil
     var topP: Double? = nil
+    var strictAPI = false
+    var expectedModelSessionID: UUID? = nil
+}
+
+struct PhoneCoderRuntimeCapabilities: Sendable {
+    let limits: LocalAPIRuntimeLimits
+    let toolParser: ModelToolParser
+}
+
+struct PhoneCoderRuntimePreflight: Sendable {
+    let prompt: LocalAPITokenCount
+    let limits: LocalAPIRuntimeLimits
+    let outputTokens: Int
 }
 
 struct PhoneCoderRuntimeEvent: Equatable, Sendable {
@@ -70,4 +83,11 @@ protocol PhoneCoderTextRuntime: Sendable {
                   onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult
     func cancel(requestID: PhoneCoderRequestID) async
     func unload() async
+    func capabilities(session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimeCapabilities
+    func preflight(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimePreflight
+}
+
+extension PhoneCoderTextRuntime {
+    func capabilities(session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimeCapabilities { throw PhoneCoderRuntimeError.modelUnavailable }
+    func preflight(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimePreflight { throw PhoneCoderRuntimeError.modelUnavailable }
 }
