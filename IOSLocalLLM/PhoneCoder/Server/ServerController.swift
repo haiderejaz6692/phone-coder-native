@@ -59,7 +59,8 @@ protocol PhoneCoderInferenceLifecycleControlling: AnyObject {
     func state() async -> PhoneCoderRuntimeState
     /// Signal cancellation promptly; the returned task represents native drain.
     func suspend() -> Task<Void, Never>
-    func resume(sessionID: UUID) async -> Bool
+    /// Capture the new foreground intent before returning its setup task.
+    func resume(sessionID: UUID) -> Task<Bool, Never>
 }
 
 /// Adapts the two actor authorities without copying their request state. The
@@ -105,24 +106,29 @@ final class PhoneCoderInferenceLifecycle: PhoneCoderInferenceLifecycleControllin
         }
     }
 
-    func resume(sessionID: UUID) async -> Bool {
+    func resume(sessionID: UUID) -> Task<Bool, Never> {
+        // Supersede old session bookkeeping without suspending the coordinator
+        // or invalidating a model switch. This epoch belongs only to the facade.
+        epoch &+= 1
         let captured = epoch
-        _ = await setup?.value
-        guard captured == epoch else { return false }
-        let resume = await coordinator.resumeAfterLifecycle()
-        guard await resume.value, captured == epoch else { return false }
-        // Join the same short setup chain as suspension. A later suspend must
-        // invalidate AFTER this session write, even across actor reentrancy.
-        let previous = setup
-        let update = Task {
-            _ = await previous?.value
-            guard captured == self.epoch else { return Task {} }
-            await self.ledger.setSessionID(sessionID)
-            return Task {}
+        return Task {
+            _ = await self.setup?.value
+            guard captured == self.epoch else { return false }
+            let resume = await self.coordinator.resumeAfterLifecycle()
+            guard await resume.value, captured == self.epoch else { return false }
+            // Join the same short setup chain as suspension. A later suspend
+            // invalidates AFTER this write, even across actor reentrancy.
+            let previous = self.setup
+            let update = Task {
+                _ = await previous?.value
+                guard captured == self.epoch else { return Task {} }
+                await self.ledger.setSessionID(sessionID)
+                return Task {}
+            }
+            self.setup = update
+            _ = await update.value
+            return captured == self.epoch
         }
-        setup = update
-        _ = await update.value
-        return captured == epoch
     }
 }
 
@@ -237,7 +243,8 @@ final class PhoneCoderServerController: ObservableObject {
         retry?.cancel()
         retry = nil
         listener.stop()
-        _ = inference.suspend()
+        // Foreground listener/session preparation is not a global runtime
+        // interruption. In particular, an owner-selected model may be loading.
         listening = false
         connectionCount = 0
         runtimeState = nil
@@ -247,12 +254,20 @@ final class PhoneCoderServerController: ObservableObject {
         setIdleTimerDisabled(true)
         let task = Task { [weak self] in
             guard let self, self.isCurrent(captured) else { return }
-            guard await self.inference.resume(sessionID: session), self.isCurrent(captured) else { return }
+            guard await self.inference.resume(sessionID: session).value, self.isCurrent(captured) else { return }
             let health = await self.inference.state()
             guard self.isCurrent(captured) else { return }
             self.runtimeState = health
             if let refusal = self.stateForRefusal(health) {
-                await self.suspend(state: refusal).value
+                if refusal == .coolingDown || refusal == .lowMemory {
+                    await self.suspend(state: refusal).value
+                } else {
+                    // Keep a pending model switch alive. The owner can retry
+                    // serving once it completes; no listener was started yet.
+                    self.sessionID = nil
+                    self.state = refusal
+                    self.setIdleTimerDisabled(false)
+                }
                 return
             }
             do {
@@ -262,10 +277,14 @@ final class PhoneCoderServerController: ObservableObject {
                 let currentHealth = await self.inference.state()
                 guard self.isCurrent(captured) else { return }
                 self.runtimeState = currentHealth
-                if let refusal = self.stateForRefusal(currentHealth) {
+                if let refusal = self.stateForRefusal(currentHealth),
+                   refusal == .coolingDown || refusal == .lowMemory {
                     await self.suspend(state: refusal).value
                     return
                 }
+                // A switch may have begun while listener.start suspended.
+                // Keep health reachable and let publishActiveState report the
+                // unavailable model until a live health refresh sees recovery.
                 self.listening = true
                 self.publishActiveState()
             } catch {
@@ -291,7 +310,7 @@ final class PhoneCoderServerController: ObservableObject {
             await drain?.value
             guard let self, captured == self.epoch, self.phase == .active,
                   !self.listening, !Task.isCancelled else { return }
-            _ = await self.inference.resume(sessionID: UUID())
+            _ = await self.inference.resume(sessionID: UUID()).value
         }
         transition = task
         return task

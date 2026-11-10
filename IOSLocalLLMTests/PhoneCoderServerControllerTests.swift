@@ -6,6 +6,119 @@ import XCTest
 
 @MainActor
 final class PhoneCoderServerControllerTests: XCTestCase {
+    func testNewForegroundSessionInvalidatesOlderResumeWithoutCancellingModelLoad() async throws {
+        let runtime = LifecycleTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let ledger = PhoneCoderRequestLedger(sessionID: UUID())
+        var nativeInterruptions = 0
+        let lifecycle = PhoneCoderInferenceLifecycle(coordinator: coordinator, ledger: ledger,
+            signalNativeInterruption: { nativeInterruptions += 1 })
+        await runtime.holdLoad()
+        let loading = Task { try await coordinator.switchModel(to: "selected-model") }
+        await runtime.waitForLoads(1)
+        let obsoleteSession = UUID()
+        let listenerSession = UUID()
+        // Both intents are captured synchronously before either setup task can
+        // run, proving that obsolete bookkeeping cannot win a scheduler race.
+        let obsoleteResume = lifecycle.resume(sessionID: obsoleteSession)
+        let currentResume = lifecycle.resume(sessionID: listenerSession)
+        let obsoleteResult = await obsoleteResume.value
+        let currentResult = await currentResume.value
+        XCTAssertFalse(obsoleteResult)
+        XCTAssertTrue(currentResult)
+        let fingerprint = SHA256.hash(data: Data("session-test".utf8))
+        do {
+            _ = try await ledger.begin(id: .init(rawValue: "obsolete"), fingerprint: fingerprint,
+                sessionID: obsoleteSession, deadline: .now.advanced(by: .seconds(60)))
+            XCTFail("An old resume must not replace the listener's current ledger session")
+        } catch { XCTAssertEqual((error as? PhoneCoderAPIError)?.code, "stale_session") }
+        let owner = try await ledger.begin(id: .init(rawValue: "current"), fingerprint: fingerprint,
+            sessionID: listenerSession, deadline: .now.advanced(by: .seconds(60)))
+        XCTAssertEqual(owner, .owner)
+        XCTAssertEqual(nativeInterruptions, 0)
+        await runtime.releaseLoad()
+        let selected = try await loading.value
+        XCTAssertEqual(selected.modelID, "selected-model")
+        await lifecycle.suspend().value
+    }
+
+    func testStartAndRetryPreserveModelLoadAlreadyInProgress() async throws {
+        let runtime = LifecycleTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        var nativeInterruptions = 0
+        let lifecycle = PhoneCoderInferenceLifecycle(coordinator: coordinator, ledger: .init(sessionID: UUID()),
+            signalNativeInterruption: { nativeInterruptions += 1 })
+        let fixture = Fixture(inference: lifecycle)
+        await fixture.controller.handle(scenePhase: .active).value
+        await runtime.holdLoad()
+        let loading = Task { try await coordinator.switchModel(to: "selected-model") }
+        await runtime.waitForLoads(1)
+
+        let startUnavailable = expectation(description: "Start reports loading model unavailable")
+        var observation = fixture.controller.$state.sink {
+            if $0 == .modelUnavailable { startUnavailable.fulfill() }
+        }
+        let start = fixture.controller.startServing()
+        await fulfillment(of: [startUnavailable], timeout: 2)
+        observation.cancel()
+        let retryUnavailable = expectation(description: "Retry reports loading model unavailable")
+        let retry = fixture.controller.retryNow()
+        observation = fixture.controller.$state.sink {
+            if $0 == .modelUnavailable { retryUnavailable.fulfill() }
+        }
+        await fulfillment(of: [retryUnavailable], timeout: 2)
+        observation.cancel()
+
+        let duringLoad = await coordinator.state()
+        XCTAssertEqual(duringLoad.availability, .unavailable(.switchingModel))
+        XCTAssertTrue(fixture.listener.starts.isEmpty)
+        XCTAssertEqual(nativeInterruptions, 0, "Starting a listener must not signal native cancelLoad")
+        await runtime.releaseLoad()
+        let selected = try? await loading.value
+        await start.value
+        await retry.value
+        XCTAssertEqual(selected?.modelID, "selected-model")
+        await fixture.controller.retryNow().value
+        XCTAssertEqual(fixture.controller.state, .ready)
+        await fixture.controller.stopServing().value
+    }
+
+    func testModelSwitchDuringListenerStartIsPreservedAndHealthRecovers() async throws {
+        let runtime = LifecycleTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        _ = try await coordinator.switchModel(to: "initial-model")
+        var nativeInterruptions = 0
+        let lifecycle = PhoneCoderInferenceLifecycle(coordinator: coordinator, ledger: .init(sessionID: UUID()),
+            signalNativeInterruption: { nativeInterruptions += 1 })
+        let fixture = Fixture(inference: lifecycle)
+        await fixture.controller.handle(scenePhase: .active).value
+        fixture.listener.holdStart = true
+        let start = fixture.controller.startServing()
+        await fixture.listener.waitForStart()
+        await runtime.holdLoad()
+        let loading = Task { try await coordinator.switchModel(to: "new-model") }
+        await runtime.waitForLoads(2)
+        let unavailable = expectation(description: "Listener starts with model unavailable")
+        let observation = fixture.controller.$state.sink {
+            if $0 == .modelUnavailable { unavailable.fulfill() }
+        }
+        fixture.listener.releaseStart()
+        await fulfillment(of: [unavailable], timeout: 2)
+        observation.cancel()
+        let duringLoad = await coordinator.state()
+        XCTAssertEqual(duringLoad.availability, .unavailable(.switchingModel))
+        XCTAssertTrue(fixture.listener.admitting, "Health must remain reachable during the load")
+        XCTAssertEqual(nativeInterruptions, 0)
+        await runtime.releaseLoad()
+        let selected = try? await loading.value
+        await start.value
+        XCTAssertEqual(selected?.modelID, "new-model")
+        await fixture.controller.refreshHealth()
+        XCTAssertEqual(fixture.controller.state, .ready)
+        XCTAssertEqual(fixture.controller.runtimeState?.modelSession?.modelID, "new-model")
+        await fixture.controller.stopServing().value
+    }
+
     func testServingIntentSurvivesDefaultsReconstructionAndStopClearsIt() async throws {
         let suite = "PhoneCoderServerControllerTests." + UUID().uuidString
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
@@ -367,7 +480,7 @@ private final class ControlledInferenceLifecycle: PhoneCoderInferenceLifecycleCo
         modelSession: .init(id: UUID(), modelID: "model"), activeRequestID: nil, waitingCount: 0, switchingModel: false)
     func state() async -> PhoneCoderRuntimeState { snapshot }
     func suspend() -> Task<Void, Never> { Task {} }
-    func resume(sessionID: UUID) async -> Bool { true }
+    func resume(sessionID: UUID) -> Task<Bool, Never> { Task { true } }
 }
 
 @MainActor
@@ -400,9 +513,30 @@ private actor LifecycleTextRuntime: PhoneCoderTextRuntime {
     private var callback: (@Sendable (PhoneCoderRuntimeEvent) async -> Void)?
     private var completion: CheckedContinuation<PhoneCoderGenerationResult, Error>?
     private var startWaiter: CheckedContinuation<Void, Never>?
+    private var heldLoad: CheckedContinuation<Void, Never>?
+    private var holdsLoad = false
+    private var loadCount = 0
+    private var loadWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
     func installedModels() async -> [PhoneCoderModelDescriptor] { [.init(id: "model", displayName: "Model")] }
     func liveAvailability() async -> PhoneCoderRuntimeAvailability { .available }
-    func load(modelID: String) async throws -> PhoneCoderModelSession { .init(id: UUID(), modelID: modelID) }
+    func holdLoad() { holdsLoad = true }
+    func releaseLoad() { holdsLoad = false; heldLoad?.resume(); heldLoad = nil }
+    func waitForLoads(_ count: Int) async {
+        if loadCount >= count { return }
+        await withCheckedContinuation { loadWaiters.append((count, $0)) }
+    }
+    func load(modelID: String) async throws -> PhoneCoderModelSession {
+        loadCount += 1
+        let ready = loadWaiters.filter { $0.0 <= loadCount }
+        loadWaiters.removeAll { $0.0 <= loadCount }
+        if holdsLoad {
+            await withCheckedContinuation {
+                heldLoad = $0
+                ready.forEach { $0.1.resume() }
+            }
+        } else { ready.forEach { $0.1.resume() } }
+        return .init(id: UUID(), modelID: modelID)
+    }
     func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession,
                   onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult {
         self.request = request
