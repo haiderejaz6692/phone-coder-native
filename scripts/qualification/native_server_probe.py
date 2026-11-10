@@ -130,12 +130,17 @@ class StreamResult:
             self.done += 1
             return
         if "error" in value:
-            if self.category is not None:
+            if self.category is not None or self.finishes:
                 raise ProbeError("duplicate_terminal")
+            if self.has_usage or value.get("choices") or "usage" in value:
+                raise ProbeError("invalid_terminal")
             self.category = error_code(value)
+            return
         choices = value.get("choices", [])
-        if not isinstance(choices, list):
+        if not isinstance(choices, list) or len(choices) > 1:
             raise ProbeError("invalid_event")
+        if self.category is not None or (self.finishes and (choices or "usage" not in value)):
+            raise ProbeError("event_after_terminal")
         for choice in choices:
             if not isinstance(choice, dict):
                 raise ProbeError("invalid_event")
@@ -143,21 +148,31 @@ class StreamResult:
             text = delta.get("content", "") if isinstance(delta, dict) else ""
             if not isinstance(text, str):
                 raise ProbeError("invalid_event")
+            finish = choice.get("finish_reason")
+            # This probe calls text-only Chat Completions without tools.
+            # The approved chat subset therefore has only stop/length exits.
+            if finish is not None and finish not in ("stop", "length"):
+                raise ProbeError("invalid_finish_reason")
             self.digest.update(text.encode("utf-8"))
             marker = "hello 🌍"
             combined = self.marker_tail + text
             self.marker_count += combined.count(marker)
             self.marker_tail = combined[-(len(marker) - 1):]
-            if choice.get("finish_reason") is not None:
+            if finish is not None:
                 self.finishes += 1
-        usage = value.get("usage")
-        if isinstance(usage, dict):
+        if "usage" in value:
+            usage = value["usage"]
+            if self.has_usage:
+                raise ProbeError("duplicate_usage")
+            if self.finishes != 1 or choices:
+                raise ProbeError("invalid_usage_order")
+            if not isinstance(usage, dict):
+                raise ProbeError("invalid_usage")
+            counts = [usage.get(field) for field in ("prompt_tokens", "completion_tokens", "total_tokens")]
+            if any(type(count) is not int or not 0 <= count <= 10_000_000 for count in counts) or counts[0] + counts[1] != counts[2]:
+                raise ProbeError("invalid_usage")
             self.has_usage = True
-            for field, attribute in (("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens")):
-                count = usage.get(field)
-                if type(count) is not int or not 0 <= count <= 10_000_000:
-                    raise ProbeError("invalid_usage")
-                setattr(self, attribute, count)
+            self.input_tokens, self.output_tokens = counts[:2]
 
     def validate(self, terminal=None):
         if self.done != 1 or self.finishes + int(self.category is not None) != 1:
@@ -361,13 +376,23 @@ class Probe:
 
     def cancel(self):
         rid = str(uuid.uuid4())
+        cancelled = None
         def cancel():
+            nonlocal cancelled
             first = self.client.json("DELETE", "/v1/requests/" + rid, request_id=rid)
             second = self.client.json("DELETE", "/v1/requests/" + rid, request_id=rid)
-            if first.get("cancelled") is not True or second.get("cancelled") is not False:
+            cancelled = first.get("cancelled")
+            if type(cancelled) is not bool or second.get("cancelled") is not False:
                 raise ProbeError("cancel_not_idempotent")
         result = self.stream(self.body(max_tokens=512), rid, first=cancel)
+        if result.category is None:
+            result.validate()
+            if cancelled is False:
+                return {"status": "BLOCKED", "category": "completion_won_race", **result.metadata()}
+            raise ProbeError("completion_after_accepted_cancel")
         result.validate({"request_cancelled"})
+        if cancelled is not True:
+            raise ProbeError("cancel_not_idempotent")
         return result.metadata()
 
     def reattach(self):
@@ -410,22 +435,28 @@ class Probe:
     def background(self):
         if self.checkpoint is None:
             return {"status": "NOT RUN", "category": "owner_checkpoint_required"}
-        result = None
-        interrupted = False
+        failure = None
         try:
             result = self.stream(self.body(max_tokens=512), first=lambda: self.checkpoint("background"))
-            result.validate({"background_interrupted", "session_ended"})
-            interrupted = True
+            if result.category is None:
+                result.validate()
+                outcome = {"status": "BLOCKED", "category": "completion_won_race", "completed": 2}
+            else:
+                result.validate({"background_interrupted", "session_ended"})
+                outcome = {"completed": 1, "terminal_errors": 1}
         except ProbeError as error:
             if error.category not in ("transport_closed", "truncated_stream", "invalid_terminal"):
-                raise
-        self.checkpoint("foreground")
-        self.client.json("GET", "/health")
-        fresh = self.stream(self.body())
-        fresh.validate()
-        if not interrupted:
-            return {"status": "BLOCKED", "category": "background_terminal_unobserved", "completed": 1}
-        return {"completed": 1, "terminal_errors": 1}
+                failure = error
+            outcome = {"status": "BLOCKED", "category": "background_terminal_unobserved", "completed": 1}
+        finally:
+            # Always restore the owner's foreground checkpoint and verify fresh
+            # work, including normal-completion and malformed-stream races.
+            self.checkpoint("foreground")
+            self.client.json("GET", "/health")
+            self.stream(self.body()).validate()
+        if failure is not None:
+            raise failure
+        return outcome
 
     def rotation(self):
         if self.checkpoint is None:

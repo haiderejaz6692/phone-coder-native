@@ -22,6 +22,11 @@ Do not turn missing evidence into PASS. `queue_not_saturated` means six requests
 completed too quickly to observe queue rejection. `background_terminal_unobserved`
 means the socket closed before an explicit interruption terminal was received;
 a fresh successful request alone cannot prove the old request's terminal state.
+`completion_won_race` means a valid ordinary completion finished before DELETE
+or the owner's background action could exercise interruption. That attempt is
+BLOCKED rather than a cancellation/lifecycle failure. Repeat it with the app
+and model ready; the background scenario still returns through the foreground
+checkpoint and verifies a fresh request before reporting its result.
 
 The probe exits 0 for all selected scenarios passing, 1 for any failure, and 2
 for a blocked/not-run scenario or invalid configuration. A selected subset

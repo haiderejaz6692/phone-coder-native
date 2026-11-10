@@ -32,6 +32,8 @@ class Fixture:
         self.active = 0
         self.lock = threading.Lock()
         self.cancelled = set()
+        self.completed = set()
+        self.completion_wins = False
         self.background = False
         self.bad_ids = None
         self.delay = 0
@@ -81,8 +83,9 @@ class Fixture:
                     return
                 rid = self.headers.get("X-Phone-Coder-Request-ID")
                 with fixture.lock:
-                    changed = rid not in fixture.cancelled
-                    fixture.cancelled.add(rid)
+                    changed = rid not in fixture.cancelled and rid not in fixture.completed
+                    if changed:
+                        fixture.cancelled.add(rid)
                 self.send(200, json.dumps({"id": rid, "cancelled": changed}).encode())
 
             def do_POST(self):
@@ -123,6 +126,9 @@ class Fixture:
                         text = "hello 🌍" if "🌍" in body.decode() else fixture.secret
                         data = completion(text)
                     parts = data.split(b"\n\n")[:-1]
+                    if fixture.completion_wins:
+                        with fixture.lock:
+                            fixture.completed.add(rid)
                     for part in parts:
                         number = int(part.split(b"\n", 1)[0][4:])
                         if number <= after:
@@ -131,7 +137,7 @@ class Fixture:
                             time.sleep(0.03)
                         with fixture.lock:
                             cancelled = rid in fixture.cancelled
-                        if cancelled or fixture.background:
+                        if not fixture.completion_wins and (cancelled or fixture.background):
                             code = "request_cancelled" if cancelled else "background_interrupted"
                             self.wfile.write(event(number, {"error": {"code": code, "message": fixture.secret}}) + event(number + 1, "[DONE]"))
                             self.wfile.flush()
@@ -187,6 +193,15 @@ class ProbeTests(unittest.TestCase):
             self.assertEqual(result["status"], "PASS", result)
             self.assertEqual(f.executions, 1)
 
+    def test_normal_completion_before_delete_is_blocked_and_other_checks_continue(self):
+        with Fixture() as f:
+            f.completion_wins = True
+            result = self.probe.Probe(self.client(f)).run(["cancel", "unauthorized"])
+            self.assertEqual(result["status"], "BLOCKED", result)
+            self.assertEqual(result["scenarios"][0]["category"], "completion_won_race")
+            self.assertEqual(result["scenarios"][1]["status"], "PASS")
+            self.assertEqual(self.probe.exit_code(result), 2)
+
     def test_disconnect_reattaches_exact_body_and_replay_matches(self):
         with Fixture() as f:
             result = self.probe.Probe(self.client(f)).run(["reattach"])
@@ -216,6 +231,35 @@ class ProbeTests(unittest.TestCase):
                 f.background = stage == "background"
             result = self.probe.Probe(self.client(f), checkpoint=checkpoint).run(["background"])
             self.assertEqual(result["status"], "PASS", result)
+            self.assertEqual(f.executions, 2)
+
+    def test_normal_completion_before_background_returns_foreground_and_checks_fresh_request(self):
+        with Fixture() as f:
+            f.completion_wins = True
+            stages = []
+            def checkpoint(stage):
+                stages.append(stage)
+                f.background = stage == "background"
+            result = self.probe.Probe(self.client(f), checkpoint=checkpoint).run(["background"])
+            self.assertEqual(result["status"], "BLOCKED", result)
+            self.assertEqual(result["scenarios"][0]["category"], "completion_won_race")
+            self.assertEqual(stages, ["background", "foreground"])
+            self.assertEqual(f.executions, 2)
+            self.assertEqual(self.probe.exit_code(result), 2)
+
+    def test_malformed_background_stream_still_restores_foreground_and_checks_fresh_request(self):
+        with Fixture() as f:
+            f.completion_wins = True
+            f.bad_ids = (1, 1, 2, 3)
+            stages = []
+            def checkpoint(stage):
+                stages.append(stage)
+                if stage == "foreground":
+                    f.bad_ids = None
+            result = self.probe.Probe(self.client(f), checkpoint=checkpoint).run(["background"])
+            self.assertEqual(result["status"], "FAIL", result)
+            self.assertEqual(result["scenarios"][0]["category"], "duplicate_event")
+            self.assertEqual(stages, ["background", "foreground"])
             self.assertEqual(f.executions, 2)
 
     def test_manual_scenarios_are_not_run_without_checkpoints(self):
@@ -288,6 +332,60 @@ class ProbeTests(unittest.TestCase):
         with self.assertRaises(self.probe.ProbeError) as caught:
             result.validate()
         self.assertEqual(caught.exception.category, "missing_usage")
+
+    def test_stream_rejects_unknown_finish_and_post_terminal_deltas_before_done(self):
+        finish = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+        error = {"error": {"code": "request_cancelled"}}
+        for events, category in [
+            ([{"choices": [{"delta": {}, "finish_reason": "arbitrary"}]}], "invalid_finish_reason"),
+            ([{"choices": [{"delta": {}, "finish_reason": "tool_calls"}]}], "invalid_finish_reason"),
+            ([finish, {"choices": [{"delta": {"content": "late"}}]}], "event_after_terminal"),
+            ([finish, {"choices": [{"delta": {"role": "assistant"}}]}], "event_after_terminal"),
+            ([error, {"choices": [{"delta": {"content": "late"}}]}], "event_after_terminal"),
+            ([error, {"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}], "event_after_terminal"),
+            ([finish, error], "duplicate_terminal"),
+        ]:
+            with self.subTest(category=category):
+                result = self.probe.StreamResult()
+                with self.assertRaises(self.probe.ProbeError) as caught:
+                    for number, value in enumerate(events, 1):
+                        result.consume(number, value)
+                self.assertEqual(caught.exception.category, category)
+
+    def test_usage_requires_coherent_integer_counts_after_one_finish(self):
+        for usage in [
+            {"prompt_tokens": 1, "completion_tokens": 2},
+            {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 4},
+            {"prompt_tokens": True, "completion_tokens": 2, "total_tokens": 3},
+            {"prompt_tokens": -1, "completion_tokens": 2, "total_tokens": 1},
+            {"prompt_tokens": 1, "completion_tokens": 2.0, "total_tokens": 3},
+            {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": "3"},
+        ]:
+            with self.subTest(usage=usage):
+                result = self.probe.StreamResult()
+                result.consume(1, {"choices": [{"delta": {}, "finish_reason": "length"}]})
+                with self.assertRaises(self.probe.ProbeError) as caught:
+                    result.consume(2, {"choices": [], "usage": usage})
+                self.assertEqual(caught.exception.category, "invalid_usage")
+        valid = {"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}}
+        result = self.probe.StreamResult()
+        with self.assertRaises(self.probe.ProbeError) as caught:
+            result.consume(1, valid)
+        self.assertEqual(caught.exception.category, "invalid_usage_order")
+        result = self.probe.StreamResult()
+        result.consume(1, {"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        result.consume(2, valid)
+        with self.assertRaises(self.probe.ProbeError) as caught:
+            result.consume(3, valid)
+        self.assertEqual(caught.exception.category, "duplicate_usage")
+
+    def test_fail_takes_precedence_over_blocked_when_aggregating_scenarios(self):
+        with Fixture() as f:
+            f.completion_wins = True
+            result = self.probe.Probe(self.client(f), checkpoint=lambda _: f.key).run(["cancel", "rotation"])
+            self.assertEqual(result["scenarios"][0]["status"], "BLOCKED")
+            self.assertEqual(result["status"], "FAIL")
+            self.assertEqual(self.probe.exit_code(result), 1)
 
     def test_total_deadline_interrupts_trickling_response_headers(self):
         listener = socket.socket()
