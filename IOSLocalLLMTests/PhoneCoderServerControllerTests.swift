@@ -2,10 +2,34 @@ import Combine
 import CryptoKit
 import SwiftUI
 import XCTest
+import UIKit
 @testable import PhoneCoder
 
 @MainActor
 final class PhoneCoderServerControllerTests: XCTestCase {
+    func testServingKeepAwakeSurvivesOtherOwnerReleaseAndEndsOnStopAndBackground() async {
+        let monitor = DeviceSafetyMonitor.shared
+        defer {
+            monitor.setKeepAwake(false, reason: "image-gen")
+            monitor.setKeepAwake(false, reason: "phone-coder-server")
+        }
+        let controller = PhoneCoderServerController(listener: ControlledServerListener(),
+            inference: ControlledInferenceLifecycle(), intent: MemoryServingIntent(), clock: ControlledServerClock())
+        await controller.handle(scenePhase: .active).value
+        await controller.startServing().value
+        XCTAssertTrue(UIApplication.shared.isIdleTimerDisabled)
+        monitor.setKeepAwake(true, reason: "image-gen")
+        monitor.setKeepAwake(false, reason: "image-gen")
+        XCTAssertTrue(UIApplication.shared.isIdleTimerDisabled, "Releasing images must preserve serving")
+        await controller.stopServing().value
+        XCTAssertFalse(UIApplication.shared.isIdleTimerDisabled)
+        await controller.startServing().value
+        monitor.setKeepAwake(true, reason: "image-gen")
+        await controller.handle(scenePhase: .background).value
+        monitor.setKeepAwake(false, reason: "image-gen")
+        XCTAssertFalse(UIApplication.shared.isIdleTimerDisabled, "Background must release server ownership")
+    }
+
     func testNewForegroundSessionInvalidatesOlderResumeWithoutCancellingModelLoad() async throws {
         let runtime = LifecycleTextRuntime()
         let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })

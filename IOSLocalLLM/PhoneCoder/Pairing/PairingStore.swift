@@ -71,7 +71,7 @@ actor PhoneCoderPairingStore {
     }
     static func normalizedName(_ name: String) throws -> String {
         let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
-        guard !normalized.isEmpty, normalized.count <= 80,
+        guard !normalized.isEmpty, normalized.count <= 80, normalized.utf8.count <= 512,
               normalized.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
             throw PhoneCoderPairingError.invalidName
         }

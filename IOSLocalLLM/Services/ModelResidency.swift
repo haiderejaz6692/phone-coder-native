@@ -33,14 +33,53 @@ final class ModelResidency: ObservableObject {
 
     static let shared = ModelResidency()
 
-    private init() {}
+    init() {}
 
-    /// Live cross-service residency view for text-only clients. Diffusion owns
-    /// a single-use container only while loading/generating; `.ready` there
-    /// means installed on disk. Vision backends may retain weights when ready.
+    private var imageOperationID: UUID?
+    private var imageOperationTask: Task<Void, Never>?
+    var imageOperationReserved: Bool { imageOperationID != nil }
+
+    /// Reserve synchronously, before any preparation can suspend. Cancellation
+    /// only signals the task: admission stays closed until native work returns.
+    /// The operation must await all its native work, including cancellation tails.
+    @discardableResult
+    func startImageOperation(_ operation: @escaping @MainActor (UUID) async -> Void) -> Task<Void, Never>? {
+        guard imageOperationID == nil else { return nil }
+        let id = UUID()
+        imageOperationID = id
+        let task = Task { @MainActor in
+            await operation(id)
+            guard self.imageOperationID == id else { return }
+            self.imageOperationTask = nil
+            self.imageOperationID = nil
+        }
+        imageOperationTask = task
+        return task
+    }
+
+    func cancelImageOperation() { imageOperationTask?.cancel() }
+
+    func ownsImageOperation(_ id: UUID) -> Bool { imageOperationID == id }
+
+    /// Recheck the actual owners after preparation and again at the allocation
+    /// boundary. This reservation does not make stale native weights disappear.
+    func imageAllocationAvailable(for id: UUID) -> Bool {
+        guard ownsImageOperation(id), !CodingAssistantService.shared.hasResidentRuntime else { return false }
+        switch CodingAssistantService.shared.state {
+        case .loading, .generating: return false
+        default: break
+        }
+        return Self.textRuntimeAvailable(image: .idle, lens: LensInferenceLoop.shared.state,
+            llama: LlamaCppVLMService.shared.state, fast: FastVLMService.shared.componentStatus,
+            fastGenerating: FastVLMService.shared.isGenerating)
+    }
+
+    /// Live cross-service residency view for text-only clients. Image work
+    /// reserves preparation through native retirement; `.ready` there means
+    /// installed on disk. Vision backends may retain weights when ready.
     /// No model loader or independently cached "healthy" flag lives here.
     var textRuntimeAvailable: Bool {
-        Self.textRuntimeAvailable(image: ImageGenerationService.shared.state,
+        !imageOperationReserved && Self.textRuntimeAvailable(image: ImageGenerationService.shared.state,
             lens: LensInferenceLoop.shared.state, llama: LlamaCppVLMService.shared.state,
             fast: FastVLMService.shared.componentStatus, fastGenerating: FastVLMService.shared.isGenerating)
     }
@@ -50,7 +89,7 @@ final class ModelResidency: ObservableObject {
                                      llama: LlamaCppVLMService.State, fast: FastVLMComponentStatus,
                                      fastGenerating: Bool) -> Bool {
         switch image {
-        case .loading, .generating: return false
+        case .downloading, .loading, .generating: return false
         default: break
         }
         switch lens {

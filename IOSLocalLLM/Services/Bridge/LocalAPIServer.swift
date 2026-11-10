@@ -2176,8 +2176,7 @@ enum LocalAPIToolCalling {
                 }
             }
             if schema["additionalProperties"] as? Bool == false,
-               let properties = schema["properties"] as? [String: Any],
-               object.keys.contains(where: { properties[$0] == nil }) {
+               object.keys.contains(where: { (schema["properties"] as? [String: Any] ?? [:])[$0] == nil }) {
                 return false
             }
         }
@@ -2195,7 +2194,9 @@ enum LocalAPIToolCalling {
         case "object": return value is [String: Any]
         case "array": return value is [Any]
         case "string": return value is String
-        case "boolean": return value is Bool
+        case "boolean":
+            guard let number = value as? NSNumber else { return false }
+            return CFGetTypeID(number) == CFBooleanGetTypeID()
         case "number":
             guard let number = value as? NSNumber else { return false }
             return CFGetTypeID(number) != CFBooleanGetTypeID()

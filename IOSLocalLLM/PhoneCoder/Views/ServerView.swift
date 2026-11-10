@@ -17,9 +17,13 @@ final class PhoneCoderServerModel: ObservableObject {
         addresses = PhoneCoderNetworkExposure.addresses().map {
             "http://\($0.contains(":") ? "[\($0)]" : $0):\(services.listener.port)"
         }
+        await refreshStoredData(pairings: services.pairings, activity: services.activity)
+    }
+    func refreshStoredData(pairings: PhoneCoderPairingStore, activity store: PhoneCoderServerActivityStore) async {
         do {
-            clients = try await services.pairings.clients()
-            activity = Array(try await services.activity.entries().reversed().prefix(50))
+            clients = try await pairings.clients()
+            activity = Array(try await store.entries().reversed().prefix(50))
+            error = nil
         } catch { clients = []; self.error = phoneCoderError(error) }
     }
     func perform(_ action: PhoneCoderServerAction, openModels: () -> Void) {

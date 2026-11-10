@@ -35,6 +35,23 @@ private final class ApprovalGate {
 private final class TestClock { var date = Date(timeIntervalSince1970: 0) }
 
 final class PhoneCoderPairingTests: XCTestCase {
+    func testDirectStoreRejectsNamesOver512UTF8BytesWithoutWriting() async throws {
+        let storage = MemoryPairingStorage()
+        let store = PhoneCoderPairingStore(storage: storage)
+        let boundary = String(repeating: "👨‍👩‍👧‍👦", count: 20) + String(repeating: "a", count: 12)
+        XCTAssertEqual(boundary.utf8.count, 512)
+        let accepted = try await store.create(name: boundary)
+        XCTAssertEqual(accepted.name, boundary)
+        let saved = storage.value
+        do {
+            _ = try await store.create(name: boundary + "a")
+            XCTFail("A short grapheme count must not bypass the UTF-8 byte limit")
+        } catch PhoneCoderPairingError.invalidName {
+            // Expected: rejection occurs before persistence or entropy use.
+        } catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertEqual(storage.value, saved)
+    }
+
     func testCredentialsPersistRotateAndRevoke() async throws {
         let storage = MemoryPairingStorage()
         let store = PhoneCoderPairingStore(storage: storage)

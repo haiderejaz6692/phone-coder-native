@@ -155,6 +155,34 @@ final class PhoneCoderAPIServerTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
+    func testStrictResponsesRejectUndeclaredRootAndNestedArgumentsAndNumericBooleans() async throws {
+        let cases: [(String, String, Bool)] = [
+            (#"{"type":"object","additionalProperties":false}"#, #"{"extra":1}"#, false),
+            (#"{"type":"object","additionalProperties":false}"#, #"{}"#, true),
+            (#"{"type":"object","properties":{"nested":{"type":"object","additionalProperties":false}},"required":["nested"],"additionalProperties":false}"#, #"{"nested":{"extra":1}}"#, false),
+            (#"{"type":"object","properties":{"nested":{"type":"object","additionalProperties":false}},"required":["nested"],"additionalProperties":false}"#, #"{"nested":{}}"#, true),
+            (#"{"type":"object","properties":{"flag":{"type":"boolean"}},"required":["flag"]}"#, #"{"flag":0}"#, false),
+            (#"{"type":"object","properties":{"flag":{"type":"boolean"}},"required":["flag"]}"#, #"{"flag":1}"#, false),
+            (#"{"type":"object","properties":{"flag":{"type":"boolean"}},"required":["flag"]}"#, #"{"flag":false}"#, true),
+            (#"{"type":"object","properties":{"flag":{"type":"boolean"}},"required":["flag"]}"#, #"{"flag":true}"#, true)
+        ]
+        for stream in [false, true] {
+            for (schema, arguments, valid) in cases {
+                let fixture = try await APIServerFixture.make(output: ["<tool_call>{\"name\":\"lookup\",\"arguments\":\(arguments)}</tool_call>"])
+                defer { fixture.close() }
+                let body = Data("{\"model\":\"test-model\",\"input\":\"lookup\",\"stream\":\(stream),\"tools\":[{\"type\":\"function\",\"name\":\"lookup\",\"parameters\":\(schema)}],\"tool_choice\":\"required\"}".utf8)
+                let response = try await fixture.exchange(method: "POST", path: "/v1/responses", id: UUID().uuidString, body: body)
+                XCTAssertEqual(response.contains("invalid_tool_output"), !valid, arguments)
+                if valid {
+                    XCTAssertTrue(response.contains("function_call"), arguments)
+                } else {
+                    XCTAssertFalse(response.contains("\"arguments\""), arguments)
+                    XCTAssertFalse(response.contains("event: response.completed"), arguments)
+                }
+            }
+        }
+    }
+
     func testResponsesToolEventsAreEncodedButNeverExecuted() async throws {
         let fixture = try await APIServerFixture.make(output: [#"<tool_call>{"name":"lookup","arguments":{"key":"x"}}</tool_call>"#])
         defer { fixture.close() }

@@ -319,7 +319,7 @@ final class CodingAssistantService: ObservableObject {
 
     /// Typed admission outcome for non-UI runtime adapters. Never classify a
     /// refusal by parsing its user-facing/localized message.
-    enum AdmissionRefusal: Equatable, Sendable { case memory, thermal }
+    enum AdmissionRefusal: Equatable, Sendable { case memory, thermal, residency }
     private(set) var admissionRefusal: AdmissionRefusal?
     /// Changes synchronously when teardown starts, even if native cleanup is
     /// still draining. Adapters can reject callbacks from a reclaimed runtime.
@@ -527,7 +527,9 @@ final class CodingAssistantService: ObservableObject {
         container ?? LensInferenceLoop.shared.sharedContainer(for: activeModel.repoID)
     }
 
-    private var hasResidentRuntime: Bool {
+    /// Physical ownership, independent of UI readiness or execution location.
+    /// The shared residency authority uses this before allocating another runtime.
+    var hasResidentRuntime: Bool {
 #if CORE_AI_SERVER_APP
         return CoreAIInferenceService.shared.isReady
 #else
@@ -1428,6 +1430,16 @@ final class CodingAssistantService: ObservableObject {
     a heading, label, sentence, or list item directly into the next one.
     """
 
+    /// Direct service callers share the same image reservation as the API
+    /// adapter. Recheck after preparation awaits before native allocation.
+    private func admitTextDuringImageOperation() -> Bool {
+        guard !ModelResidency.shared.imageOperationReserved else {
+            admissionRefusal = .residency
+            return false
+        }
+        return true
+    }
+
     // MARK: - Load
 
     func load(
@@ -1437,6 +1449,7 @@ final class CodingAssistantService: ObservableObject {
         requireLocalFiles: Bool = false
     ) async {
         admissionRefusal = nil
+        guard admitTextDuringImageOperation() else { return }
         if let unloadTask {
             Diagnostics.shared.breadcrumb(
                 "assistant load waiting for pending unload",
@@ -1453,6 +1466,7 @@ final class CodingAssistantService: ObservableObject {
         // Resolve `model_type: nanbeige` before MLX reads config.json.
         // Registration is actor-isolated and idempotent.
         await NanbeigeMLXRegistration.register()
+        guard admitTextDuringImageOperation() else { return }
 
         // Loading/generation cannot be re-entered. A `.ready` state is only a
         // no-op when its actual runtime still exists; a shared Lens container
@@ -1509,6 +1523,8 @@ final class CodingAssistantService: ObservableObject {
             guard !Task.isCancelled else { return }
         }
 
+        guard admitTextDuringImageOperation() else { return }
+
         // The Lens runtime is the neutral owner for unified text+vision
         // packages. If it already has this model, attach instantly instead of
         // unloading it and loading identical weights through MLXLLM.
@@ -1532,6 +1548,8 @@ final class CodingAssistantService: ObservableObject {
         FastVLMService.shared.unload()
         await LlamaCppVLMService.shared.unloadAndWaitForCleanup()
         await MLXGenerationGate.shared.clearCacheWhenIdle()
+
+        guard !Task.isCancelled, admitTextDuringImageOperation() else { return }
 
         // Resolve and measure the exact directory the native loader will use
         // before admission. Imported models live under a synthetic
@@ -1894,6 +1912,9 @@ final class CodingAssistantService: ObservableObject {
             // Gated so weight uploads can't race a concurrent MLXVision /
             // FastVLM load or another service's in-flight generate.
             let loadedContainer = try await MLXGenerationGate.shared.run { [weak self, latch, loadID] in
+                guard await MainActor.run(body: { !ModelResidency.shared.imageOperationReserved }) else {
+                    throw MLXGenerationGate.Cancelled()
+                }
                 let previousMemoryLimit = MLX.Memory.memoryLimit
                 let previousCacheLimit = MLX.Memory.cacheLimit
                 if let limit = lowMemoryPolicy.memoryLimitBytes {
@@ -2543,7 +2564,7 @@ final class CodingAssistantService: ObservableObject {
                     let outcome: AssistantGenerationOutcome = switch self.admissionRefusal {
                     case .memory: .memoryPressure
                     case .thermal: .thermal
-                    case nil: .unavailable
+                    case .residency, nil: .unavailable
                     }
                     completion.finish(outcome, rate: 0)
                 }

@@ -4,6 +4,21 @@ import Combine
 
 @MainActor
 final class PhoneCoderViewModelTests: XCTestCase {
+    func testSuccessfulStoredDataRefreshClearsPriorReadError() async throws {
+        let storage = ViewModelPairingStorage()
+        let pairings = PhoneCoderPairingStore(storage: storage)
+        let activity = PhoneCoderServerActivityStore(url: nil)
+        let model = PhoneCoderServerModel(services: .shared)
+        storage.failRead = true
+        await model.refreshStoredData(pairings: pairings, activity: activity)
+        XCTAssertNotNil(model.error)
+        storage.failRead = false
+        let client = try await pairings.create(name: "Laptop")
+        await model.refreshStoredData(pairings: pairings, activity: activity)
+        XCTAssertNil(model.error)
+        XCTAssertEqual(model.clients, [.init(id: client.id, name: "Laptop")])
+    }
+
     func testEveryServerStateHasAccessibleStatusAndRecovery() {
         let states: [PhoneCoderServerState] = [.stopped, .starting, .ready, .serving, .generating,
             .recovering(attempt: 2, retryAt: .now), .pausedBackground, .coolingDown, .lowMemory,

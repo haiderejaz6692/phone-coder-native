@@ -6,6 +6,9 @@ import Foundation
 @MainActor
 final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
     private let service = CodingAssistantService.shared
+    private let residency: ModelResidency
+
+    init(residency: ModelResidency = .shared) { self.residency = residency }
     private var session: PhoneCoderModelSession?
     private var upstreamSessionID: UUID?
     private var activeRequestID: PhoneCoderRequestID?
@@ -28,13 +31,13 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         } ?? true
         return PhoneCoderRuntimeMapping.availability(thermal: DeviceSafetyMonitor.shared.thermalState,
             stopReason: DeviceSafetyMonitor.shared.stopReason,
-            textResidencyAvailable: ModelResidency.shared.textRuntimeAvailable,
+            textResidencyAvailable: residency.textRuntimeAvailable,
             foregrounded: foregrounded, sessionIsUsable: usable)
     }
 
     func load(modelID: String) async throws -> PhoneCoderModelSession {
         if let refusal = safetyRefusal { throw refusal }
-        guard ModelResidency.shared.textRuntimeAvailable else { throw PhoneCoderRuntimeError.residencyUnavailable }
+        guard residency.textRuntimeAvailable else { throw PhoneCoderRuntimeError.residencyUnavailable }
         guard let model = installedTextModel(modelID) else { throw PhoneCoderRuntimeError.modelUnavailable }
         switch service.state {
         case .loading, .generating: throw PhoneCoderRuntimeError.residencyUnavailable
@@ -44,9 +47,14 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
         // remote execution, or implicit model download.
         await service.switchTo(model, persistAsDefault: false, requireLocalFiles: true)
         if let refusal = service.admissionRefusal {
-            throw refusal == .thermal ? PhoneCoderRuntimeError.thermal : .memoryPressure
+            switch refusal {
+            case .thermal: throw PhoneCoderRuntimeError.thermal
+            case .memory: throw PhoneCoderRuntimeError.memoryPressure
+            case .residency: throw PhoneCoderRuntimeError.residencyUnavailable
+            }
         }
         if let refusal = safetyRefusal { throw refusal }
+        guard residency.textRuntimeAvailable else { throw PhoneCoderRuntimeError.residencyUnavailable }
         guard service.activeExecutionLocation == .localDownloaded,
               service.activeModel.id == modelID, service.state == .ready, service.hasUsableLocalRuntime else {
             throw PhoneCoderRuntimeError.runtimeFailure
@@ -102,7 +110,7 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
                 // adapter. Its synchronous epoch invalidation precedes cleanup.
                 guard upstreamSessionID == service.runtimeSessionID,
                       service.hasUsableLocalRuntime,
-                      ModelResidency.shared.textRuntimeAvailable else {
+                      residency.textRuntimeAvailable else {
                     throw PhoneCoderRuntimeError.staleSession
                 }
                 switch event {

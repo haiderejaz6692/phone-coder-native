@@ -178,7 +178,6 @@ final class ImageGenerationService: ObservableObject {
     private var hub: HubApi {
         HubApi(hfToken: HFTokenStore.shared.isActive ? HFTokenStore.shared.currentToken() : nil)
     }
-    private var genTask: Task<Void, Never>?
     private var directDownloadTasks: [String: Task<Void, Never>] = [:]
 
     private init() {}
@@ -232,7 +231,7 @@ final class ImageGenerationService: ObservableObject {
     // MARK: - Selection
 
     func select(_ id: String) {
-        guard id != selectedModelID else { return }
+        guard !ModelResidency.shared.imageOperationReserved, id != selectedModelID else { return }
         selectedModelID = id
         if case .generating = state { } else {
             state = isInstalled(selectedModel) ? .ready : .idle
@@ -284,6 +283,7 @@ final class ImageGenerationService: ObservableObject {
     }
 
     func deleteModel(_ model: Model) {
+        guard !ModelResidency.shared.imageOperationReserved else { return }
         let dir = repoDirectory(model.id)
         try? FileManager.default.removeItem(at: dir)
         if model.id == selectedModelID { state = .idle }
@@ -293,12 +293,9 @@ final class ImageGenerationService: ObservableObject {
     // MARK: - Generation
 
     func cancel() {
-        genTask?.cancel()
-        genTask = nil
-        Task { await MLXGenerationGate.shared.cancelAll() }
-        if case .generating = state { state = isInstalled(selectedModel) ? .ready : .idle }
-        if case .loading = state { state = isInstalled(selectedModel) ? .ready : .idle }
-        if case .downloading = state { state = .idle }
+        // MLXGenerationGate.run propagates cancellation and awaits its native
+        // task. Keep both the reservation and busy state until that task drains.
+        ModelResidency.shared.cancelImageOperation()
     }
 
     /// Download (if needed), load, and generate an image for `prompt`.
@@ -311,23 +308,32 @@ final class ImageGenerationService: ObservableObject {
             ToastCenter.shared.info("Enter a prompt first")
             return
         }
-        guard genTask == nil else { return }
         let model = selectedModel
-        genTask = Task { [weak self] in
+        guard ModelResidency.shared.startImageOperation({ [weak self] operationID in
             await self?.runGeneration(model: model,
-                                       prompt: trimmed,
-                                       negativePrompt: negativePrompt,
-                                       steps: steps ?? model.defaultSteps,
-                                       seed: seed)
-            await MainActor.run { self?.genTask = nil }
-        }
+                                      prompt: trimmed,
+                                      negativePrompt: negativePrompt,
+                                      steps: steps ?? model.defaultSteps,
+                                      seed: seed,
+                                      operationID: operationID)
+        }) != nil else { return }
+        state = .loading
+        statusMessage = "Preparing \(model.displayName)…"
     }
 
     private func runGeneration(model: Model,
                                prompt: String,
                                negativePrompt: String,
                                steps: Int,
-                               seed: UInt64?) async {
+                               seed: UInt64?,
+                               operationID: UUID) async {
+        defer {
+            if Task.isCancelled {
+                state = isInstalled(model) ? .ready : .idle
+                statusMessage = ""
+            }
+        }
+        guard !Task.isCancelled else { return }
         Diagnostics.shared.breadcrumb(
             "imagegen start · \(model.id) · steps=\(steps) · avail=\(MemoryAdvisor.availableMemoryForModel.formattedBytes)",
             category: "imagegen")
@@ -366,42 +372,11 @@ final class ImageGenerationService: ObservableObject {
         await CodingAssistantService.shared.unloadAndWaitForCleanup()
         MLXVisionService.shared.unload()
         FastVLMService.shared.unload()
+        await LlamaCppVLMService.shared.unloadAndWaitForCleanup()
         // Flush MLX's idle buffer pool now. The clear shares the global gate,
         // so cancelled VLM Metal work must drain before reclamation and before
         // the memory measurement below.
         await MLXGenerationGate.shared.clearCacheWhenIdle()
-
-        // 2. Memory gate — the real per-process ceiling on iOS. Diffusion's
-        //    transient load peak is high; refuse rather than SIGKILL.
-        //
-        // The needed figure is the model's curated peak resident working set.
-        // Do NOT use the installed directory size here: Hugging Face repos can
-        // contain multiple large components / stale downloaded files, and that
-        // disk footprint is not the live RAM peak. Using it here inflated SDXL
-        // Turbo to ~14 GB needed on devices where the measured working set fits.
-        let avail = MemoryAdvisor.availableMemoryForModel
-        let needed = model.approxRAMBytes + MemoryAdvisor.loadHeadroomReserve
-        guard avail <= 0 || avail >= needed else {
-            let needGB = Double(needed) / 1_000_000_000
-            let haveGB = Double(avail) / 1_000_000_000
-            Diagnostics.shared.warning(
-                "imagegen refused — low memory (need ~\(String(format: "%.1f", needGB))GB, have ~\(String(format: "%.1f", haveGB))GB)",
-                category: "imagegen")
-            state = .failed(String(
-                format: "Not enough memory for %@ (~%.1f GB needed, ~%.1f GB free). Close other apps and retry.",
-                model.displayName, needGB, haveGB))
-            return
-        }
-        // When memory measurement is unavailable (avail == 0, uncommon on
-        // device), refuse anyway with a conservative floor — an unsized
-        // model is safer to block than to let through into a likely OOM.
-        if avail <= 0 {
-            Diagnostics.shared.warning(
-                "imagegen refused — memory measurement unavailable, blocking conservatively",
-                category: "imagegen")
-            state = .failed("Could not measure available memory. Close other apps, restart, and retry.")
-            return
-        }
 
         // 3. Download any missing preset files (weights, configs, tokenizers).
         if !isInstalled(model) {
@@ -432,6 +407,7 @@ final class ImageGenerationService: ObservableObject {
                 }
             }
         }
+        guard !Task.isCancelled else { state = isInstalled(model) ? .ready : .idle; return }
         let missingAfterDownload = missingRequiredFiles(for: model)
         guard missingAfterDownload.isEmpty else {
             Diagnostics.shared.error(
@@ -466,6 +442,15 @@ final class ImageGenerationService: ObservableObject {
             return
         }
 
+        // Downloads can outlive the initial teardown and memory snapshot.
+        // Reclaim again while the reservation still excludes new text loads.
+        await CodingAssistantService.shared.unloadAndWaitForCleanup()
+        MLXVisionService.shared.unload()
+        FastVLMService.shared.unload()
+        await LlamaCppVLMService.shared.unloadAndWaitForCleanup()
+        await MLXGenerationGate.shared.clearCacheWhenIdle()
+        guard !Task.isCancelled else { state = isInstalled(model) ? .ready : .idle; return }
+
         // Keep the screen awake for the load + denoise so auto-lock can't
         // background the app mid-generation and trip the same Metal abort.
         // Generation is seconds (not the multi-minute download, which we
@@ -494,8 +479,31 @@ final class ImageGenerationService: ObservableObject {
         do {
             // Return PNG Data (Sendable) from the gate — CGImage / UIImage are
             // not reliably Sendable across the actor boundary.
-            let availForCap = avail
             let pngData = try await MLXGenerationGate.shared.run { () -> Data in
+                // Measure after the gate wait, immediately before diffusion
+                // allocates. No pre-download headroom is reused here.
+                let availForCap = try await MainActor.run {
+                    try Task.checkCancellation()
+                    guard UIApplication.shared.applicationState == .active,
+                          !DeviceSafetyMonitor.shared.shouldStopHeavyWork else {
+                        throw MLXGenerationGate.Cancelled()
+                    }
+                    guard ModelResidency.shared.imageAllocationAvailable(for: operationID) else {
+                        throw NSError(domain: "ImageGen", code: -2, userInfo: [
+                            NSLocalizedDescriptionKey: "Another model is still retiring. Retry image generation."])
+                    }
+                    let available = MemoryAdvisor.availableMemoryForModel
+                    let needed = model.approxRAMBytes + MemoryAdvisor.loadHeadroomReserve
+                    guard available > 0, available >= needed else {
+                        throw NSError(domain: "ImageGen", code: -3, userInfo: [
+                            NSLocalizedDescriptionKey: available <= 0
+                                ? "Could not measure available memory. Close other apps, restart, and retry."
+                                : String(format: "Not enough memory for %@ (~%.1f GB needed, ~%.1f GB free). Close other apps and retry.",
+                                    model.displayName, Double(needed) / 1_000_000_000, Double(available) / 1_000_000_000)])
+                    }
+                    return available
+                }
+                try Task.checkCancellation()
                 // Bound MLX's allocator for the duration of THIS generation only.
                 // IOSLocalLLMApp deliberately leaves the cache unbounded globally —
                 // a low global cap starves the resident LLM and triggers Metal
@@ -593,14 +601,20 @@ final class ImageGenerationService: ObservableObject {
                             i += 1
                             let frac = Double(i) / Double(max(totalSteps, 1))
                             Task { @MainActor [weak self] in
-                                self?.state = .generating(frac)
+                                guard let self, ModelResidency.shared.ownsImageOperation(operationID) else { return }
+                                switch self.state {
+                                case .loading, .generating: self.state = .generating(frac)
+                                default: break // A queued progress callback cannot undo a terminal state.
+                                }
                             }
                         }
+                        try Task.checkCancellation()
                         guard let lastXt else { throw MLXGenerationGate.Cancelled() }
                         eval(lastXt)
                         return (decoder, lastXt)
                     },
                     second: { pair -> MLXArray in
+                        try Task.checkCancellation()
                         let (decoder, latent) = pair
                         let decoded = decoder(latent)
                         let r = (decoded * 255).asType(.uint8).squeezed()
@@ -619,6 +633,7 @@ final class ImageGenerationService: ObservableObject {
                 return data
             }
 
+            try Task.checkCancellation()
             image = UIImage(data: pngData)
             state = .ready
             statusMessage = ""
@@ -815,13 +830,11 @@ final class ImageGenerationService: ObservableObject {
         return [401, 403, 404].contains(ns.code)
     }
 
-    /// Drop any queued GPU work (keeps weights on disk). Called when the app
-    /// needs the RAM back for the LLM / VLM. The diffusion container is
-    /// single-use and never held past a generation, so there's nothing to
-    /// release here beyond draining the gate.
+    /// Cancel this image operation (keeps weights on disk). The single-use
+    /// diffusion container and reservation remain owned until native work
+    /// drains; readiness cannot be published by the unload caller.
     func unload() {
-        Task { await MLXGenerationGate.shared.cancelAll() }
-        if case .generating = state { state = isInstalled(selectedModel) ? .ready : .idle }
+        cancel()
     }
 
     // MARK: - Crash-aware adaptive sizing

@@ -159,7 +159,9 @@ final class PhoneCoderServerController: ObservableObject {
          inference: any PhoneCoderInferenceLifecycleControlling,
          intent: any PhoneCoderServingIntentStore,
          clock: any PhoneCoderServerClock,
-         setIdleTimerDisabled: @escaping @MainActor (Bool) -> Void) {
+         setIdleTimerDisabled: @escaping @MainActor (Bool) -> Void = {
+             DeviceSafetyMonitor.shared.setKeepAwake($0, reason: "phone-coder-server")
+         }) {
         self.listener = listener
         self.inference = inference
         self.intent = intent

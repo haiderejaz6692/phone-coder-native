@@ -67,6 +67,9 @@ actor PhoneCoderInferenceCoordinator {
 
     /// Admission is synchronous on this actor, so FIFO does not depend on
     /// scheduling Tasks created by callers. Cancellation uses both identities.
+    /// `onEvent` is awaited by the generation worker for ordered backpressure.
+    /// It must not await cancel/unload/switch/lifecycle work that drains this
+    /// same worker; signal such work from a separate task and return instead.
     func enqueue(_ request: PhoneCoderGenerationRequest,
                  onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) throws -> Task<PhoneCoderGenerationResult, Error> {
         try request.cancellationSignal?.check()

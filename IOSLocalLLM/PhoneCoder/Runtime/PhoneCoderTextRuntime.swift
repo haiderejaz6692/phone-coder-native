@@ -90,6 +90,8 @@ protocol PhoneCoderTextRuntime: Sendable {
     func installedModels() async -> [PhoneCoderModelDescriptor]
     func liveAvailability() async -> PhoneCoderRuntimeAvailability
     func load(modelID: String) async throws -> PhoneCoderModelSession
+    /// The worker awaits `onEvent`. The callback must return without awaiting
+    /// cancellation, unload, or another operation that drains its own worker.
     func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession,
                   onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult
     func cancel(requestID: PhoneCoderRequestID) async

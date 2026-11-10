@@ -124,8 +124,7 @@ final class PhoneCoderServerServices {
         self.apiServer = server; self.listener = listener
         controller = PhoneCoderServerController(listener: listener,
             inference: lifecycle, intent: PhoneCoderDefaultsServingIntent(defaults: .standard),
-            clock: PhoneCoderContinuousServerClock(),
-            setIdleTimerDisabled: { UIApplication.shared.isIdleTimerDisabled = $0 })
+            clock: PhoneCoderContinuousServerClock())
         listener.controller = controller
         _ = lifecycle.suspend()
     }

@@ -4,6 +4,65 @@ import os
 @testable import PhoneCoder
 
 final class PhoneCoderInferenceCoordinatorTests: XCTestCase {
+    @MainActor
+    func testImageDownloadReservationRejectsTextLoadUntilOperationRetires() async throws {
+        let residency = ModelResidency()
+        let download = ImageOperationBarrier()
+        let operation = try XCTUnwrap(residency.startImageOperation { _ in await download.wait() })
+        await download.waitForEntry()
+        let adapter = OnDeviceTextRuntimeAdapter(residency: residency)
+        do {
+            _ = try await adapter.load(modelID: "text-during-image-download")
+            XCTFail("Text load must refuse before looking up or allocating a model")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .residencyUnavailable) }
+        XCTAssertTrue(residency.imageOperationReserved)
+        download.release()
+        await operation.value
+        XCTAssertFalse(residency.imageOperationReserved)
+    }
+
+    @MainActor
+    func testDirectTextLoadHonorsTheSharedImageReservation() async throws {
+        let residency = ModelResidency.shared
+        let native = ImageOperationBarrier()
+        let operation = try XCTUnwrap(residency.startImageOperation { _ in await native.wait() })
+        await native.waitForEntry()
+        await CodingAssistantService.shared.load(requireLocalFiles: true)
+        XCTAssertEqual(CodingAssistantService.shared.admissionRefusal, .residency)
+        native.release()
+        await operation.value
+    }
+
+    @MainActor
+    func testCancelledImageRetainsReservationUntilNativeDrainBeforeReplacement() async throws {
+        let residency = ModelResidency()
+        let native = ImageOperationBarrier()
+        var firstCancelled = false
+        let first = try XCTUnwrap(residency.startImageOperation { _ in
+            await native.wait()
+            firstCancelled = Task.isCancelled
+        })
+        await native.waitForEntry()
+        residency.cancelImageOperation()
+        XCTAssertTrue(residency.imageOperationReserved)
+        XCTAssertNil(residency.startImageOperation { _ in XCTFail("Replacement overlapped native work") })
+        XCTAssertFalse(residency.textRuntimeAvailable)
+        native.release()
+        await first.value
+        XCTAssertTrue(firstCancelled)
+        XCTAssertFalse(residency.imageOperationReserved)
+        let replacement = ImageOperationBarrier()
+        let second = try XCTUnwrap(residency.startImageOperation { _ in await replacement.wait() })
+        await replacement.waitForEntry()
+        await first.value
+        XCTAssertTrue(residency.imageOperationReserved, "Old completion cannot clear replacement")
+        residency.cancelImageOperation()
+        XCTAssertTrue(residency.imageOperationReserved)
+        replacement.release()
+        await second.value
+        XCTAssertFalse(residency.imageOperationReserved)
+    }
+
     func testCancellationSignalClosesTheCrossActorAdmissionWindow() async throws {
         let runtime = ControlledTextRuntime()
         let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
@@ -246,6 +305,7 @@ final class PhoneCoderInferenceCoordinatorTests: XCTestCase {
                                                 fast: fast, fastGenerating: false)
         }
         XCTAssertTrue(residency()) // diffusion ready means installed, not resident
+        XCTAssertFalse(residency(image: .downloading(0.25)))
         XCTAssertFalse(residency(image: .loading))
         XCTAssertFalse(residency(image: .generating(0.5)))
         XCTAssertFalse(residency(lens: .ready))
@@ -678,4 +738,23 @@ private actor ReconstructionGate {
         await withCheckedContinuation { entry = $0 }
     }
     func release() { resume?.resume(); resume = nil }
+}
+
+@MainActor
+private final class ImageOperationBarrier {
+    private var entered = false
+    private var entry: CheckedContinuation<Void, Never>?
+    private var drain: CheckedContinuation<Void, Never>?
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            drain = continuation
+            entered = true
+            entry?.resume(); entry = nil
+        }
+    }
+    func waitForEntry() async {
+        if entered { return }
+        await withCheckedContinuation { entry = $0 }
+    }
+    func release() { drain?.resume(); drain = nil }
 }
