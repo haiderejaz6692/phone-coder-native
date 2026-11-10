@@ -68,6 +68,23 @@ with tempfile.TemporaryDirectory() as temporary:
     baseline = validate(original)
     assert baseline.returncode == 0, baseline.stdout + baseline.stderr
     print("PASS: unchanged workflow is accepted")
+    local_gate_test = "bash scripts/tests/test_ci_local.sh"
+    repository_test_script = next(
+        step["run"] for step in original["jobs"]["phone-coder-ios"]["steps"]
+        if step["id"] == "repository-tests"
+    )
+    if repository_test_script.count(local_gate_test) != 1:
+        failures.append("missing local gate regression test")
+        print("FAIL: workflow must execute the local gate regression test exactly once")
+    else:
+        changed = copy.deepcopy(original)
+        replace_command(changed, "repository-tests", local_gate_test, f"# {local_gate_test}")
+        result = validate(changed)
+        if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+            failures.append("commented local gate regression test")
+            print("FAIL: accepted commented local gate regression test")
+        else:
+            print("PASS: rejects commented local gate regression test")
     prefixed_branch = copy.deepcopy(original)
     prefixed_branch["on"]["push"]["branches"].append("codex/**")
     result = validate(prefixed_branch)

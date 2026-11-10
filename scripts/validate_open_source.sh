@@ -173,13 +173,15 @@ if [[ -n "$retired_brand_matches" ]]; then
 fi
 
 for executable_script in \
+  .githooks/pre-push \
+  scripts/ci_local.sh \
   scripts/build_native_frameworks.sh \
   scripts/prepare_metal_toolchain_for_codeql.sh \
   scripts/prepare_unsigned_archive.sh \
   scripts/native/build_catalyst_slice.sh \
   scripts/native/build_whisper_ios.sh; do
   if [[ ! -x "$executable_script" ]]; then
-    echo "error: build script is not executable: $executable_script" >&2
+    echo "error: required script is not executable: $executable_script" >&2
     exit 1
   fi
   bash -n "$executable_script"

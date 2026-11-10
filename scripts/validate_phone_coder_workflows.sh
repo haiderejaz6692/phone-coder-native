@@ -154,6 +154,7 @@ try:
     contains_text("tools", "17A400", "PyYAML==6.0.3")
     for command in ("bash scripts/validate_open_source.sh",
              "bash scripts/validate_phone_coder_workflows.sh",
+             "bash scripts/tests/test_ci_local.sh",
              "bash scripts/tests/test_validate_phone_coder_workflows.sh",
              "bash scripts/tests/test_validate_open_source.sh",
              "bash scripts/tests/test_build_native_frameworks.sh",
