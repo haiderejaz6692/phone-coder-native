@@ -14,6 +14,11 @@ retired_brand='Local AI'' Studio'
 mkdir -p "$test_root/docs/superpowers/specs" "$test_root/docs/superpowers/plans"
 printf '%s\n' "$retired_brand" > "$test_root/docs/superpowers/specs/branding-regression.md"
 printf '%s\n' "$retired_brand" > "$test_root/docs/superpowers/plans/branding-regression.md"
+# The upstream repository already tracks `Docs/`. Case-insensitive macOS
+# filesystems therefore surface these archival paths with that casing.
+mkdir -p "$test_root/Docs/superpowers/specs" "$test_root/Docs/superpowers/plans"
+printf '%s\n' "$retired_brand" > "$test_root/Docs/superpowers/specs/branding-regression-uppercase.md"
+printf '%s\n' "$retired_brand" > "$test_root/Docs/superpowers/plans/branding-regression-uppercase.md"
 git -C "$test_root" add .
 
 run_validator() {
