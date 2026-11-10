@@ -24,7 +24,7 @@ jobs:
     timeout-minutes: 120
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
-      CODEQL_TOOLCHAINS: com.apple.dt.toolchain.Metal.32023 com.apple.dt.toolchain.XcodeDefault
+      CODEQL_TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
     permissions:
       contents: read
       security-events: write
@@ -42,8 +42,8 @@ jobs:
           test "$(xcodebuild -version)" = $'Xcode 26.0.1\nBuild version 17A400'
           xcodebuild -downloadComponent MetalToolchain
 
-      - name: Mount Metal toolchain for traced builds
-        run: bash scripts/mount_metal_toolchain.sh
+      - name: Prepare Xcode Metal toolchain for CodeQL tracing
+        run: bash scripts/prepare_metal_toolchain_for_codeql.sh
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -91,8 +91,9 @@ jobs:
         run: ./scripts/build_native_frameworks.sh --llama-only
 
       # CodeQL's macOS tracer currently hides Xcode 26's optional Metal
-      # toolchain (github/codeql-action#3978). Compile package dependencies
-      # and Metal resources first, then retain only those reviewed outputs.
+      # cryptex (github/codeql-action#3978). The preparation step grafts the
+      # signed compiler into XcodeDefault; priming also keeps analysis focused
+      # on first-party source by retaining reviewed dependency outputs.
       - name: Prime dependency and Metal build outputs before tracing
         run: |
           TOOLCHAINS="$CODEQL_TOOLCHAINS" xcodebuild \
@@ -124,7 +125,8 @@ jobs:
 
       - name: Verify Metal toolchain under CodeQL tracing
         run: |
-          xcrun metal -v
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" \
+            xcrun metal -v
           TOOLCHAINS="$CODEQL_TOOLCHAINS" \
             "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal" -v
 

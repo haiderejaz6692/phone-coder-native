@@ -157,7 +157,7 @@ try:
              "bash scripts/tests/test_validate_phone_coder_workflows.sh",
              "bash scripts/tests/test_validate_open_source.sh",
              "bash scripts/tests/test_build_native_frameworks.sh",
-             "bash scripts/tests/test_mount_metal_toolchain.sh",
+             "bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh",
              "bash scripts/tests/test_prepare_unsigned_archive.sh",
              "bash scripts/tests/test_package_unsigned_ipa.sh",
              "swift test --package-path Packages/VoiceAgentOrb"):
@@ -232,8 +232,8 @@ try:
     require(swift_job["env"]["DEVELOPER_DIR"] == "/Applications/Xcode_26.0.1.app/Contents/Developer",
             "CodeQL must select exact Xcode 26.0.1")
     require(swift_job["env"]["CODEQL_TOOLCHAINS"] ==
-            "com.apple.dt.toolchain.Metal.32023 com.apple.dt.toolchain.XcodeDefault",
-            "CodeQL must pin the mounted Metal and default Xcode toolchain order")
+            "com.apple.dt.toolchain.XcodeDefault",
+            "CodeQL must use the prepared default Xcode toolchain")
     codeql_commands = [
         words
         for step in swift_job["steps"]
@@ -242,33 +242,38 @@ try:
     ]
     codeql_steps = swift_job["steps"]
     codeql_by_name = {step.get("name"): step for step in codeql_steps}
-    mount_name = "Mount Metal toolchain for traced builds"
+    prepare_metal_name = "Prepare Xcode Metal toolchain for CodeQL tracing"
     prime_name = "Prime dependency and Metal build outputs before tracing"
     reset_name = "Reset only first-party build outputs for analysis"
     init_name = "Initialize CodeQL"
     verify_metal_name = "Verify Metal toolchain under CodeQL tracing"
     analysis_name = "Build the iOS app for analysis"
     require(all(name in codeql_by_name for name in
-                (mount_name, prime_name, reset_name, init_name, verify_metal_name, analysis_name)),
-            "CodeQL must mount Metal, prime dependencies, and verify Metal under tracing")
+                (prepare_metal_name, prime_name, reset_name, init_name,
+                 verify_metal_name, analysis_name)),
+            "CodeQL must prepare Metal, prime dependencies, and verify Metal under tracing")
     positions = {name: next(index for index, step in enumerate(codeql_steps)
                             if step.get("name") == name)
                  for name in
-                 (mount_name, prime_name, reset_name, init_name, verify_metal_name, analysis_name)}
-    require(positions[mount_name] < positions[prime_name] < positions[reset_name]
+                 (prepare_metal_name, prime_name, reset_name, init_name,
+                  verify_metal_name, analysis_name)}
+    require(positions[prepare_metal_name] < positions[prime_name] < positions[reset_name]
             < positions[init_name] < positions[verify_metal_name] < positions[analysis_name],
-            "CodeQL Metal mount/priming must precede initialization and traced verification")
-    mount_commands = command_lines("CodeQL Metal mount", codeql_by_name[mount_name]["run"])
-    require(invokes(mount_commands, "bash scripts/mount_metal_toolchain.sh"),
-            "CodeQL must use the reviewed Metal mount helper before tracer initialization")
+            "CodeQL Metal preparation/priming must precede initialization and traced verification")
+    prepare_metal_commands = command_lines(
+        "CodeQL Metal preparation", codeql_by_name[prepare_metal_name]["run"])
+    require(invokes(prepare_metal_commands,
+                    "bash scripts/prepare_metal_toolchain_for_codeql.sh"),
+            "CodeQL must use the reviewed Metal preparation helper before tracer initialization")
     verify_metal_commands = command_lines(
         "CodeQL traced Metal verification", codeql_by_name[verify_metal_name]["run"])
-    require(invokes(verify_metal_commands, "xcrun metal -v"),
-            "CodeQL must prove Metal remains executable after tracer initialization")
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and
+                invokes([words], "xcrun metal -v") for words in verify_metal_commands),
+            "CodeQL must prove prepared XcodeDefault Metal remains executable under tracing")
     require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes(
                     [words], "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal", "-v")
                 for words in verify_metal_commands),
-            "CodeQL must verify the exact Xcode Metal shim used by the app build")
+            "CodeQL must verify the exact grafted Xcode Metal driver used by the app build")
     prime_commands = command_lines("CodeQL prime", codeql_by_name[prime_name]["run"])
     require(invokes(prime_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
                     "-scheme", "PhoneCoder", "-derivedDataPath",
@@ -280,7 +285,7 @@ try:
             "CodeQL must prime the locked arm64 app build before tracer initialization")
     require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes([words], "xcodebuild")
                 for words in prime_commands),
-            "CodeQL priming must use the pinned Metal/default toolchain order")
+            "CodeQL priming must use the prepared default Xcode toolchain")
     reset_commands = command_lines("CodeQL reset", codeql_by_name[reset_name]["run"])
     require(invokes(reset_commands, "rm -rf",
                     "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build",
@@ -310,7 +315,7 @@ try:
     analysis_commands = command_lines("CodeQL analysis build", codeql_by_name[analysis_name]["run"])
     require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes([words], "xcodebuild")
                 for words in analysis_commands),
-            "CodeQL traced build must use the pinned Metal/default toolchain order")
+            "CodeQL traced build must use the prepared default Xcode toolchain")
     podfile_checksum = hashlib.sha1((root / "Podfile").read_bytes()).hexdigest()
     lock_text = (root / "Podfile.lock").read_text(encoding="utf-8")
     require(f"PODFILE CHECKSUM: {podfile_checksum}" in lock_text,

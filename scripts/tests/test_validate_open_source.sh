@@ -7,7 +7,7 @@ trap 'rm -rf "$test_root"' EXIT
 git -C "$repository_root" archive HEAD | tar -x -C "$test_root"
 # Exercise the working validator, including changes that are not committed yet.
 cp "$repository_root/scripts/validate_open_source.sh" "$test_root/scripts/"
-cp "$repository_root/scripts/mount_metal_toolchain.sh" "$test_root/scripts/"
+cp "$repository_root/scripts/prepare_metal_toolchain_for_codeql.sh" "$test_root/scripts/"
 cp "$repository_root/scripts/prepare_unsigned_archive.sh" "$test_root/scripts/"
 git -C "$test_root" init -q
 
