@@ -41,6 +41,9 @@ jobs:
           test "$(xcodebuild -version)" = $'Xcode 26.0.1\nBuild version 17A400'
           xcodebuild -downloadComponent MetalToolchain
 
+      - name: Mount Metal toolchain for traced builds
+        run: bash scripts/mount_metal_toolchain.sh
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -117,6 +120,9 @@ jobs:
           languages: swift
           build-mode: manual
           queries: security-extended
+
+      - name: Verify Metal toolchain under CodeQL tracing
+        run: xcrun metal -v
 
       - name: Build the iOS app for analysis
         run: |

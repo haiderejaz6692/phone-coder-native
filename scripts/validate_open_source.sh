@@ -174,6 +174,7 @@ fi
 
 for executable_script in \
   scripts/build_native_frameworks.sh \
+  scripts/mount_metal_toolchain.sh \
   scripts/prepare_unsigned_archive.sh \
   scripts/native/build_catalyst_slice.sh \
   scripts/native/build_whisper_ios.sh; do

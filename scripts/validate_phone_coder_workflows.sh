@@ -157,6 +157,7 @@ try:
              "bash scripts/tests/test_validate_phone_coder_workflows.sh",
              "bash scripts/tests/test_validate_open_source.sh",
              "bash scripts/tests/test_build_native_frameworks.sh",
+             "bash scripts/tests/test_mount_metal_toolchain.sh",
              "bash scripts/tests/test_prepare_unsigned_archive.sh",
              "bash scripts/tests/test_package_unsigned_ipa.sh",
              "swift test --package-path Packages/VoiceAgentOrb"):
@@ -238,17 +239,29 @@ try:
     ]
     codeql_steps = swift_job["steps"]
     codeql_by_name = {step.get("name"): step for step in codeql_steps}
+    mount_name = "Mount Metal toolchain for traced builds"
     prime_name = "Prime dependency and Metal build outputs before tracing"
     reset_name = "Reset only first-party build outputs for analysis"
     init_name = "Initialize CodeQL"
+    verify_metal_name = "Verify Metal toolchain under CodeQL tracing"
     analysis_name = "Build the iOS app for analysis"
-    require(all(name in codeql_by_name for name in (prime_name, reset_name, init_name, analysis_name)),
-            "CodeQL must prime Metal and then rebuild first-party outputs under tracing")
+    require(all(name in codeql_by_name for name in
+                (mount_name, prime_name, reset_name, init_name, verify_metal_name, analysis_name)),
+            "CodeQL must mount Metal, prime dependencies, and verify Metal under tracing")
     positions = {name: next(index for index, step in enumerate(codeql_steps)
                             if step.get("name") == name)
-                 for name in (prime_name, reset_name, init_name, analysis_name)}
-    require(positions[prime_name] < positions[reset_name] < positions[init_name] < positions[analysis_name],
-            "CodeQL Metal priming/reset must occur before initialization and analysis")
+                 for name in
+                 (mount_name, prime_name, reset_name, init_name, verify_metal_name, analysis_name)}
+    require(positions[mount_name] < positions[prime_name] < positions[reset_name]
+            < positions[init_name] < positions[verify_metal_name] < positions[analysis_name],
+            "CodeQL Metal mount/priming must precede initialization and traced verification")
+    mount_commands = command_lines("CodeQL Metal mount", codeql_by_name[mount_name]["run"])
+    require(invokes(mount_commands, "bash scripts/mount_metal_toolchain.sh"),
+            "CodeQL must use the reviewed Metal mount helper before tracer initialization")
+    verify_metal_commands = command_lines(
+        "CodeQL traced Metal verification", codeql_by_name[verify_metal_name]["run"])
+    require(invokes(verify_metal_commands, "xcrun metal -v"),
+            "CodeQL must prove Metal remains executable after tracer initialization")
     prime_commands = command_lines("CodeQL prime", codeql_by_name[prime_name]["run"])
     require(invokes(prime_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
                     "-scheme", "PhoneCoder", "-derivedDataPath",
