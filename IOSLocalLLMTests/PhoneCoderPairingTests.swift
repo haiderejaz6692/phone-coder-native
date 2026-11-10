@@ -141,7 +141,8 @@ final class PhoneCoderPairingTests: XCTestCase {
         let gate = ApprovalGate(started: started)
         let first = Task {
             try await exchange.redeem(token: payload.token, name: "Laptop") { _ in
-                await gate.wait()
+                MainActor.preconditionIsolated()
+                return await gate.wait()
             }
         }
         await fulfillment(of: [started], timeout: 5)
