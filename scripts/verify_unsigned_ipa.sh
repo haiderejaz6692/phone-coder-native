@@ -180,7 +180,12 @@ try:
             if info.is_dir():
                 continue
             with archive.open(info) as stream:
-                macho = inspect_macho(stream, info.file_size)
+                try:
+                    macho = inspect_macho(stream, info.file_size)
+                except ValueError as error:
+                    # The member path is safe diagnostic context; never include
+                    # matched bytes, which could contain credential material.
+                    raise ValueError(f"{error} in {name}") from error
                 stream.seek(0)
                 overlap = b""
                 first = True
@@ -198,7 +203,7 @@ try:
                             blob_offset = consumed - len(overlap) + match.start()
                             blob_length = int.from_bytes(match.group(1), "big")
                             require(not 8 <= blob_length <= info.file_size - blob_offset,
-                                    "embedded Mach-O code-signature blob")
+                                    f"embedded Mach-O code-signature blob in {name}")
                     consumed += len(chunk)
                     overlap = chunk[-512:]
                     first = False

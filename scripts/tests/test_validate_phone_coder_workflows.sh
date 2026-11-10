@@ -24,6 +24,7 @@ def replace_command(workflow, step_id, command, replacement):
     step["run"] = step["run"].replace(command, replacement)
 
 mutations = [
+    ("unlocked CocoaPods install", "dependencies", "pod install --deployment", "pod install"),
     ("commented IPA verifier", "package", "bash scripts/verify_unsigned_ipa.sh", "# bash scripts/verify_unsigned_ipa.sh"),
     ("commented Swift package tests", "repository-tests", "swift test --package-path Packages/VoiceAgentOrb", "# swift test --package-path Packages/VoiceAgentOrb"),
     ("echoed XCTest command", "unit-tests", "xcodebuild test", "echo xcodebuild test"),
@@ -73,8 +74,11 @@ with tempfile.TemporaryDirectory() as temporary:
     else:
         print("PASS: rejects reserved feature-branch prefix")
     for name, old, new in [
-        ("stale CodeQL product identity", "PhoneCoder.xcworkspace", "OnDeviceLAS.xcworkspace"),
+        ("stale CodeQL product identity", "PhoneCoder.xcworkspace -scheme PhoneCoder", "OnDeviceLAS.xcworkspace -scheme OnDeviceLAS"),
         ("full native CodeQL build", "./scripts/build_native_frameworks.sh --llama-only", "./scripts/build_native_frameworks.sh"),
+        ("unpinned CodeQL Xcode", "/Applications/Xcode_26.0.1.app/Contents/Developer", "/Applications/Xcode.app/Contents/Developer"),
+        ("skipped locked Swift resolution", "xcodebuild -resolvePackageDependencies", "echo xcodebuild -resolvePackageDependencies"),
+        ("automatic CodeQL package resolution", "-disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile", "-onlyUsePackageVersionsFromResolvedFile"),
     ]:
         assert original_codeql.count(old) == 1
         (fixture / ".github/workflows/codeql.yml").write_text(original_codeql.replace(old, new))

@@ -79,7 +79,7 @@ jobs:
         run: |
           set -euo pipefail
           xcodegen generate
-          pod install
+          pod install --deployment
           # Renaming the project must not silently resolve a new SwiftPM graph.
           mkdir -p PhoneCoder.xcworkspace/xcshareddata/swiftpm
           cp OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved \

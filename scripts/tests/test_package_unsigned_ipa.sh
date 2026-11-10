@@ -314,7 +314,11 @@ try:
             member.write_bytes(data)
             output = temp / ("signed-macho-" + label + ".ipa")
             raw_zip(dirty, output)
-            reject(run(verify, output), "embedded Mach-O signature: " + label)
+            verified = run(verify, output)
+            reject(verified, "embedded Mach-O signature: " + label)
+            expected_member = "Payload/Phone Coder.app/" + members[index % len(members)]
+            check(expected_member in verified.stdout,
+                  f"Mach-O rejection did not identify its safe bundle member for {label}: {verified.stdout}")
             packaged = temp / ("signed-macho-packaged-" + label + ".ipa")
             reject(run(package, dirty, packaged), "packaged embedded Mach-O signature: " + label)
             check(not packaged.exists() and not Path(str(packaged) + ".sha256").exists(),

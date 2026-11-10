@@ -169,7 +169,7 @@ try:
             and any(invokes([words], "df -h") for words in native[build_index + 1:]),
             "native compilation must report disk space before and after")
     executes("dependencies", "xcodegen generate")
-    executes("dependencies", "pod install")
+    executes("dependencies", "pod install --deployment")
     executes("dependencies", "cp", "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
              "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved")
     executes("dependencies", "xcodebuild -resolvePackageDependencies", "-onlyUsePackageVersionsFromResolvedFile")
@@ -225,6 +225,8 @@ try:
 
     codeql = read_workflow(root / ".github/workflows/codeql.yml")
     swift_job = codeql["jobs"]["swift"]
+    require(swift_job["env"]["DEVELOPER_DIR"] == "/Applications/Xcode_26.0.1.app/Contents/Developer",
+            "CodeQL must select exact Xcode 26.0.1")
     codeql_commands = [
         words
         for step in swift_job["steps"]
@@ -233,10 +235,19 @@ try:
     ]
     require(invokes(codeql_commands, "pod install --deployment"),
             "CodeQL must install the locked CocoaPods workspace")
+    require(invokes(codeql_commands, "cp",
+                    "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+                    "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved"),
+            "CodeQL must copy the reviewed Swift package graph")
+    require(invokes(codeql_commands, "xcodebuild -resolvePackageDependencies",
+                    "-workspace", "PhoneCoder.xcworkspace", "-scheme", "PhoneCoder",
+                    "-onlyUsePackageVersionsFromResolvedFile"),
+            "CodeQL must resolve only the reviewed Swift package graph")
     require(invokes(codeql_commands, "./scripts/build_native_frameworks.sh --llama-only"),
             "CodeQL must build only the release-one native framework")
     require(invokes(codeql_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
-                    "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO"),
+                    "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO",
+                    "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile"),
             "CodeQL must build the Phone Coder workspace and scheme")
     podfile_checksum = hashlib.sha1((root / "Podfile").read_bytes()).hexdigest()
     lock_text = (root / "Podfile.lock").read_text(encoding="utf-8")

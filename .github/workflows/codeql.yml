@@ -22,6 +22,8 @@ jobs:
     name: Swift security analysis
     runs-on: macos-15
     timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
     permissions:
       contents: read
       security-events: write
@@ -31,6 +33,12 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
+
+      - name: Check pinned Xcode
+        run: |
+          test -d "$DEVELOPER_DIR"
+          test "$(xcodebuild -version)" = $'Xcode 26.0.1\nBuild version 17A400'
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -40,6 +48,17 @@ jobs:
 
       - name: Install locked CocoaPods dependencies
         run: pod install --deployment
+
+      - name: Resolve locked Swift package dependencies
+        run: |
+          mkdir -p PhoneCoder.xcworkspace/xcshareddata/swiftpm
+          cp OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+            PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          xcodebuild -resolvePackageDependencies \
+            -workspace PhoneCoder.xcworkspace -scheme PhoneCoder \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Derive the native framework cache key
         id: native-cache-key
@@ -81,6 +100,8 @@ jobs:
             -configuration Debug \
             -sdk iphonesimulator \
             -destination "generic/platform=iOS Simulator" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
+            -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
             CODE_SIGNING_ALLOWED=NO \
             build
 
