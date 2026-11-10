@@ -84,6 +84,21 @@ def raw_zip(app, output, transform=None, extra=None):
             info.external_attr = mode << 16
             archive.writestr(info, data)
 
+def clear_utf8_name_flags(output):
+    """Model ditto ZIPs that contain UTF-8 name bytes without bit 11."""
+    data = bytearray(output.read_bytes())
+    signatures = ((b"PK\x03\x04", 6), (b"PK\x01\x02", 8))
+    for signature, flag_offset in signatures:
+        position = 0
+        while True:
+            position = data.find(signature, position)
+            if position < 0:
+                break
+            flags = struct.unpack_from("<H", data, position + flag_offset)[0]
+            struct.pack_into("<H", data, position + flag_offset, flags & ~0x0800)
+            position += len(signature)
+    output.write_bytes(data)
+
 def thin_macho(bits=64, order="<", signing_command=None, signature_blob=True):
     # Independently encoded Mach-O header, UUID command and optional signature.
     # These are structural fixtures, not runnable machine code.
@@ -212,6 +227,18 @@ try:
             raw_zip(dirty, output)
             reject(run(verify, output), name)
         print("PASS: packaging and independent verification reject signing, models, credentials and forbidden metadata")
+
+        # macOS ditto writes UTF-8 filename bytes without ZIP's language flag.
+        # Python then exposes a CP437-decoded spelling unless the verifier
+        # conservatively recovers valid UTF-8 bytes before applying policy.
+        dirty = app_fixture(temp / "ditto-unicode-name")
+        disguised = dirty / "credential\u017f.json"
+        disguised.write_bytes(b"forbidden fixture")
+        output = temp / "ditto-unicode-name.ipa"
+        raw_zip(dirty, output)
+        clear_utf8_name_flags(output)
+        reject(run(verify, output), "ditto UTF-8 filename without language flag")
+        print("PASS: ditto-style unflagged UTF-8 names are checked canonically")
 
         # Build credential-like fixtures in pieces so the repository scanner does
         # not mistake test data for a checked-in credential.

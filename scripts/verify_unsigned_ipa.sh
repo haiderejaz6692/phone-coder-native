@@ -65,6 +65,18 @@ def collision_key(path):
     # Normalize again after folding because folding can introduce combining marks.
     return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
 
+def canonical_zip_name(info):
+    name = info.filename
+    if info.flag_bits & 0x0800:
+        return name
+    # macOS ditto may store UTF-8 filename bytes without ZIP's language flag.
+    # zipfile follows the specification and exposes those bytes as CP437, so
+    # recover valid UTF-8 conservatively before applying path/content policy.
+    try:
+        return name.encode("cp437").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return name
+
 def inspect_macho(stream, length):
     def read_at(offset, size):
         require(0 <= offset <= length and 0 <= size <= length - offset, "truncated Mach-O data")
@@ -130,7 +142,7 @@ try:
         entries = {}
         folded = set()
         for info in archive.infolist():
-            name = info.filename
+            name = canonical_zip_name(info)
             parts = name.rstrip("/").split("/")
             require(name and "\\" not in name and not any(ord(c) < 32 for c in name)
                     and all(part not in ("", ".", "..") for part in parts), "unsafe ZIP path")
