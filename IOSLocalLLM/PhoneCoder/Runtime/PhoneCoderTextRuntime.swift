@@ -1,0 +1,73 @@
+import Foundation
+
+struct PhoneCoderModelDescriptor: Equatable, Sendable {
+    let id: String
+    let displayName: String
+}
+
+struct PhoneCoderModelSession: Equatable, Sendable {
+    let id: UUID
+    let modelID: String
+}
+
+/// A text-only runtime request, after wire/tool prompt adaptation. The server
+/// owns stop-sequence filtering and tool decoding; native options stay values.
+struct PhoneCoderGenerationRequest: Sendable {
+    let id: PhoneCoderRequestID
+    /// Captured ledger/session identity, never read from mutable global state.
+    let sessionID: UUID
+    let modelID: String
+    let messages: [ChatMessage]
+    var maxTokens: Int? = nil
+    var temperature: Double? = nil
+    var topP: Double? = nil
+}
+
+struct PhoneCoderRuntimeEvent: Equatable, Sendable {
+    let requestID: PhoneCoderRequestID
+    let sessionID: UUID
+    let modelSessionID: UUID
+    let text: String
+}
+
+struct PhoneCoderGenerationResult: Equatable, Sendable {
+    let requestID: PhoneCoderRequestID
+    let sessionID: UUID
+    let modelSessionID: UUID
+    let promptTokens: Int
+    let completionTokens: Int
+    let finishReason: PhoneCoderFinishReason
+}
+
+enum PhoneCoderRuntimeError: Error, Equatable, Sendable {
+    case queueFull, duplicateRequest, cancelled, switchingModel
+    case modelUnavailable, residencyUnavailable, memoryPressure, thermal
+    case runtimeFailure, staleSession
+}
+
+enum PhoneCoderRuntimeAvailability: Equatable, Sendable {
+    case available
+    case unavailable(PhoneCoderRuntimeError)
+}
+
+struct PhoneCoderRuntimeState: Equatable, Sendable {
+    let availability: PhoneCoderRuntimeAvailability
+    let modelSession: PhoneCoderModelSession?
+    let activeRequestID: PhoneCoderRequestID?
+    let waitingCount: Int
+    let switchingModel: Bool
+}
+
+/// Integrated runtimes must keep admission, native serialization, cancellation,
+/// and unload in their upstream owner. Returning from generate/cancel/unload
+/// means its native work has drained. Callbacks are ordered and awaited before
+/// generate returns; every event and result carries the captured identities.
+protocol PhoneCoderTextRuntime: Sendable {
+    func installedModels() async -> [PhoneCoderModelDescriptor]
+    func liveAvailability() async -> PhoneCoderRuntimeAvailability
+    func load(modelID: String) async throws -> PhoneCoderModelSession
+    func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession,
+                  onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult
+    func cancel(requestID: PhoneCoderRequestID) async
+    func unload() async
+}

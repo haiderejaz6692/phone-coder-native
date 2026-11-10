@@ -268,6 +268,18 @@ final class CodingAssistantService: ObservableObject {
         return max(320, context - output - 256)
     }
 
+    /// Typed admission outcome for non-UI runtime adapters. Never classify a
+    /// refusal by parsing its user-facing/localized message.
+    enum AdmissionRefusal: Equatable, Sendable { case memory, thermal }
+    private(set) var admissionRefusal: AdmissionRefusal?
+    /// Changes synchronously when teardown starts, even if native cleanup is
+    /// still draining. Adapters can reject callbacks from a reclaimed runtime.
+    private(set) var runtimeSessionID = UUID()
+    var hasUsableLocalRuntime: Bool {
+        activeExecutionLocation == .localDownloaded && hasResidentRuntime
+            && (state == .ready || state == .generating)
+    }
+
     @Published private(set) var state: ServiceState = .unloaded
     @Published private(set) var tokenRate: Double = 0
     /// Estimated token count of the trimmed input sent on the last generate().
@@ -1353,8 +1365,10 @@ final class CodingAssistantService: ObservableObject {
     func load(
         allowStorageFallback: Bool = true,
         reselectFromSettings: Bool = true,
-        allowUnsafeMemoryLoad: Bool = false
+        allowUnsafeMemoryLoad: Bool = false,
+        requireLocalFiles: Bool = false
     ) async {
+        admissionRefusal = nil
         if let unloadTask {
             Diagnostics.shared.breadcrumb(
                 "assistant load waiting for pending unload",
@@ -1459,6 +1473,10 @@ final class CodingAssistantService: ObservableObject {
         // materializing weights. Weight bytes × workingSetOverhead is the same
         // single peak estimate used by MemoryAdvisor for known local models.
         let stagedDirectory = Self.preStagedDirectory(for: activeModel)
+        if requireLocalFiles, stagedDirectory == nil {
+            state = .failed("The selected model is not installed locally.")
+            return
+        }
         let probedWarm = stagedDirectory != nil
         let measuredWeightBytes = stagedDirectory.map {
             Self.sumWeightFiles(in: $0)
@@ -1485,6 +1503,7 @@ final class CodingAssistantService: ObservableObject {
                 allowUnsafeMemoryLoad: allowUnsafeMemoryLoad,
                 measuredFootprintBytes: measuredFootprintBytes
             ) {
+            admissionRefusal = DeviceSafetyMonitor.shared.thermalState == .critical ? .thermal : .memory
             state = .failed(block)
             RuntimeLogCenter.emit(
                 "Memory/safety gate blocked \(activeModel.displayName) · weights=\(Int64(measuredWeightBytes).formattedBytes) · estimatedPeak=\(measuredFootprintBytes?.formattedBytes ?? "unknown") · kv=\(capabilityProfile.maximumKVCacheTokens) tokens · \(block)",
@@ -1571,6 +1590,7 @@ final class CodingAssistantService: ObservableObject {
                 return
             }
             if let reason = DeviceSafetyMonitor.shared.stopReason {
+                admissionRefusal = reason == .thermal ? .thermal : .memory
                 state = .failed(reason.detail)
                 finishLoadDebug(phase: .failed, operation: "Safety gate blocked load", detail: reason.detail, error: reason.detail)
                 return
@@ -1600,6 +1620,7 @@ final class CodingAssistantService: ObservableObject {
                     availableBytes: available,
                     hasIncreasedMemoryEntitlement: MemoryAdvisor.hasIncreasedMemoryLimitEntitlement
                 ) else {
+                    admissionRefusal = .memory
                     throw RuntimeError.modelLoadBlocked(reason: String(
                         format: "This GGUF needs about %.1f GB available in the selected loading mode; the app currently has %.1f GB. Close other apps, enable storage-backed paging, or use a smaller quantization.",
                         Double(minimumNeeded) / 1_000_000_000,
@@ -3588,6 +3609,15 @@ final class CodingAssistantService: ObservableObject {
         return state == .ready && hasResidentRuntime
     }
 
+    /// Adapter handoff barrier. Capture and await the actual task, without a
+    /// timeout or cancellation, before releasing the caller's inference lease.
+    func drainGeneration() async {
+        let inflight = generateTask
+        let pccInflight = pccGenerateTask
+        await inflight?.value
+        await pccInflight?.value
+    }
+
     /// Called during background transition. Cooperatively cancels the active
     /// generation and waits briefly for it to unwind. Does NOT block
     /// indefinitely — the background task expiration handler cancels the
@@ -3644,6 +3674,7 @@ final class CodingAssistantService: ObservableObject {
         policy: AssistantUnloadDrainPolicy
     ) -> Task<Void, Never> {
         if let unloadTask { return unloadTask }
+        runtimeSessionID = UUID()
 
         let taskID = UUID()
         unloadTaskID = taskID
@@ -3794,7 +3825,8 @@ final class CodingAssistantService: ObservableObject {
     /// opt into making the choice the default. No-op when already active.
     func switchTo(
         _ model: AssistantModel,
-        persistAsDefault: Bool = true
+        persistAsDefault: Bool = true,
+        requireLocalFiles: Bool = false
     ) async {
 #if CORE_AI_SERVER_APP
         // The Core AI product has one manifest-selected runtime. The picker is
@@ -3887,7 +3919,8 @@ final class CodingAssistantService: ObservableObject {
         // intentionally do not persist that choice as the default, so a
         // settings reselect here would immediately replace `model` with the
         // saved default before loading it.
-        await load(reselectFromSettings: false)
+        await load(allowStorageFallback: !requireLocalFiles, reselectFromSettings: false,
+                   requireLocalFiles: requireLocalFiles)
     }
 
     /// Loads a small model for a one-shot background analysis without changing

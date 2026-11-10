@@ -35,6 +35,30 @@ final class ModelResidency: ObservableObject {
 
     private init() {}
 
+    /// Live cross-service residency view for text-only clients. Diffusion owns
+    /// a single-use container only while loading/generating; `.ready` there
+    /// means installed on disk. Vision backends may retain weights when ready.
+    /// No model loader or independently cached "healthy" flag lives here.
+    var textRuntimeAvailable: Bool {
+        switch ImageGenerationService.shared.state {
+        case .loading, .generating: return false
+        default: break
+        }
+        switch LensInferenceLoop.shared.state {
+        case .unloaded: break
+        default: return false
+        }
+        switch LlamaCppVLMService.shared.state {
+        case .unloaded: break
+        default: return false
+        }
+        let fast = FastVLMService.shared.componentStatus
+        return !FastVLMService.shared.isGenerating
+            && ![fast.encoder, fast.projector, fast.decoder, fast.tokenizer].contains {
+                $0.isReady || $0.isLoading
+            }
+    }
+
     // MARK: - Tier budget table
     //
     // Per-device-class hard budget for "both models combined." Used by
