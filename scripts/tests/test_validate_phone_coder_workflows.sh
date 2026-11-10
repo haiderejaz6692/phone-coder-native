@@ -14,6 +14,8 @@ import yaml
 
 root = Path(sys.argv[1])
 original = yaml.load((root / ".github/workflows/phone-coder-ios.yml").read_text(), Loader=yaml.BaseLoader)
+original_codeql = (root / ".github/workflows/codeql.yml").read_text()
+original_lock = (root / "Podfile.lock").read_text()
 
 def replace_command(workflow, step_id, command, replacement):
     step = next(step for step in workflow["jobs"]["phone-coder-ios"]["steps"] if step["id"] == step_id)
@@ -49,6 +51,9 @@ with tempfile.TemporaryDirectory() as temporary:
     (fixture / ".github/workflows").mkdir(parents=True)
     shutil.copyfile(root / "scripts/validate_phone_coder_workflows.sh", fixture / "scripts/validate_phone_coder_workflows.sh")
     shutil.copyfile(root / ".github/workflows/validate.yml", fixture / ".github/workflows/validate.yml")
+    shutil.copyfile(root / ".github/workflows/codeql.yml", fixture / ".github/workflows/codeql.yml")
+    shutil.copyfile(root / "Podfile", fixture / "Podfile")
+    shutil.copyfile(root / "Podfile.lock", fixture / "Podfile.lock")
 
     def validate(workflow):
         (fixture / ".github/workflows/phone-coder-ios.yml").write_text(yaml.safe_dump(workflow, sort_keys=False))
@@ -57,6 +62,30 @@ with tempfile.TemporaryDirectory() as temporary:
     baseline = validate(original)
     assert baseline.returncode == 0, baseline.stdout + baseline.stderr
     print("PASS: unchanged workflow is accepted")
+    for name, old, new in [
+        ("stale CodeQL product identity", "PhoneCoder.xcworkspace", "OnDeviceLAS.xcworkspace"),
+        ("full native CodeQL build", "./scripts/build_native_frameworks.sh --llama-only", "./scripts/build_native_frameworks.sh"),
+    ]:
+        assert original_codeql.count(old) == 1
+        (fixture / ".github/workflows/codeql.yml").write_text(original_codeql.replace(old, new))
+        result = validate(original)
+        if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+            failures.append(name)
+            print(f"FAIL: accepted {name}")
+        else:
+            print(f"PASS: rejects {name}")
+        (fixture / ".github/workflows/codeql.yml").write_text(original_codeql)
+    (fixture / "Podfile.lock").write_text(original_lock.replace(
+        "PODFILE CHECKSUM: c176ac6b0ef2b4994d263d02cba18cacc5c5e633",
+        "PODFILE CHECKSUM: 0000000000000000000000000000000000000000",
+    ))
+    result = validate(original)
+    if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+        failures.append("stale Podfile checksum")
+        print("FAIL: accepted stale Podfile checksum")
+    else:
+        print("PASS: rejects stale Podfile checksum")
+    (fixture / "Podfile.lock").write_text(original_lock)
     for name, step_id, command, replacement in mutations:
         changed = copy.deepcopy(original)
         replace_command(changed, step_id, command, replacement)

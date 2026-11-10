@@ -49,8 +49,7 @@ jobs:
               git submodule status
               git hash-object \
                 Patches/llama.cpp-ios-only-xcframework.patch \
-                scripts/build_native_frameworks.sh \
-                scripts/native/build_whisper_ios.sh
+                scripts/build_native_frameworks.sh
             } | shasum -a 256 | awk '{ print $1 }'
           )"
           echo "key=native-ios-${RUNNER_OS}-${RUNNER_ARCH}-${native_hash}" >>"$GITHUB_OUTPUT"
@@ -61,12 +60,11 @@ jobs:
         with:
           path: |
             ThirdParty/llama.cpp/build-apple/llama.xcframework
-            ThirdParty/whisper.cpp/build-apple/whisper.xcframework
           key: ${{ steps.native-cache-key.outputs.key }}
 
       - name: Build pinned native inference frameworks
         if: steps.native-cache.outputs.cache-hit != 'true'
-        run: ./scripts/build_native_frameworks.sh
+        run: ./scripts/build_native_frameworks.sh --llama-only
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
@@ -78,8 +76,8 @@ jobs:
       - name: Build the iOS app for analysis
         run: |
           xcodebuild \
-            -workspace OnDeviceLAS.xcworkspace \
-            -scheme OnDeviceLAS \
+            -workspace PhoneCoder.xcworkspace \
+            -scheme PhoneCoder \
             -configuration Debug \
             -sdk iphonesimulator \
             -destination "generic/platform=iOS Simulator" \

@@ -5,6 +5,7 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 - "$repository_root" <<'PY'
 from pathlib import Path
+import hashlib
 import re
 import shlex
 import sys
@@ -219,6 +220,26 @@ try:
                 for item in jobs.values() for step in item["steps"]), "Validate must run workflow invariants")
     require(any(invokes(command_lines("Validate", step.get("run", "")), "bash scripts/tests/test_validate_phone_coder_workflows.sh")
                 for item in jobs.values() for step in item["steps"]), "Validate must run workflow mutation regressions")
+
+    codeql = read_workflow(root / ".github/workflows/codeql.yml")
+    swift_job = codeql["jobs"]["swift"]
+    codeql_commands = [
+        words
+        for step in swift_job["steps"]
+        if "run" in step
+        for words in command_lines("CodeQL", step["run"])
+    ]
+    require(invokes(codeql_commands, "pod install --deployment"),
+            "CodeQL must install the locked CocoaPods workspace")
+    require(invokes(codeql_commands, "./scripts/build_native_frameworks.sh --llama-only"),
+            "CodeQL must build only the release-one native framework")
+    require(invokes(codeql_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
+                    "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO"),
+            "CodeQL must build the Phone Coder workspace and scheme")
+    podfile_checksum = hashlib.sha1((root / "Podfile").read_bytes()).hexdigest()
+    lock_text = (root / "Podfile.lock").read_text(encoding="utf-8")
+    require(f"PODFILE CHECKSUM: {podfile_checksum}" in lock_text,
+            "Podfile.lock checksum must match Podfile for deployment installs")
 except (KeyError, TypeError, ValueError, AttributeError):
     sys.exit("FAIL: missing or invalid workflow configuration")
 print("PASS: Phone Coder CI pins, test gates, unsigned packaging, metadata, and artifact allowlist")
