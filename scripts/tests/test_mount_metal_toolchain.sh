@@ -13,8 +13,9 @@ mkdir -p "$fake_bin" "$asset_root/Restore"
 cat > "$fake_bin/xcodebuild" <<'EOF'
 #!/usr/bin/env bash
 [[ "$*" == "-showComponent MetalToolchain" ]]
-printf 'Asset Path: %s\nBuild Version: 17A400\nStatus: %s\nToolchain Identifier: com.apple.dt.toolchain.Metal.32023\n' \
-  "$FAKE_ASSET_PATH" "${FAKE_COMPONENT_STATUS:-installed}"
+printf 'Asset Path: %s\nBuild Version: 17A400\nStatus: %s\nToolchain Identifier: %s\n' \
+  "$FAKE_ASSET_PATH" "${FAKE_COMPONENT_STATUS:-installed}" \
+  "${FAKE_TOOLCHAIN_IDENTIFIER:-com.apple.dt.toolchain.Metal.32023}"
 EOF
 
 cat > "$fake_bin/hdiutil" <<'EOF'
@@ -51,6 +52,14 @@ if FAKE_COMPONENT_STATUS=uninstalled bash "$repository_root/scripts/mount_metal_
 fi
 grep -Fq "MetalToolchain status is 'uninstalled'" "$test_root/uninstalled.out"
 echo 'PASS: rejects an uninstalled component'
+
+if FAKE_TOOLCHAIN_IDENTIFIER=com.example.unreviewed bash \
+    "$repository_root/scripts/mount_metal_toolchain.sh" >"$test_root/identifier.out" 2>&1; then
+  echo 'FAIL: accepted an unreviewed Metal toolchain identifier' >&2
+  exit 1
+fi
+grep -Fq "unexpected Metal toolchain identifier 'com.example.unreviewed'" "$test_root/identifier.out"
+echo 'PASS: rejects an unreviewed toolchain identifier'
 
 : > "$asset_root/Restore/OtherMetalToolchain.dmg"
 if bash "$repository_root/scripts/mount_metal_toolchain.sh" >"$test_root/multiple.out" 2>&1; then

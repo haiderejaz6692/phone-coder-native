@@ -231,6 +231,9 @@ try:
     swift_job = codeql["jobs"]["swift"]
     require(swift_job["env"]["DEVELOPER_DIR"] == "/Applications/Xcode_26.0.1.app/Contents/Developer",
             "CodeQL must select exact Xcode 26.0.1")
+    require(swift_job["env"]["CODEQL_TOOLCHAINS"] ==
+            "com.apple.dt.toolchain.Metal.32023 com.apple.dt.toolchain.XcodeDefault",
+            "CodeQL must pin the mounted Metal and default Xcode toolchain order")
     codeql_commands = [
         words
         for step in swift_job["steps"]
@@ -262,6 +265,10 @@ try:
         "CodeQL traced Metal verification", codeql_by_name[verify_metal_name]["run"])
     require(invokes(verify_metal_commands, "xcrun metal -v"),
             "CodeQL must prove Metal remains executable after tracer initialization")
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes(
+                    [words], "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal", "-v")
+                for words in verify_metal_commands),
+            "CodeQL must verify the exact Xcode Metal shim used by the app build")
     prime_commands = command_lines("CodeQL prime", codeql_by_name[prime_name]["run"])
     require(invokes(prime_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
                     "-scheme", "PhoneCoder", "-derivedDataPath",
@@ -271,6 +278,9 @@ try:
                     "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile",
                     "CODE_SIGNING_ALLOWED=NO"),
             "CodeQL must prime the locked arm64 app build before tracer initialization")
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes([words], "xcodebuild")
+                for words in prime_commands),
+            "CodeQL priming must use the pinned Metal/default toolchain order")
     reset_commands = command_lines("CodeQL reset", codeql_by_name[reset_name]["run"])
     require(invokes(reset_commands, "rm -rf",
                     "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build",
@@ -297,6 +307,10 @@ try:
                     "SWIFT_USE_INTEGRATED_DRIVER=NO", "-disableAutomaticPackageResolution",
                     "-onlyUsePackageVersionsFromResolvedFile"),
             "CodeQL must build the Phone Coder workspace and scheme")
+    analysis_commands = command_lines("CodeQL analysis build", codeql_by_name[analysis_name]["run"])
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes([words], "xcodebuild")
+                for words in analysis_commands),
+            "CodeQL traced build must use the pinned Metal/default toolchain order")
     podfile_checksum = hashlib.sha1((root / "Podfile").read_bytes()).hexdigest()
     lock_text = (root / "Podfile.lock").read_text(encoding="utf-8")
     require(f"PODFILE CHECKSUM: {podfile_checksum}" in lock_text,

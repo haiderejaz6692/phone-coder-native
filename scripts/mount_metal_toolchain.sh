@@ -14,9 +14,14 @@ field() {
 
 status="$(field 'Status')"
 asset_path="$(field 'Asset Path')"
+toolchain_identifier="$(field 'Toolchain Identifier')"
 
 if [[ "$status" != "installed" ]]; then
   echo "error: MetalToolchain status is '$status', expected 'installed'" >&2
+  exit 1
+fi
+if [[ "$toolchain_identifier" != "com.apple.dt.toolchain.Metal.32023" ]]; then
+  echo "error: unexpected Metal toolchain identifier '$toolchain_identifier'" >&2
   exit 1
 fi
 if [[ -z "$asset_path" || "$asset_path" != /* || ! -d "$asset_path/Restore" ]]; then

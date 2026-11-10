@@ -24,6 +24,7 @@ jobs:
     timeout-minutes: 120
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
+      CODEQL_TOOLCHAINS: com.apple.dt.toolchain.Metal.32023 com.apple.dt.toolchain.XcodeDefault
     permissions:
       contents: read
       security-events: write
@@ -94,7 +95,7 @@ jobs:
       # and Metal resources first, then retain only those reviewed outputs.
       - name: Prime dependency and Metal build outputs before tracing
         run: |
-          xcodebuild \
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" xcodebuild \
             -workspace PhoneCoder.xcworkspace \
             -scheme PhoneCoder \
             -configuration Debug \
@@ -122,11 +123,14 @@ jobs:
           queries: security-extended
 
       - name: Verify Metal toolchain under CodeQL tracing
-        run: xcrun metal -v
+        run: |
+          xcrun metal -v
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" \
+            "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal" -v
 
       - name: Build the iOS app for analysis
         run: |
-          xcodebuild \
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" xcodebuild \
             -workspace PhoneCoder.xcworkspace \
             -scheme PhoneCoder \
             -configuration Debug \
