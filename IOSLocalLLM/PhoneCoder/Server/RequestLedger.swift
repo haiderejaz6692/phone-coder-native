@@ -33,6 +33,7 @@ actor PhoneCoderRequestLedger {
     private var sessionID: UUID
     private let replayEventLimit: Int
     private let completedRecordLimit: Int
+    private let subscriberLimit: Int
     private let outputByteLimit: Int
     private var records: [PhoneCoderRequestID: Record] = [:]
     private var completedIDs: [PhoneCoderRequestID] = []
@@ -40,11 +41,12 @@ actor PhoneCoderRequestLedger {
     private var tombstones: [PhoneCoderRequestID: SHA256.Digest] = [:]
     private var tombstoneIDs: [PhoneCoderRequestID] = []
 
-    init(sessionID: UUID, replayEventLimit: Int = 256, completedRecordLimit: Int = 128, outputByteLimit: Int = 8_388_608) {
-        precondition(replayEventLimit > 0 && completedRecordLimit > 0 && outputByteLimit > 0)
+    init(sessionID: UUID, replayEventLimit: Int = 256, completedRecordLimit: Int = 128, outputByteLimit: Int = 8_388_608, subscriberLimit: Int = 8) {
+        precondition(replayEventLimit > 0 && completedRecordLimit > 0 && outputByteLimit > 0 && subscriberLimit > 0)
         self.sessionID = sessionID
         self.replayEventLimit = replayEventLimit
         self.completedRecordLimit = completedRecordLimit
+        self.subscriberLimit = subscriberLimit
         self.outputByteLimit = outputByteLimit
     }
 
@@ -83,7 +85,19 @@ actor PhoneCoderRequestLedger {
         record.outputBytes += bytes
         record.events.append(sequenced)
         if record.events.count > replayEventLimit { record.events.removeFirst() }
-        for continuation in record.subscribers.values { continuation.yield(sequenced) }
+        var detached: [UUID] = []
+        for (subscriberID, continuation) in record.subscribers {
+            switch continuation.yield(sequenced) {
+            case .enqueued: break
+            case .dropped, .terminated:
+                continuation.finish()
+                detached.append(subscriberID)
+            @unknown default:
+                continuation.finish()
+                detached.append(subscriberID)
+            }
+        }
+        for subscriberID in detached { record.subscribers.removeValue(forKey: subscriberID) }
         records[id] = record
         return sequenced
     }
@@ -115,8 +129,10 @@ actor PhoneCoderRequestLedger {
         let last = eventID ?? 0
         guard last >= 0 && last < record.nextID else { throw PhoneCoderAPIError.invalid("Invalid event ID") }
         if let first = record.events.first, last < first.id - 1 { throw Self.expired }
+        if record.terminal == nil && record.subscribers.count >= subscriberLimit { throw Self.subscriberLimit }
         let subscriberID = UUID()
-        let (stream, continuation) = AsyncStream<SequencedEvent>.makeStream()
+        // Preserve the oldest unread events; overflow disconnects rather than silently skipping one.
+        let (stream, continuation) = AsyncStream<SequencedEvent>.makeStream(bufferingPolicy: .bufferingOldest(replayEventLimit))
         for event in record.events where event.id > last { continuation.yield(event) }
         if record.terminal != nil {
             continuation.finish()
@@ -181,5 +197,6 @@ actor PhoneCoderRequestLedger {
     private static let expired = PhoneCoderAPIError(code: "replay_expired", message: "Request replay is no longer available.")
     private static let staleSession = PhoneCoderAPIError(code: "stale_session", message: "Request session is no longer active.")
     private static let terminalError = PhoneCoderAPIError(code: "request_finished", message: "Request has already finished.")
+    private static let subscriberLimit = PhoneCoderAPIError(code: "subscriber_limit", message: "Request has too many active subscribers.")
     private static let outputLimit = PhoneCoderAPIError(code: "output_limit", message: "Request output limit exceeded.")
 }

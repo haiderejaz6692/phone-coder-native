@@ -54,6 +54,31 @@ final class PhoneCoderRequestLedgerTests: XCTestCase {
         XCTAssertEqual(terminal, .cancelled(.client))
     }
 
+    func testSubscriberCapAndSlowConsumerOverflowAllowReplay() async throws {
+        let ledger = PhoneCoderRequestLedger(sessionID: session, replayEventLimit: 1, subscriberLimit: 1)
+        _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline)
+        let slow = try await ledger.attach(id: id, fingerprint: fingerprint, after: nil)
+        do { _ = try await ledger.attach(id: id, fingerprint: fingerprint, after: nil); XCTFail("Expected subscriber admission limit") }
+        catch let error as PhoneCoderAPIError { XCTAssertEqual(error.code, "subscriber_limit") }
+
+        let first = try await ledger.append(id: id, event: .chatText(context, "one"))
+        let second = try await ledger.append(id: id, event: .chatText(context, "two"))
+        var iterator = slow.makeAsyncIterator()
+        let buffered = await iterator.next()
+        let end = await iterator.next()
+        XCTAssertEqual(buffered, first)
+        XCTAssertNil(end)
+
+        // Overflow frees the admission slot, and the missed event remains in the ledger.
+        let resumed = try await ledger.attach(id: id, fingerprint: fingerprint, after: first.id)
+        try await ledger.finish(id: id, terminal: .completed)
+        var replayed: [PhoneCoderRequestLedger.SequencedEvent] = []
+        for await event in resumed { replayed.append(event) }
+        XCTAssertEqual(replayed, [second])
+        let terminal = try await ledger.terminal(id: id)
+        XCTAssertEqual(terminal, .completed)
+    }
+
     func testEvictedEventsAndCompletedRecordsReturnReplayExpired() async throws {
         let ledger = PhoneCoderRequestLedger(sessionID: session, replayEventLimit: 1, completedRecordLimit: 1)
         _ = try await ledger.begin(id: id, fingerprint: fingerprint, sessionID: session, deadline: deadline)
