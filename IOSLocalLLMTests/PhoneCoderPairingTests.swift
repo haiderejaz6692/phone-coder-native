@@ -4,12 +4,32 @@ import XCTest
 private final class MemoryPairingStorage: PhoneCoderPairingStorage {
     var value: String?
     var failWrites = false
-    func read() throws -> String? { value }
+    var failReads = false
+    func read() throws -> String? {
+        if failReads { throw Failure.read }
+        return value
+    }
     func write(_ value: String) throws {
         if failWrites { throw Failure.write }
         self.value = value
     }
-    enum Failure: Error { case write }
+    enum Failure: Error { case read, write }
+}
+
+@MainActor
+private final class ApprovalGate {
+    let started: XCTestExpectation
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    init(started: XCTestExpectation) { self.started = started }
+    func wait() async -> Bool {
+        MainActor.preconditionIsolated()
+        return await withCheckedContinuation { continuation in
+            self.continuation = continuation
+            started.fulfill()
+        }
+    }
+    func resume() { continuation?.resume(returning: true); continuation = nil }
 }
 
 private final class TestClock { var date = Date(timeIntervalSince1970: 0) }
@@ -60,6 +80,87 @@ final class PhoneCoderPairingTests: XCTestCase {
         let restored = PhoneCoderPairingStore(storage: storage)
         let context = await restored.authenticate(bearer: credential.bearer)
         XCTAssertEqual(context?.name, "Laptop")
+        let rotated = try await restored.rotate(id: credential.id)
+        let stale = await store.authenticate(bearer: credential.bearer)
+        let replacement = await store.authenticate(bearer: rotated.bearer)
+        XCTAssertNil(stale)
+        XCTAssertEqual(replacement?.id, credential.id)
+        try await restored.revoke(id: credential.id)
+        let revoked = await store.authenticate(bearer: rotated.bearer)
+        XCTAssertNil(revoked)
+    }
+
+    func testAuthenticationFailsClosedOnReadAndDecodeErrors() async throws {
+        let storage = MemoryPairingStorage()
+        let store = PhoneCoderPairingStore(storage: storage)
+        let credential = try await store.create(name: "Laptop")
+        storage.failReads = true
+        let readFailure = await store.authenticate(bearer: credential.bearer)
+        XCTAssertNil(readFailure)
+        storage.failReads = false
+        storage.value = "not valid JSON"
+        let decodeFailure = await store.authenticate(bearer: credential.bearer)
+        XCTAssertNil(decodeFailure)
+    }
+
+    func testCheckedKeychainUpdateLegacyCompatibilityAndNamespaceIsolation() throws {
+        let account = "regression." + UUID().uuidString
+        let isolatedService = "com.haider.phonecoder.tests." + UUID().uuidString
+        let webService = KeychainStore.service
+        let pairingService = "com.haider.phonecoder.pairings"
+        defer {
+            for service in [isolatedService, webService, pairingService] {
+                KeychainStore.delete(account: account, serviceName: service)
+            }
+        }
+        try KeychainStore.setChecked("first", account: account, serviceName: isolatedService)
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService), "first")
+        try KeychainStore.setChecked("second", account: account, serviceName: isolatedService)
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService), "second")
+        XCTAssertEqual(KeychainStore.get(account: account, serviceName: isolatedService), "second")
+        KeychainStore.set("legacy", account: account, serviceName: isolatedService)
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService), "legacy")
+        try KeychainStore.setChecked("web", account: account, serviceName: webService)
+        try KeychainStore.setChecked("pairing", account: account, serviceName: pairingService)
+        KeychainStore.delete(account: account, serviceName: isolatedService)
+        XCTAssertNil(try KeychainStore.getChecked(account: account, serviceName: isolatedService))
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: webService), "web")
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: pairingService), "pairing")
+        KeychainStore.delete(account: account, serviceName: webService)
+        XCTAssertNil(KeychainStore.get(account: account, serviceName: webService))
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: pairingService), "pairing")
+    }
+
+    @MainActor
+    func testConcurrentAndSuccessfulExchangeReplayCannotIssueAnotherCredential() async throws {
+        let storage = MemoryPairingStorage()
+        let store = PhoneCoderPairingStore(storage: storage)
+        let exchange = PhoneCoderPairingExchange(store: store)
+        let payload = try await exchange.issue(server: "s", apiVersion: "1", tailnetIdentity: "t")
+        let started = expectation(description: "approval is suspended")
+        let gate = ApprovalGate(started: started)
+        let first = Task {
+            try await exchange.redeem(token: payload.token, name: "Laptop") { _ in
+                await gate.wait()
+            }
+        }
+        await fulfillment(of: [started], timeout: 5)
+        let competing = try await exchange.redeem(token: payload.token, name: "Other") { _ in
+            XCTFail("consumed token requested approval")
+            return true
+        }
+        XCTAssertNil(competing)
+        gate.resume()
+        let credential = try await first.value
+        XCTAssertNotNil(credential)
+        let replay = try await exchange.redeem(token: payload.token, name: "Other") { _ in
+            XCTFail("successful token requested approval again")
+            return true
+        }
+        XCTAssertNil(replay)
+        let clients = try JSONDecoder().decode([PhoneCoderClientCredential].self, from: Data(XCTUnwrap(storage.value).utf8))
+        XCTAssertEqual(clients.count, 1)
+        XCTAssertEqual(clients.first?.id, credential?.id)
     }
 
     func testRejectsShortRandomSecretAndIncorrectBearer() async throws {
