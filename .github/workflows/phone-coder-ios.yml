@@ -43,6 +43,7 @@ jobs:
           test -d "$DEVELOPER_DIR"
           xcodebuild -version
           test "$(xcodebuild -version)" = $'Xcode 26.0.1\nBuild version 17A400'
+          xcodebuild -downloadComponent MetalToolchain
           if ! command -v xcodegen >/dev/null; then
             HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen
           fi
@@ -62,6 +63,7 @@ jobs:
           bash scripts/tests/test_validate_phone_coder_workflows.sh
           bash scripts/tests/test_validate_open_source.sh
           bash scripts/tests/test_build_native_frameworks.sh
+          bash scripts/tests/test_prepare_unsigned_archive.sh
           bash scripts/tests/test_package_unsigned_ipa.sh
           swift test --package-path Packages/VoiceAgentOrb
 
@@ -128,6 +130,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/phone-coder-artifacts"
           ipa="$RUNNER_TEMP/phone-coder-artifacts/phone-coder-unsigned-${GITHUB_SHA}.ipa"
+          bash scripts/prepare_unsigned_archive.sh "$RUNNER_TEMP/PhoneCoder.xcarchive"
           bash scripts/package_unsigned_ipa.sh "$RUNNER_TEMP/PhoneCoder.xcarchive" "$ipa"
           bash scripts/verify_unsigned_ipa.sh "$ipa"
           (

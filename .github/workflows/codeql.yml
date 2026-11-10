@@ -39,6 +39,7 @@ jobs:
         run: |
           test -d "$DEVELOPER_DIR"
           test "$(xcodebuild -version)" = $'Xcode 26.0.1\nBuild version 17A400'
+          xcodebuild -downloadComponent MetalToolchain
 
       - name: Install XcodeGen
         run: brew install xcodegen

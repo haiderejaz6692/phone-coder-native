@@ -24,7 +24,9 @@ def replace_command(workflow, step_id, command, replacement):
     step["run"] = step["run"].replace(command, replacement)
 
 mutations = [
+    ("skipped Metal toolchain installation", "tools", "xcodebuild -downloadComponent MetalToolchain", "echo xcodebuild -downloadComponent MetalToolchain"),
     ("unlocked CocoaPods install", "dependencies", "pod install --deployment", "pod install"),
+    ("skipped Xcode compatibility signature normalization", "package", "bash scripts/prepare_unsigned_archive.sh", "echo scripts/prepare_unsigned_archive.sh"),
     ("commented IPA verifier", "package", "bash scripts/verify_unsigned_ipa.sh", "# bash scripts/verify_unsigned_ipa.sh"),
     ("commented Swift package tests", "repository-tests", "swift test --package-path Packages/VoiceAgentOrb", "# swift test --package-path Packages/VoiceAgentOrb"),
     ("echoed XCTest command", "unit-tests", "xcodebuild test", "echo xcodebuild test"),
@@ -79,6 +81,7 @@ with tempfile.TemporaryDirectory() as temporary:
         ("unpinned CodeQL Xcode", "/Applications/Xcode_26.0.1.app/Contents/Developer", "/Applications/Xcode.app/Contents/Developer"),
         ("skipped locked Swift resolution", "xcodebuild -resolvePackageDependencies", "echo xcodebuild -resolvePackageDependencies"),
         ("automatic CodeQL package resolution", "-disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile", "-onlyUsePackageVersionsFromResolvedFile"),
+        ("skipped CodeQL Metal toolchain installation", "xcodebuild -downloadComponent MetalToolchain", "echo xcodebuild -downloadComponent MetalToolchain"),
     ]:
         assert original_codeql.count(old) == 1
         (fixture / ".github/workflows/codeql.yml").write_text(original_codeql.replace(old, new))

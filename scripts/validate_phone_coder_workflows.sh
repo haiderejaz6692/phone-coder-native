@@ -149,6 +149,7 @@ try:
         require(invokes(command_lines(step_id), command, *arguments), f"{step_id} must execute {command}")
 
     executes("tools", "xcodebuild -version")
+    executes("tools", "xcodebuild -downloadComponent MetalToolchain")
     executes("tools", "xcodegen --version")
     contains_text("tools", "17A400", "PyYAML==6.0.3")
     for command in ("bash scripts/validate_open_source.sh",
@@ -156,6 +157,7 @@ try:
              "bash scripts/tests/test_validate_phone_coder_workflows.sh",
              "bash scripts/tests/test_validate_open_source.sh",
              "bash scripts/tests/test_build_native_frameworks.sh",
+             "bash scripts/tests/test_prepare_unsigned_archive.sh",
              "bash scripts/tests/test_package_unsigned_ipa.sh",
              "swift test --package-path Packages/VoiceAgentOrb"):
         executes("repository-tests", command)
@@ -183,6 +185,7 @@ try:
              "-archivePath", "$RUNNER_TEMP/PhoneCoder.xcarchive",
              "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile")
     executes("archive", "rm -rf", "$RUNNER_TEMP/PhoneCoder-TestDerivedData")
+    executes("package", "bash scripts/prepare_unsigned_archive.sh", "$RUNNER_TEMP/PhoneCoder.xcarchive")
     executes("package", "bash scripts/package_unsigned_ipa.sh")
     executes("package", "bash scripts/verify_unsigned_ipa.sh")
     executes("package", "shasum -a 256 -c")
@@ -235,6 +238,8 @@ try:
     ]
     require(invokes(codeql_commands, "pod install --deployment"),
             "CodeQL must install the locked CocoaPods workspace")
+    require(invokes(codeql_commands, "xcodebuild -downloadComponent MetalToolchain"),
+            "CodeQL must install the pinned Xcode Metal toolchain")
     require(invokes(codeql_commands, "cp",
                     "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
                     "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved"),
