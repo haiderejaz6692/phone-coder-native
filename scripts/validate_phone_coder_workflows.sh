@@ -253,6 +253,8 @@ try:
     require(invokes(prime_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
                     "-scheme", "PhoneCoder", "-derivedDataPath",
                     "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData", "ARCHS=arm64",
+                    "COMPILATION_CACHE_ENABLE_CACHING=NO", "SWIFT_ENABLE_COMPILE_CACHE=NO",
+                    "SWIFT_USE_INTEGRATED_DRIVER=NO",
                     "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile",
                     "CODE_SIGNING_ALLOWED=NO"),
             "CodeQL must prime the locked arm64 app build before tracer initialization")

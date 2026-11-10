@@ -100,7 +100,9 @@ jobs:
             -derivedDataPath "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData" \
             -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
             -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
-            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO \
+            SWIFT_ENABLE_COMPILE_CACHE=NO SWIFT_USE_INTEGRATED_DRIVER=NO \
             build
 
       - name: Reset only first-party build outputs for analysis
