@@ -82,9 +82,12 @@ with tempfile.TemporaryDirectory() as temporary:
         ("skipped locked Swift resolution", "xcodebuild -resolvePackageDependencies", "echo xcodebuild -resolvePackageDependencies"),
         ("automatic CodeQL package resolution", "-disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile", "-onlyUsePackageVersionsFromResolvedFile"),
         ("skipped CodeQL Metal toolchain installation", "xcodebuild -downloadComponent MetalToolchain", "echo xcodebuild -downloadComponent MetalToolchain"),
+        ("skipped untraced CodeQL Metal priming", "Prime dependency and Metal build outputs before tracing", "Prime dependency outputs before tracing"),
+        ("broad CodeQL output reset", "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build", "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex"),
+        ("enabled CodeQL Swift compile cache", "SWIFT_ENABLE_COMPILE_CACHE=NO", "SWIFT_ENABLE_COMPILE_CACHE=YES"),
     ]:
-        assert original_codeql.count(old) == 1
-        (fixture / ".github/workflows/codeql.yml").write_text(original_codeql.replace(old, new))
+        assert original_codeql.count(old) >= 1
+        (fixture / ".github/workflows/codeql.yml").write_text(original_codeql.replace(old, new, 1))
         result = validate(original)
         if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
             failures.append(name)

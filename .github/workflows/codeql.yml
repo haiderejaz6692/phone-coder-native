@@ -86,6 +86,29 @@ jobs:
         if: steps.native-cache.outputs.cache-hit != 'true'
         run: ./scripts/build_native_frameworks.sh --llama-only
 
+      # CodeQL's macOS tracer currently hides Xcode 26's optional Metal
+      # toolchain (github/codeql-action#3978). Compile package dependencies
+      # and Metal resources first, then retain only those reviewed outputs.
+      - name: Prime dependency and Metal build outputs before tracing
+        run: |
+          xcodebuild \
+            -workspace PhoneCoder.xcworkspace \
+            -scheme PhoneCoder \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
+            -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Reset only first-party build outputs for analysis
+        run: |
+          rm -rf \
+            "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build" \
+            "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Products/Debug-iphonesimulator/Phone Coder.app"
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         with:
@@ -101,9 +124,12 @@ jobs:
             -configuration Debug \
             -sdk iphonesimulator \
             -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData" \
             -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
             -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
-            CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO \
+            SWIFT_ENABLE_COMPILE_CACHE=NO SWIFT_USE_INTEGRATED_DRIVER=NO \
             build
 
       - name: Analyze Swift

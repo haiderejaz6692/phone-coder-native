@@ -236,6 +236,31 @@ try:
         if "run" in step
         for words in command_lines("CodeQL", step["run"])
     ]
+    codeql_steps = swift_job["steps"]
+    codeql_by_name = {step.get("name"): step for step in codeql_steps}
+    prime_name = "Prime dependency and Metal build outputs before tracing"
+    reset_name = "Reset only first-party build outputs for analysis"
+    init_name = "Initialize CodeQL"
+    analysis_name = "Build the iOS app for analysis"
+    require(all(name in codeql_by_name for name in (prime_name, reset_name, init_name, analysis_name)),
+            "CodeQL must prime Metal and then rebuild first-party outputs under tracing")
+    positions = {name: next(index for index, step in enumerate(codeql_steps)
+                            if step.get("name") == name)
+                 for name in (prime_name, reset_name, init_name, analysis_name)}
+    require(positions[prime_name] < positions[reset_name] < positions[init_name] < positions[analysis_name],
+            "CodeQL Metal priming/reset must occur before initialization and analysis")
+    prime_commands = command_lines("CodeQL prime", codeql_by_name[prime_name]["run"])
+    require(invokes(prime_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
+                    "-scheme", "PhoneCoder", "-derivedDataPath",
+                    "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData", "ARCHS=arm64",
+                    "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile",
+                    "CODE_SIGNING_ALLOWED=NO"),
+            "CodeQL must prime the locked arm64 app build before tracer initialization")
+    reset_commands = command_lines("CodeQL reset", codeql_by_name[reset_name]["run"])
+    require(invokes(reset_commands, "rm -rf",
+                    "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build",
+                    "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Products/Debug-iphonesimulator/Phone Coder.app"),
+            "CodeQL must invalidate only first-party target outputs before tracing")
     require(invokes(codeql_commands, "pod install --deployment"),
             "CodeQL must install the locked CocoaPods workspace")
     require(invokes(codeql_commands, "xcodebuild -downloadComponent MetalToolchain"),
@@ -252,7 +277,10 @@ try:
             "CodeQL must build only the release-one native framework")
     require(invokes(codeql_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
                     "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO",
-                    "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile"),
+                    "-derivedDataPath", "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData", "ARCHS=arm64",
+                    "COMPILATION_CACHE_ENABLE_CACHING=NO", "SWIFT_ENABLE_COMPILE_CACHE=NO",
+                    "SWIFT_USE_INTEGRATED_DRIVER=NO", "-disableAutomaticPackageResolution",
+                    "-onlyUsePackageVersionsFromResolvedFile"),
             "CodeQL must build the Phone Coder workspace and scheme")
     podfile_checksum = hashlib.sha1((root / "Podfile").read_bytes()).hexdigest()
     lock_text = (root / "Podfile.lock").read_text(encoding="utf-8")
