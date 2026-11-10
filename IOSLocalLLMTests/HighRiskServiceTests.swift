@@ -94,6 +94,8 @@ final class CodingAssistantServicePolicyTests: XCTestCase {
         ))
     }
 
+    #if !canImport(PhoneCoder)
+    // The legacy lifecycle controller is intentionally excluded from Phone Coder.
     func testBackgroundCleanupNeverWaitsForMetalOrUnloadsItsRuntime() {
         let actions = LifecycleBackgroundCleanupPlan.referenceCompatible.actions
 
@@ -101,6 +103,7 @@ final class CodingAssistantServicePolicyTests: XCTestCase {
         XCTAssertFalse(actions.contains(.awaitNativeGeneration))
         XCTAssertFalse(actions.contains(.unloadResidentRuntimes))
     }
+    #endif
 
     func testTransitionOwnedUnloadNeverDrainsItsOwnTask() {
         XCTAssertTrue(AssistantUnloadDrainPolicy.transitionOwned.loadTask)
