@@ -20,9 +20,13 @@ protocol PhoneCoderPairingStorage {
 struct PhoneCoderKeychainPairingStorage: PhoneCoderPairingStorage {
     let service: String
     private let account = "clients"
-    init(service: String = "com.haider.phonecoder.pairings") { self.service = service }
-    func read() throws -> String? { try KeychainStore.getChecked(account: account, serviceName: service) }
-    func write(_ value: String) throws { try KeychainStore.setChecked(value, account: account, serviceName: service) }
+    private let operations: any KeychainOperations
+    init(service: String = "com.haider.phonecoder.pairings", operations: any KeychainOperations = SecurityKeychainOperations()) {
+        self.service = service
+        self.operations = operations
+    }
+    func read() throws -> String? { try KeychainStore.getChecked(account: account, serviceName: service, operations: operations) }
+    func write(_ value: String) throws { try KeychainStore.setChecked(value, account: account, serviceName: service, operations: operations) }
 }
 
 enum PhoneCoderPairingError: Error {
@@ -72,7 +76,11 @@ actor PhoneCoderPairingStore {
     static func normalizedName(_ name: String) throws -> String {
         let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).precomposedStringWithCanonicalMapping
         guard !normalized.isEmpty, normalized.count <= 80, normalized.utf8.count <= 512,
-              normalized.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }) else {
+              normalized.unicodeScalars.allSatisfy({ scalar in
+                  // Reject C0/C1 controls, but preserve Unicode format characters
+                  // such as the zero-width joiner in ordinary family-emoji names.
+                  scalar.value > 0x1F && !(0x7F...0x9F).contains(scalar.value)
+              }) else {
             throw PhoneCoderPairingError.invalidName
         }
         return normalized

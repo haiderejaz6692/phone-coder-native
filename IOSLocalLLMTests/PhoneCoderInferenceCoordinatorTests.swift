@@ -80,8 +80,12 @@ final class PhoneCoderInferenceCoordinatorTests: XCTestCase {
 
     func testCancellationMarkedDuringRuntimeActorHopNeverInvokesGenerateOrReload() async throws {
         let runtime = ControlledTextRuntime()
-        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+            XCTFail("Cancellation must never reconstruct")
+            return runtime
+        })
         let loaded = try await coordinator.switchModel(to: "model")
+        let baseline = await runtime.operations
         await runtime.holdAvailability()
         var input = request("cancel-in-hop")
         input.strictAPI = true; input.expectedModelSessionID = loaded.id
@@ -93,7 +97,9 @@ final class PhoneCoderInferenceCoordinatorTests: XCTestCase {
         await runtime.releaseAvailability()
         await assertError(pending, .cancelled)
         let operations = await runtime.operations
-        XCTAssertEqual(operations, ["load:model"])
+        // Catches any generate/reload/unload after cancellation, independently
+        // of the conservative unload performed by switchModel during setup.
+        XCTAssertEqual(operations, baseline)
     }
 
     func testMarkedCancellationWinsAConcurrentNativeFaultWithoutRetry() async throws {

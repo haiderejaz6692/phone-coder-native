@@ -7,6 +7,22 @@ import XCTest
 
 @MainActor
 final class PhoneCoderAPIServerTests: XCTestCase {
+    // Catches treating an empty incomplete NWConnection delivery as EOF.
+    func testWireReaderKeepsReadingEmptyIncompleteDeliveriesUntilComplete() async throws {
+        let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+        let terminal = "data: {\"error\":{\"code\":\"request_cancelled\"}}\n\ndata: [DONE]\n\n"
+        let chunks = APIReceiveSequence([(Data(header.utf8), false), (Data(), false), (Data(terminal.utf8), true)])
+        let response = try await APIWireClient.readResponse { try await chunks.next() }
+        XCTAssertEqual(response, header + terminal)
+    }
+
+    // Catches requiring socket EOF after the caller's requested marker arrived.
+    func testWireReaderStopsAtRequestedMarkerBeforeConnectionCompletes() async throws {
+        let chunks = APIReceiveSequence([(Data(), false), (Data("header".utf8), false), (Data("marker".utf8), false)])
+        let response = try await APIWireClient.readResponse(until: "marker") { try await chunks.next() }
+        XCTAssertEqual(response, "headermarker")
+    }
+
     func testDeleteDuringEveryAdmissionWindowCannotRestartCancelledWork() async throws {
         for checkpoint in PhoneCoderAPIServer.AdmissionCheckpoint.allCases {
             let barrier = APIAdmissionBarrier(checkpoint)
@@ -18,19 +34,19 @@ final class PhoneCoderAPIServerTests: XCTestCase {
             await barrier.waitForEntry()
             let stranger = try await fixture.store.create(name: "Stranger")
             let denied = try await fixture.exchange(method: "DELETE", path: "/v1/requests/\(id)", id: id, bearer: stranger.bearer)
-            XCTAssertTrue(denied.hasPrefix("HTTP/1.1 404"))
+            XCTAssertTrue(denied.hasPrefix("HTTP/1.1 404"), "\(checkpoint): \(denied)")
             let cancelled = try await fixture.exchange(method: "DELETE", path: "/v1/requests/\(id)", id: id)
-            XCTAssertTrue(cancelled.hasPrefix("HTTP/1.1 200"))
+            XCTAssertTrue(cancelled.hasPrefix("HTTP/1.1 200"), "\(checkpoint): \(cancelled)")
             await barrier.release()
             let response = try await original.value
-            XCTAssertTrue(response.contains("request_cancelled"))
-            XCTAssertFalse(response.contains("\"finish_reason\":\"stop\""))
+            XCTAssertTrue(response.contains("request_cancelled"), "\(checkpoint): \(response)")
+            XCTAssertFalse(response.contains("\"finish_reason\":\"stop\""), "\(checkpoint): \(response)")
             let started = await fixture.runtime.startedCount
-            if checkpoint != .enqueued { XCTAssertEqual(started, 0) }
+            if checkpoint != .enqueued { XCTAssertEqual(started, 0, "\(checkpoint): \(response)") }
             let replay = try await fixture.exchange(method: "POST", path: "/v1/chat/completions", id: id, body: body)
-            XCTAssertTrue(replay.contains("request_cancelled"))
+            XCTAssertTrue(replay.contains("request_cancelled"), "\(checkpoint): \(replay)")
             let afterReplay = await fixture.runtime.startedCount
-            XCTAssertEqual(afterReplay, started)
+            XCTAssertEqual(afterReplay, started, "\(checkpoint): \(replay)")
         }
     }
 
@@ -534,18 +550,34 @@ private final class APIWireClient: @unchecked Sendable {
     func read(until marker: String? = nil) async throws -> String {
         let timeout = Task { try? await Task.sleep(for: .seconds(5)); if !Task.isCancelled { connection.cancel() } }
         defer { timeout.cancel() }
-        var result = Data()
-        while true {
-            let next: (Data, Bool) = try await withCheckedThrowingContinuation { continuation in
+        return try await Self.readResponse(until: marker) { [connection] in
+            try await withCheckedThrowingContinuation { continuation in
                 connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, done, error in
                     if let error, data == nil { continuation.resume(throwing: error) }
                     else { continuation.resume(returning: (data ?? Data(), done)) }
                 }
             }
+        }
+    }
+
+    static func readResponse(until marker: String? = nil,
+                             receive: () async throws -> (Data, Bool)) async throws -> String {
+        var result = Data()
+        while true {
+            let next = try await receive()
             result.append(next.0)
             if let marker, String(decoding: result, as: UTF8.self).contains(marker) { break }
-            if next.1 || next.0.isEmpty { break }
+            if next.1 { break }
         }
         return String(decoding: result, as: UTF8.self)
+    }
+}
+
+private actor APIReceiveSequence {
+    private var chunks: [(Data, Bool)]
+    init(_ chunks: [(Data, Bool)]) { self.chunks = chunks }
+    func next() throws -> (Data, Bool) {
+        guard !chunks.isEmpty else { throw URLError(.badServerResponse) }
+        return chunks.removeFirst()
     }
 }

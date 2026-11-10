@@ -1,4 +1,6 @@
 import XCTest
+import Foundation
+import Security
 @testable import PhoneCoder
 
 private final class MemoryPairingStorage: PhoneCoderPairingStorage {
@@ -35,6 +37,7 @@ private final class ApprovalGate {
 private final class TestClock { var date = Date(timeIntervalSince1970: 0) }
 
 final class PhoneCoderPairingTests: XCTestCase {
+    // Catches rejecting Unicode joiners or admitting more than 512 UTF-8 bytes.
     func testDirectStoreRejectsNamesOver512UTF8BytesWithoutWriting() async throws {
         let storage = MemoryPairingStorage()
         let store = PhoneCoderPairingStore(storage: storage)
@@ -49,6 +52,24 @@ final class PhoneCoderPairingTests: XCTestCase {
         } catch PhoneCoderPairingError.invalidName {
             // Expected: rejection occurs before persistence or entropy use.
         } catch { XCTFail("Unexpected error: \(error)") }
+        XCTAssertEqual(storage.value, saved)
+    }
+
+    // Catches permitting embedded C0/C1 controls while allowing Unicode formats.
+    func testNamesRejectEmbeddedControlCodesAndKeepNFCAndGraphemeBounds() async throws {
+        let storage = MemoryPairingStorage()
+        let store = PhoneCoderPairingStore(storage: storage)
+        let accepted = try await store.create(name: "  Cafe\u{301}  ")
+        XCTAssertEqual(accepted.name, "Café")
+        let saved = storage.value
+        for scalar in [0x00, 0x09, 0x1F, 0x7F, 0x85, 0x9F] {
+            let name = "A" + String(UnicodeScalar(scalar)!) + "B"
+            do { _ = try await store.create(name: name); XCTFail("Embedded control accepted: \(scalar)") }
+            catch PhoneCoderPairingError.invalidName {} catch { XCTFail("Unexpected error: \(error)") }
+            XCTAssertEqual(storage.value, saved)
+        }
+        do { _ = try await store.create(name: String(repeating: "a", count: 81)); XCTFail("Grapheme bound bypassed") }
+        catch PhoneCoderPairingError.invalidName {} catch { XCTFail("Unexpected error: \(error)") }
         XCTAssertEqual(storage.value, saved)
     }
 
@@ -88,13 +109,15 @@ final class PhoneCoderPairingTests: XCTestCase {
         XCTAssertEqual(original?.id, credential.id)
     }
 
+    // Catches bypassing injected Security operations or losing persistence across
+    // distinct pairing-storage instances sharing one service/account namespace.
     func testKeychainPersistsCredentialsAcrossStoreInstances() async throws {
         let service = "com.haider.phonecoder.pairings.tests." + UUID().uuidString
-        defer { KeychainStore.delete(account: "clients", serviceName: service) }
-        let storage = PhoneCoderKeychainPairingStorage(service: service)
+        let operations = MemorySecurityOperations()
+        let storage = PhoneCoderKeychainPairingStorage(service: service, operations: operations)
         let store = PhoneCoderPairingStore(storage: storage)
         let credential = try await store.create(name: "Laptop")
-        let restored = PhoneCoderPairingStore(storage: storage)
+        let restored = PhoneCoderPairingStore(storage: PhoneCoderKeychainPairingStorage(service: service, operations: operations))
         let context = await restored.authenticate(bearer: credential.bearer)
         XCTAssertEqual(context?.name, "Laptop")
         let rotated = try await restored.rotate(id: credential.id)
@@ -120,32 +143,66 @@ final class PhoneCoderPairingTests: XCTestCase {
         XCTAssertNil(decodeFailure)
     }
 
+    // Catches broken update/add/read/delete behavior, legacy incompatibility,
+    // or dropped service/account selectors in the Security query boundary.
     func testCheckedKeychainUpdateLegacyCompatibilityAndNamespaceIsolation() throws {
+        let operations = MemorySecurityOperations()
         let account = "regression." + UUID().uuidString
         let isolatedService = "com.haider.phonecoder.tests." + UUID().uuidString
         let webService = KeychainStore.service
         let pairingService = "com.haider.phonecoder.pairings"
         defer {
             for service in [isolatedService, webService, pairingService] {
-                KeychainStore.delete(account: account, serviceName: service)
+                KeychainStore.delete(account: account, serviceName: service, operations: operations)
             }
         }
-        try KeychainStore.setChecked("first", account: account, serviceName: isolatedService)
-        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService), "first")
-        try KeychainStore.setChecked("second", account: account, serviceName: isolatedService)
-        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService), "second")
-        XCTAssertEqual(KeychainStore.get(account: account, serviceName: isolatedService), "second")
-        KeychainStore.set("legacy", account: account, serviceName: isolatedService)
-        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService), "legacy")
-        try KeychainStore.setChecked("web", account: account, serviceName: webService)
-        try KeychainStore.setChecked("pairing", account: account, serviceName: pairingService)
-        KeychainStore.delete(account: account, serviceName: isolatedService)
-        XCTAssertNil(try KeychainStore.getChecked(account: account, serviceName: isolatedService))
-        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: webService), "web")
-        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: pairingService), "pairing")
-        KeychainStore.delete(account: account, serviceName: webService)
-        XCTAssertNil(KeychainStore.get(account: account, serviceName: webService))
-        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: pairingService), "pairing")
+        try KeychainStore.setChecked("first", account: account, serviceName: isolatedService, operations: operations)
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService, operations: operations), "first")
+        try KeychainStore.setChecked("second", account: account, serviceName: isolatedService, operations: operations)
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService, operations: operations), "second")
+        XCTAssertEqual(KeychainStore.get(account: account, serviceName: isolatedService, operations: operations), "second")
+        KeychainStore.set("legacy", account: account, serviceName: isolatedService, operations: operations)
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: isolatedService, operations: operations), "legacy")
+        try KeychainStore.setChecked("web", account: account, serviceName: webService, operations: operations)
+        try KeychainStore.setChecked("pairing", account: account, serviceName: pairingService, operations: operations)
+        try KeychainStore.setChecked("other account", account: "other", serviceName: isolatedService, operations: operations)
+        KeychainStore.delete(account: account, serviceName: isolatedService, operations: operations)
+        XCTAssertEqual(try KeychainStore.getChecked(account: "other", serviceName: isolatedService, operations: operations), "other account")
+        XCTAssertNil(try KeychainStore.getChecked(account: account, serviceName: isolatedService, operations: operations))
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: webService, operations: operations), "web")
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: pairingService, operations: operations), "pairing")
+        KeychainStore.delete(account: account, serviceName: webService, operations: operations)
+        XCTAssertNil(KeychainStore.get(account: account, serviceName: webService, operations: operations))
+        XCTAssertEqual(try KeychainStore.getChecked(account: account, serviceName: pairingService, operations: operations), "pairing")
+    }
+
+    // Catches swallowing an unexpected Security status, treating failed reads
+    // as absence, or falling back to add after errors other than item-not-found.
+    func testCheckedKeychainPropagatesSecurityFailuresAndDecodeErrors() throws {
+        let operations = MemorySecurityOperations()
+        operations.updateStatus = errSecMissingEntitlement
+        XCTAssertThrowsError(try KeychainStore.setChecked("secret", account: "a", serviceName: "s", operations: operations)) {
+            XCTAssertEqual(($0 as? KeychainStore.CheckedError)?.status, errSecMissingEntitlement)
+        }
+        operations.updateStatus = nil
+        XCTAssertNil(try KeychainStore.getChecked(account: "a", serviceName: "s", operations: operations))
+        operations.addStatus = errSecNotAvailable
+        XCTAssertThrowsError(try KeychainStore.setChecked("secret", account: "a", serviceName: "s", operations: operations)) {
+            XCTAssertEqual(($0 as? KeychainStore.CheckedError)?.status, errSecNotAvailable)
+        }
+        operations.addStatus = nil
+        try KeychainStore.setChecked("secret", account: "a", serviceName: "s", operations: operations)
+        operations.copyResult = (errSecInteractionNotAllowed, nil)
+        XCTAssertThrowsError(try KeychainStore.getChecked(account: "a", serviceName: "s", operations: operations)) {
+            XCTAssertEqual(($0 as? KeychainStore.CheckedError)?.status, errSecInteractionNotAllowed)
+        }
+        XCTAssertNil(KeychainStore.get(account: "a", serviceName: "s", operations: operations))
+        operations.copyResult = (errSecSuccess, Data([0xFF]))
+        XCTAssertThrowsError(try KeychainStore.getChecked(account: "a", serviceName: "s", operations: operations)) {
+            XCTAssertEqual(($0 as? KeychainStore.CheckedError)?.status, errSecDecode)
+        }
+        operations.copyResult = nil
+        XCTAssertEqual(try KeychainStore.getChecked(account: "a", serviceName: "s", operations: operations), "secret")
     }
 
     @MainActor
@@ -221,5 +278,48 @@ final class PhoneCoderPairingTests: XCTestCase {
         clock.date = Date(timeIntervalSince1970: 300)
         let expired = try await exchange.redeem(token: payload.token, name: "Laptop") { _ in true }
         XCTAssertNil(expired)
+    }
+}
+
+/// Test-only Security backend. Query selectors and status behavior are modeled
+/// below the real KeychainStore logic, so no entitlement or global hook is needed.
+private final class MemorySecurityOperations: KeychainOperations {
+    private struct Key: Hashable { let service: String; let account: String }
+    private var items: [Key: Data] = [:]
+    var updateStatus: OSStatus?
+    var addStatus: OSStatus?
+    var copyResult: (OSStatus, Data?)?
+
+    private func key(_ query: [String: Any]) -> Key? {
+        guard query[kSecClass as String] as? String == kSecClassGenericPassword as String,
+              let service = query[kSecAttrService as String] as? String,
+              let account = query[kSecAttrAccount as String] as? String else { return nil }
+        return Key(service: service, account: account)
+    }
+    func update(_ query: [String: Any], attributes: [String: Any]) -> OSStatus {
+        if let updateStatus { return updateStatus }
+        guard let key = key(query), let data = attributes[kSecValueData as String] as? Data else { return errSecParam }
+        guard items[key] != nil else { return errSecItemNotFound }
+        items[key] = data
+        return errSecSuccess
+    }
+    func add(_ attributes: [String: Any]) -> OSStatus {
+        if let addStatus { return addStatus }
+        guard let key = key(attributes), let data = attributes[kSecValueData as String] as? Data,
+              attributes[kSecAttrAccessible as String] as? String == kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String else { return errSecParam }
+        guard items[key] == nil else { return errSecDuplicateItem }
+        items[key] = data
+        return errSecSuccess
+    }
+    func copyMatching(_ query: [String: Any]) -> (OSStatus, Data?) {
+        if let copyResult { return copyResult }
+        guard let key = key(query), query[kSecReturnData as String] as? Bool == true,
+              query[kSecMatchLimit as String] as? String == kSecMatchLimitOne as String else { return (errSecParam, nil) }
+        guard let data = items[key] else { return (errSecItemNotFound, nil) }
+        return (errSecSuccess, data)
+    }
+    func delete(_ query: [String: Any]) -> OSStatus {
+        guard let key = key(query) else { return errSecParam }
+        return items.removeValue(forKey: key) == nil ? errSecItemNotFound : errSecSuccess
     }
 }
