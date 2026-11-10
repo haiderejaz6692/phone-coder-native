@@ -13,7 +13,11 @@ struct PhoneCoderRootView: View {
 
     /// A supplied binding lets a parent control navigation. Otherwise the
     /// root owns mutable selection, starting on the center Server tab.
-    init(selection: Binding<PhoneCoderTab>? = nil, services: PhoneCoderServerServices = .shared) {
+    init(selection: Binding<PhoneCoderTab>? = nil) {
+        self.init(selection: selection, services: .shared)
+    }
+
+    init(selection: Binding<PhoneCoderTab>? = nil, services: PhoneCoderServerServices) {
         self.selection = selection
         self.services = services
         _server = StateObject(wrappedValue: PhoneCoderServerModel(services: services))

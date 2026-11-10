@@ -8,7 +8,8 @@ final class OnDeviceTextRuntimeAdapter: PhoneCoderTextRuntime {
     private let service = CodingAssistantService.shared
     private let residency: ModelResidency
 
-    init(residency: ModelResidency = .shared) { self.residency = residency }
+    convenience init() { self.init(residency: .shared) }
+    init(residency: ModelResidency) { self.residency = residency }
     private var session: PhoneCoderModelSession?
     private var upstreamSessionID: UUID?
     private var activeRequestID: PhoneCoderRequestID?

@@ -33,7 +33,10 @@ final class PhoneCoderChatModel: ObservableObject {
     private var persistConversation = true
     private var active: PhoneCoderGenerationRequest?
     var canRetry: Bool { !isGenerating && budgetError == nil && messages.contains { $0.role == .user } }
-    init(coordinator: PhoneCoderInferenceCoordinator, history: any PhoneCoderChatHistory = PhoneCoderConversationHistory()) {
+    convenience init(coordinator: PhoneCoderInferenceCoordinator) {
+        self.init(coordinator: coordinator, history: PhoneCoderConversationHistory())
+    }
+    init(coordinator: PhoneCoderInferenceCoordinator, history: any PhoneCoderChatHistory) {
         self.coordinator = coordinator; self.history = history
     }
     func refresh() async {

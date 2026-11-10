@@ -109,6 +109,9 @@ struct PhoneCoderStopBuffer {
     let stops: [String]
     private var pending = ""
     private(set) var stopped = false
+
+    init(stops: [String]) { self.stops = stops }
+
     mutating func consume(_ text: String) -> String {
         guard !stopped else { return "" }
         pending += text
