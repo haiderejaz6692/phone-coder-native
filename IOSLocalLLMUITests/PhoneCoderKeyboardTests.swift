@@ -78,20 +78,21 @@ final class PhoneCoderKeyboardTests: XCTestCase {
     func testImageValidationRetainsKeyboardAndInput() throws {
         open("Images")
         try requireInstalledImageModel()
-        app.buttons["Generation options"].tap()
-        let steps = input("phonecoder.images.steps")
-        reveal(steps)
-        replace(steps, with: "0")
-        let generate = app.buttons["phonecoder.images.generate"]
         // Ensure validation reaches the invalid numeric field rather than the
         // earlier empty-prompt guard, without invoking the native runtime.
-        hideKeyboard()
         let prompt = input("phonecoder.images.prompt")
         reveal(prompt)
         prompt.tap(); prompt.typeText("a landscape")
         hideKeyboard()
-        reveal(steps)
-        steps.tap()
+        app.buttons["Generation options"].tap()
+        let steps = input("phonecoder.images.steps")
+        let generate = app.buttons["phonecoder.images.generate"]
+        // Position the action while the keyboard is hidden. Do not scroll after
+        // focusing Steps: interactive scrolling could dismiss the keyboard and
+        // make the validation assertion test the wrong interaction.
+        reveal(generate)
+        XCTAssertTrue(steps.isHittable, "Steps and Generate must share the visible form area")
+        replace(steps, with: "0")
         XCTAssertTrue(generate.isHittable, "Generate must remain reachable with a number pad")
         generate.tap()
         XCTAssertTrue(app.keyboards.firstMatch.exists)
@@ -103,9 +104,10 @@ final class PhoneCoderKeyboardTests: XCTestCase {
         open("Images")
         try requireInstalledImageModel()
         let prompt = input("phonecoder.images.prompt")
-        reveal(prompt)
-        prompt.tap(); prompt.typeText("a landscape")
         let generate = app.buttons["phonecoder.images.generate"]
+        reveal(generate)
+        XCTAssertTrue(prompt.isHittable, "Prompt and Generate must share the visible form area")
+        prompt.tap(); prompt.typeText("a landscape")
         XCTAssertTrue(generate.isHittable, "Generate must remain reachable while editing")
         generate.tap()
         assertKeyboardHidden()
@@ -150,8 +152,14 @@ final class PhoneCoderKeyboardTests: XCTestCase {
         open("Settings")
         let port = input("phonecoder.settings.port")
         replace(port, with: "12345")
-        app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45))
-            .press(forDuration: 0.05, thenDragTo: app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.15)))
+        let keyboard = app.keyboards.firstMatch
+        XCTAssertTrue(keyboard.waitForExistence(timeout: 3))
+        // Start in the scrollable content immediately above the live keyboard,
+        // then pull down through it. Screen Y increases toward the bottom.
+        let start = keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0))
+            .withOffset(CGVector(dx: 0, dy: -48))
+        let end = keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8))
+        start.press(forDuration: 0.05, thenDragTo: end)
         assertKeyboardHidden()
         // Return to the top without tapping Apply.
         for _ in 0..<3 where !port.isHittable { app.swipeDown() }
@@ -187,7 +195,11 @@ final class PhoneCoderKeyboardTests: XCTestCase {
         field.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: current.count + 1) + value)
     }
     private func reveal(_ field: XCUIElement) {
-        for _ in 0..<4 where !field.isHittable { app.swipeUp() }
+        for _ in 0..<4 where !field.isHittable {
+            if field.frame.midY < app.navigationBars.firstMatch.frame.maxY + 22 {
+                app.swipeDown()
+            } else { app.swipeUp() }
+        }
         XCTAssertTrue(field.isHittable)
     }
     private func hideKeyboard() {
