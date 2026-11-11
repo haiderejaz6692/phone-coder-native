@@ -147,16 +147,31 @@ struct PhoneCoderChatView: View {
     @ObservedObject var settings: PhoneCoderSettingsModel
     @ObservedObject private var history = ConversationStore.shared
     @State private var showHistory = false
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     private enum Field: Hashable { case draft }
     @FocusState private var focusedField: Field?
     let openModels: () -> Void
     var body: some View {
         List {
             Section {
-                Button(action: openModels) { Label(model.modelName, systemImage: "shippingbox") }.phoneCoderTarget()
+                Button(action: openModels) {
+                    Label(model.modelName, systemImage: "shippingbox")
+                        .font(.subheadline.weight(.semibold)).fixedSize(horizontal: false, vertical: true)
+                }.phoneCoderTarget().accessibilityIdentifier("phonecoder.chat.model")
+                    .accessibilityHint("Choose a text model in Models")
                 Text(settings.historyEnabled ? "Local history on" : "Private chat · history off").font(.caption).foregroundStyle(.secondary)
-                Text(model.context).font(.caption).foregroundStyle(.secondary)
-                Text("Responses are text only. Chat never runs commands or tools.").font(.caption).foregroundStyle(.secondary)
+                DisclosureGroup("Conversation details") {
+                    Text(model.context).font(.caption).foregroundStyle(.secondary)
+                    Text("Responses are text only. Chat never runs commands or tools.").font(.caption).foregroundStyle(.secondary)
+                }.font(.subheadline)
+            }.listRowSeparator(.hidden)
+            if model.messages.isEmpty {
+                Section {
+                    PhoneCoderStatusHeader(title: "Start a conversation",
+                        detail: "Ask a question, work through an idea, or write code with a model on this phone.",
+                        systemImage: "bubble.left.and.bubble.right")
+                        .padding(.vertical, PhoneCoderSpacing.section)
+                }.listRowSeparator(.hidden)
             }
             ForEach(model.messages) { message in
                 VStack(alignment: .leading, spacing: 8) {
@@ -167,12 +182,17 @@ struct PhoneCoderChatView: View {
                     if message.isStreaming { ProgressView("Generating") }
                     if message.wasInterrupted { Label("Stopped", systemImage: "stop.circle").font(.caption) }
                     if !message.isStreaming, !message.content.isEmpty {
-                        HStack {
-                            Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = message.content }.phoneCoderTarget()
-                            ShareLink(item: message.content).phoneCoderTarget()
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: PhoneCoderSpacing.content) { messageActions(message).fixedSize(horizontal: true, vertical: false) }
+                            VStack(alignment: .leading, spacing: PhoneCoderSpacing.compact) { messageActions(message) }
                         }.buttonStyle(.borderless)
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(PhoneCoderSpacing.content)
+                .background(message.role == .user ? Color(uiColor: .secondarySystemBackground) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 16))
+                .listRowSeparator(.hidden)
             }
             Section {
                 PhoneCoderInlineError(message: model.error)
@@ -187,13 +207,20 @@ struct PhoneCoderChatView: View {
                 }
             }
         }
+        .listStyle(.plain)
+        .scrollContentBackground(.hidden)
+        .background(Color(uiColor: .systemBackground))
         .scrollDismissesKeyboard(.interactively)
         .phoneCoderKeyboard($focusedField)
         .safeAreaInset(edge: .bottom) {
-            HStack(alignment: .bottom) {
+            let layout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: PhoneCoderSpacing.compact))
+                : AnyLayout(HStackLayout(alignment: .bottom, spacing: PhoneCoderSpacing.compact))
+            layout {
                 TextField("Message your local model", text: $model.draft, axis: .vertical)
                     .focused($focusedField, equals: .draft)
                     .accessibilityIdentifier("phonecoder.chat.draft")
+                    .accessibilityLabel("Message your local model")
                     .lineLimit(1...6).textFieldStyle(.roundedBorder).phoneCoderTarget()
                 if model.isGenerating {
                     Button("Stop", systemImage: "stop.fill") { model.stop() }.phoneCoderTarget()
@@ -204,10 +231,11 @@ struct PhoneCoderChatView: View {
                         focusedField = PhoneCoderKeyboardFocus.afterSubmission(
                             accepted: model.messages.count > previousCount, current: focusedField)
                     }
+                        .buttonStyle(.borderedProminent)
                         .accessibilityIdentifier("phonecoder.chat.send")
                         .disabled(model.budgetError != nil || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).phoneCoderTarget()
                 }
-            }.padding().background(.regularMaterial)
+            }.padding(PhoneCoderSpacing.content).background(.regularMaterial)
         }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
@@ -226,5 +254,10 @@ struct PhoneCoderChatView: View {
         }
         .task { model.historyEnabled = settings.historyEnabled; await model.refresh() }
         .onChange(of: settings.historyEnabled) { _, value in model.historyEnabled = value }
+    }
+
+    @ViewBuilder private func messageActions(_ message: ChatMessage) -> some View {
+        Button("Copy", systemImage: "doc.on.doc") { UIPasteboard.general.string = message.content }.phoneCoderTarget()
+        ShareLink(item: message.content).phoneCoderTarget()
     }
 }

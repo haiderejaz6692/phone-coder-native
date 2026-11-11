@@ -55,10 +55,11 @@ struct PhoneCoderServerView: View {
         let status = PhoneCoderServerPresentation(controller.state)
         List {
             Section {
-                Label(status.title, systemImage: status.icon).font(.title2.bold()).foregroundStyle(status.tint)
-                Text(status.detail).foregroundStyle(.secondary)
+                PhoneCoderStatusHeader(title: status.title, detail: status.detail, systemImage: status.icon, tint: status.tint)
+                    .accessibilityIdentifier("phonecoder.server.status")
                 Button(status.action.title) { model.perform(status.action, openModels: openModels) }
                     .buttonStyle(.borderedProminent).phoneCoderTarget()
+                    .accessibilityIdentifier("phonecoder.server.primary")
                 if status.offersModels {
                     Button("Open Models", action: openModels).phoneCoderTarget()
                 }
@@ -67,15 +68,18 @@ struct PhoneCoderServerView: View {
                 }
             }
             Section("Runtime") {
-                LabeledContent("Model", value: model.runtimeState?.modelSession?.modelID ?? "No model loaded")
-                LabeledContent("Connections", value: "\(controller.connectionCount)")
-                LabeledContent("Queued requests", value: "\(model.runtimeState?.waitingCount ?? 0)")
-                LabeledContent("Current request", value: model.runtimeState?.activeRequestID?.rawValue ?? "None")
+                PhoneCoderDetailRow("Model", value: model.runtimeState?.modelSession?.modelID ?? "No model loaded")
+                DisclosureGroup("Runtime details") {
+                    PhoneCoderDetailRow("Connections", value: "\(controller.connectionCount)")
+                    PhoneCoderDetailRow("Queued requests", value: "\(model.runtimeState?.waitingCount ?? 0)")
+                    PhoneCoderDetailRow("Current request", value: model.runtimeState?.activeRequestID?.rawValue ?? "None")
+                }
             }
             Section("Private connection") {
                 if model.addresses.isEmpty { Text("Connect Tailscale to get this phone’s private address.").foregroundStyle(.secondary) }
                 ForEach(model.addresses, id: \.self) { address in
                     Text(address).textSelection(.enabled).font(.system(.body, design: .monospaced))
+                        .fixedSize(horizontal: false, vertical: true)
                         .accessibilityLabel("Server address, \(address)")
                 }
                 Text("Keep this app open while serving. Both devices must be on your tailnet.").font(.footnote).foregroundStyle(.secondary)
@@ -85,11 +89,11 @@ struct PhoneCoderServerView: View {
             Section("Paired clients") {
                 if model.clients.isEmpty { Text("No paired clients").foregroundStyle(.secondary) }
                 ForEach(model.clients) { client in
-                    VStack(alignment: .leading) {
+                    VStack(alignment: .leading, spacing: PhoneCoderSpacing.compact) {
                         Label(client.name, systemImage: "laptopcomputer").fixedSize(horizontal: false, vertical: true)
-                        HStack {
-                            Button("Rotate and pair again") { Task { await model.rotate(client) } }.phoneCoderTarget()
-                            Button("Revoke", role: .destructive) { revokeClient = client }.phoneCoderTarget()
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: PhoneCoderSpacing.content) { clientActions(client).fixedSize(horizontal: true, vertical: false) }
+                            VStack(alignment: .leading, spacing: PhoneCoderSpacing.compact) { clientActions(client) }
                         }.buttonStyle(.borderless)
                     }
                 }
@@ -98,8 +102,8 @@ struct PhoneCoderServerView: View {
                 if model.activity.isEmpty { Text("No server requests yet").foregroundStyle(.secondary) }
                 ForEach(model.activity) { item in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(item.clientName).font(.headline)
-                        Text(item.modelID).font(.caption)
+                        Text(item.clientName).font(.headline).fixedSize(horizontal: false, vertical: true)
+                        Text(item.modelID).font(.caption).fixedSize(horizontal: false, vertical: true)
                         Text("\(item.terminal.rawValue) · \(item.inputTokens) input · \(item.outputTokens) output tokens").font(.caption)
                         Text(item.endedAt, style: .relative).font(.caption).foregroundStyle(.secondary)
                     }
@@ -112,6 +116,7 @@ struct PhoneCoderServerView: View {
                 if model.error != nil { Button("Refresh status") { Task { await model.refresh() } }.phoneCoderTarget() }
             }
         }
+        .listStyle(.insetGrouped)
         .refreshable { await model.refresh() }
         .task {
             while !Task.isCancelled {
@@ -129,5 +134,10 @@ struct PhoneCoderServerView: View {
         .confirmationDialog("Revoke this client?", isPresented: Binding(get: { revokeClient != nil }, set: { if !$0 { revokeClient = nil } }), titleVisibility: .visible) {
             if let client = revokeClient { Button("Revoke \(client.name)", role: .destructive) { Task { await model.revoke(client) }; revokeClient = nil } }
         }
+    }
+
+    @ViewBuilder private func clientActions(_ client: PhoneCoderClientSummary) -> some View {
+        Button("Rotate and pair again") { Task { await model.rotate(client) } }.phoneCoderTarget()
+        Button("Revoke", role: .destructive) { revokeClient = client }.phoneCoderTarget()
     }
 }

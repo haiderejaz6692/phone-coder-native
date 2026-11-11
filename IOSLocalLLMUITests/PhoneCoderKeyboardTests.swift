@@ -213,7 +213,8 @@ final class PhoneCoderKeyboardTests: XCTestCase {
         XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 3))
     }
     private func requireInstalledImageModel() throws {
-        guard app.staticTexts["Downloaded on this phone"].exists else {
+        let readiness = app.descendants(matching: .any)["phonecoder.images.status"].firstMatch
+        guard readiness.label.contains("Downloaded on this phone") else {
             throw XCTSkip("Requires an installed selected image model; this test never downloads weights")
         }
     }

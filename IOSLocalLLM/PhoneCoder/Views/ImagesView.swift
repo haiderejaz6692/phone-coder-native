@@ -5,6 +5,7 @@ struct PhoneCoderImagesView: View {
     @ObservedObject private var service = ImageGenerationService.shared
     @StateObject private var device = PhoneCoderDeviceSnapshotModel()
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var prompt = ""
     @State private var negativePrompt = ""
     @State private var steps = "4"
@@ -27,11 +28,10 @@ struct PhoneCoderImagesView: View {
                     Picker("Model", selection: Binding(get: { service.selectedModelID }, set: { service.select($0); steps = "\(service.selectedModel.defaultSteps)" })) {
                         ForEach(ImageGenerationService.catalog) { model in Text(model.displayName).tag(model.id) }
                     }.disabled(operation.isBusy).phoneCoderTarget()
-                    Text(readiness.title).font(.headline)
-                    Text(readiness.detail).font(.caption).foregroundStyle(.secondary)
+                    PhoneCoderStatusHeader(title: readiness.title, detail: readiness.detail, systemImage: "photo")
+                        .accessibilityIdentifier("phonecoder.images.status")
                     Text(readiness.memoryFit).font(.caption).foregroundStyle(.secondary)
-                    Text("\(service.selectedModel.sizeLabel) download · default \(service.selectedModel.pixelEdge) × \(service.selectedModel.pixelEdge)")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text("\(service.selectedModel.sizeLabel) download").font(.caption).foregroundStyle(.secondary)
                 }
 
                 if let image = operation.image, operation.resultOperationID == operation.id {
@@ -48,6 +48,7 @@ struct PhoneCoderImagesView: View {
 
                 Section("Create an image") {
                     TextField("Describe your image", text: $prompt, axis: .vertical).lineLimit(3...10).phoneCoderTarget()
+                        .accessibilityLabel("Describe your image")
                         .focused($focusedField, equals: .prompt).accessibilityIdentifier("phonecoder.images.prompt")
                         .disabled(operation.isBusy)
                     DisclosureGroup("Generation options") {
@@ -106,13 +107,15 @@ struct PhoneCoderImagesView: View {
                 Section {
                     DisclosureGroup("Technical details") {
                         Text(service.selectedModel.subtitle).font(.caption)
+                        Text("Default size: \(service.selectedModel.pixelEdge) × \(service.selectedModel.pixelEdge)")
+                            .font(.caption).foregroundStyle(.secondary)
                         if let edge = operation.effectivePixelEdge {
                             Text("Effective requested size: \(edge) × \(edge)").font(.caption)
                         }
                         if let snapshot = device.snapshot {
                             Text("Memory sampled at \(snapshot.sampledAtText)").font(.caption).foregroundStyle(.secondary)
                             ForEach(snapshot.rows) { row in
-                                LabeledContent(row.label, value: row.value).font(.caption)
+                                PhoneCoderDetailRow(row.label, value: row.value).font(.caption)
                             }
                         }
                         Button("Refresh device snapshot", systemImage: "arrow.clockwise") { device.refresh() }.phoneCoderTarget()
@@ -128,7 +131,10 @@ struct PhoneCoderImagesView: View {
             }
             .scrollDismissesKeyboard(.interactively)
             .onChange(of: operation.resultOperationID) { _, id in
-                if id != nil { withAnimation { scroll.scrollTo("image-result", anchor: .top) } }
+                if id != nil {
+                    if reduceMotion { scroll.scrollTo("image-result", anchor: .top) }
+                    else { withAnimation { scroll.scrollTo("image-result", anchor: .top) } }
+                }
             }
         }
         .phoneCoderKeyboard($focusedField)

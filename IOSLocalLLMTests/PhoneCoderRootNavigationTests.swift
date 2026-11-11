@@ -9,6 +9,12 @@ final class PhoneCoderRootNavigationTests: XCTestCase {
         )
     }
 
+    func testDockRetainsApprovedLabelsAndSymbols() {
+        XCTAssertEqual(PhoneCoderTab.allCases.map(\.accessibilityLabel), ["Chat", "Models", "Server", "Images", "Settings"])
+        XCTAssertEqual(PhoneCoderTab.allCases.map(\.systemImage),
+                       ["bubble.left.and.bubble.right", "shippingbox", "server.rack", "photo", "gearshape"])
+    }
+
     func testServerOccupiesTheCenterTab() {
         XCTAssertEqual(PhoneCoderTab.allCases.firstIndex(of: .server), 2)
     }

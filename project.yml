@@ -295,6 +295,7 @@ targets:
     deploymentTarget: "18.0"
     sources:
       - path: IOSLocalLLMUITests/PhoneCoderKeyboardTests.swift
+      - path: IOSLocalLLMUITests/PhoneCoderPresentationTests.swift
     dependencies:
       - target: PhoneCoder
     settings:

@@ -1,9 +1,43 @@
 import XCTest
 import Combine
+import SwiftUI
+import UIKit
 @testable import PhoneCoder
 
 @MainActor
 final class PhoneCoderViewModelTests: XCTestCase {
+    // A fixed-height or single-line status would hide recovery instructions on
+    // compact phones. Measure the production header with real SwiftUI layout.
+    func testStatusHeaderGrowsForLongModelNamesAndAccessibilityText() {
+        let short = PhoneCoderStatusHeader(title: "Model ready", detail: "On this phone", systemImage: "shippingbox")
+        let long = PhoneCoderStatusHeader(title: String(repeating: "Long model name ", count: 16),
+                                         detail: "Load a smaller model, then retry.", systemImage: "shippingbox")
+        let shortSize = fittingSize(short.environment(\.dynamicTypeSize, .large), width: 288)
+        let longSize = fittingSize(long.environment(\.dynamicTypeSize, .large), width: 288)
+        let accessibleSize = fittingSize(long.environment(\.dynamicTypeSize, .accessibility5), width: 288)
+        XCTAssertGreaterThan(longSize.height, shortSize.height)
+        XCTAssertGreaterThan(accessibleSize.height, longSize.height)
+        XCTAssertLessThanOrEqual(accessibleSize.width, 288)
+    }
+
+    // Long identifiers must remain in the row at narrow widths and RTL rather
+    // than forcing horizontal scrolling or being constrained to one line.
+    func testDetailRowGrowsForLongValuesInCompactRTLLayout() {
+        let short = PhoneCoderDetailRow("Model", value: "Small model")
+        let long = PhoneCoderDetailRow("Model", value: String(repeating: "organization/model-name-", count: 12))
+        let shortSize = fittingSize(short.environment(\.dynamicTypeSize, .large), width: 288)
+        let longSize = fittingSize(long.environment(\.layoutDirection, .rightToLeft).environment(\.dynamicTypeSize, .large), width: 288)
+        let accessibleSize = fittingSize(long.environment(\.dynamicTypeSize, .accessibility5), width: 288)
+        XCTAssertGreaterThan(longSize.height, shortSize.height)
+        XCTAssertGreaterThan(accessibleSize.height, longSize.height)
+        XCTAssertLessThanOrEqual(accessibleSize.width, 288)
+    }
+
+    private func fittingSize<Content: View>(_ content: Content, width: CGFloat) -> CGSize {
+        let host = UIHostingController(rootView: content)
+        return host.sizeThatFits(in: CGSize(width: width, height: 10_000))
+    }
+
     // Losing acceptance detection would dismiss rejected drafts (including the
     // 1 MiB guard) or leave the keyboard over a successfully queued message.
     func testChatSubmissionFocusTracksActualAcceptanceWithoutChangingDraftValidation() async throws {

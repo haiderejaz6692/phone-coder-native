@@ -72,35 +72,41 @@ struct PhoneCoderModelsView: View {
     }
     var body: some View {
         List {
-            Section("On-device text models") {
-                Text("Start with a smaller model: download it below, then tap Load in Installed models. Loading another model replaces the current runtime.").font(.callout)
-                LabeledContent("Downloaded storage", value: ByteCountFormatter.string(fromByteCount: catalog.totalStorageUsed, countStyle: .file))
+            Section {
+                PhoneCoderStatusHeader(title: model.loadedID == nil ? "Choose a text model" : "Text model loaded",
+                    detail: model.loadedID == nil ? "Download a model below, then load it for Chat and Server. Start small for more working memory." : "Ready for Chat and Server. Loading another model replaces the current runtime.",
+                    systemImage: "shippingbox")
+                    .accessibilityIdentifier("phonecoder.models.status")
+                if let loadedID = model.loadedID { PhoneCoderDetailRow("Loaded model", value: loadedID) }
+                PhoneCoderDetailRow("Downloaded storage", value: ByteCountFormatter.string(fromByteCount: catalog.totalStorageUsed, countStyle: .file))
                 if model.busy { ProgressView("Updating model runtime") }
                 PhoneCoderInlineError(message: model.error)
                 if model.error != nil { Button("Refresh models") { Task { await model.refresh() } }.phoneCoderTarget() }
             }
             Section("Working memory") {
                 if let snapshot = device.snapshot {
-                    ForEach(snapshot.rows.filter { ["footprint", "modelHeadroom", "thermal", "safety"].contains($0.id) }) { row in
-                        LabeledContent(row.label, value: row.value)
-                    }
-                    DisclosureGroup("Technical device readings") {
-                        ForEach(snapshot.rows.filter { !["footprint", "modelHeadroom", "thermal", "safety"].contains($0.id) }) { row in
-                            LabeledContent(row.label, value: row.value)
-                        }
-                        LabeledContent("Sampled at", value: snapshot.sampledAtText)
+                    ForEach(snapshot.rows.filter { ["modelHeadroom", "safety"].contains($0.id) }) { row in
+                        PhoneCoderDetailRow(row.label, value: row.value)
                     }
                 } else { Text("Device snapshot: Unavailable") }
-                Button("Refresh device readings") { device.refresh() }.phoneCoderTarget()
-                Text("Working-memory estimates include runtime overhead and differ from download size. Raw values are measured; derived values use those readings; estimated ceilings are policy fallbacks. Model headroom is advisory and changes as models load. The runtime rechecks memory and temperature before heavy work.")
-                    .font(.footnote).foregroundStyle(.secondary)
+                DisclosureGroup("Technical device readings") {
+                    if let snapshot = device.snapshot {
+                        ForEach(snapshot.rows.filter { !["modelHeadroom", "safety"].contains($0.id) }) { row in
+                            PhoneCoderDetailRow(row.label, value: row.value)
+                        }
+                        PhoneCoderDetailRow("Sampled at", value: snapshot.sampledAtText)
+                    }
+                    Button("Refresh device readings") { device.refresh() }.phoneCoderTarget()
+                    Text("Working-memory estimates include runtime overhead and differ from download size. Raw values are measured; derived values use those readings; estimated ceilings are policy fallbacks. Model headroom is advisory and changes as models load. The runtime rechecks memory and temperature before heavy work.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
             }
             Section("Installed models") {
                 if model.installed.isEmpty { Text("No callable text model yet. Download one from the catalog below.").foregroundStyle(.secondary) }
                 ForEach(model.installed, id: \.id) { item in
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: PhoneCoderSpacing.compact) {
                         Text(item.displayName).font(.headline).fixedSize(horizontal: false, vertical: true)
-                        Text(item.id).font(.caption).foregroundStyle(.secondary)
+                        Text(item.id).font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                         if model.loadedID == item.id {
                             Label("Loaded", systemImage: "checkmark.circle")
                             Button("Unload") { Task { await model.unload() } }.disabled(model.busy).phoneCoderTarget()
@@ -119,6 +125,7 @@ struct PhoneCoderModelsView: View {
                 }
             }
         }
+        .listStyle(.insetGrouped)
         .task {
             device.refresh()
             catalog.refreshAllStates(); catalog.refreshStorageStats()
@@ -146,15 +153,17 @@ private struct PhoneCoderDownloadRow: View {
     @State private var error: String?
     var body: some View {
         let action = PhoneCoderModelAction.action(for: downloader.state)
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: PhoneCoderSpacing.compact) {
             Text(model.displayName).font(.headline).fixedSize(horizontal: false, vertical: true)
-            Text(model.subtitle).font(.caption).foregroundStyle(.secondary)
-            Text(model.sizeLabel).font(.caption)
-            if let ram = model.approxRAMBytes {
-                Text("Estimated working memory: \(ByteCountFormatter.string(fromByteCount: ram, countStyle: .memory))").font(.caption)
-            }
-            if let context = model.contextWindowTokens { Text("Context: \(context) tokens").font(.caption) }
-            if let compatibility = model.platformCompatibility { Text(compatibility.detail).font(.caption) }
+            Text(model.sizeLabel).font(.subheadline).foregroundStyle(.secondary)
+            DisclosureGroup("Model details") {
+                Text(model.subtitle).font(.caption).foregroundStyle(.secondary)
+                if let ram = model.approxRAMBytes {
+                    Text("Estimated working memory: \(ByteCountFormatter.string(fromByteCount: ram, countStyle: .memory))").font(.caption)
+                }
+                if let context = model.contextWindowTokens { Text("Context: \(context) tokens").font(.caption) }
+                if let compatibility = model.platformCompatibility { Text(compatibility.detail).font(.caption) }
+            }.font(.subheadline)
             if downloader.state.isActive || downloader.state.isPaused {
                 ProgressView(value: downloader.progress) { Text(downloader.state.isPaused ? "Download paused" : "Downloading") }
                     .accessibilityValue(downloader.progress.formatted(.percent.precision(.fractionLength(0))))
