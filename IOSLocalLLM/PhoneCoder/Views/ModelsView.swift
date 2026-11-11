@@ -56,8 +56,16 @@ final class PhoneCoderModelsModel: ObservableObject {
 
 struct PhoneCoderModelsView: View {
     @ObservedObject var model: PhoneCoderModelsModel
+    @Environment(\.scenePhase) private var scenePhase
+    @StateObject private var device: PhoneCoderDeviceSnapshotModel
     @ObservedObject private var catalog = ModelDownloadCenter.shared
     @State private var deletion: DownloadableModel?
+    init(model: PhoneCoderModelsModel,
+         deviceSnapshotProvider: (any PhoneCoderDeviceSnapshotProviding)? = nil) {
+        self.model = model
+        _device = StateObject(wrappedValue: PhoneCoderDeviceSnapshotModel(provider: deviceSnapshotProvider))
+    }
+
     private var textModels: [DownloadableModel] {
         catalog.models.filter { $0.supportsCategory(.assistant) && !$0.capabilities.contains(.vision) }
             .sorted { ($0.approxRAMBytes ?? Int64.max) < ($1.approxRAMBytes ?? Int64.max) }
@@ -70,6 +78,22 @@ struct PhoneCoderModelsView: View {
                 if model.busy { ProgressView("Updating model runtime") }
                 PhoneCoderInlineError(message: model.error)
                 if model.error != nil { Button("Refresh models") { Task { await model.refresh() } }.phoneCoderTarget() }
+            }
+            Section("Working memory") {
+                if let snapshot = device.snapshot {
+                    ForEach(snapshot.rows.filter { ["footprint", "modelHeadroom", "thermal", "safety"].contains($0.id) }) { row in
+                        LabeledContent(row.label, value: row.value)
+                    }
+                    DisclosureGroup("Technical device readings") {
+                        ForEach(snapshot.rows.filter { !["footprint", "modelHeadroom", "thermal", "safety"].contains($0.id) }) { row in
+                            LabeledContent(row.label, value: row.value)
+                        }
+                        LabeledContent("Sampled at", value: snapshot.sampledAtText)
+                    }
+                } else { Text("Device snapshot: Unavailable") }
+                Button("Refresh device readings") { device.refresh() }.phoneCoderTarget()
+                Text("Working-memory estimates include runtime overhead and differ from download size. Raw values are measured; derived values use those readings; estimated ceilings are policy fallbacks. Model headroom is advisory and changes as models load. The runtime rechecks memory and temperature before heavy work.")
+                    .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Installed models") {
                 if model.installed.isEmpty { Text("No callable text model yet. Download one from the catalog below.").foregroundStyle(.secondary) }
@@ -96,13 +120,17 @@ struct PhoneCoderModelsView: View {
             }
         }
         .task {
+            device.refresh()
             catalog.refreshAllStates(); catalog.refreshStorageStats()
             while !Task.isCancelled {
                 await model.refresh()
                 do { try await Task.sleep(for: .seconds(2)) } catch { break }
             }
         }
-        .refreshable { catalog.refreshAllStates(); catalog.refreshStorageStats(); await model.refresh() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { device.refresh() }
+        }
+        .refreshable { device.refresh(); catalog.refreshAllStates(); catalog.refreshStorageStats(); await model.refresh() }
         .confirmationDialog("Delete this downloaded model?", isPresented: Binding(get: { deletion != nil }, set: { if !$0 { deletion = nil } }), titleVisibility: .visible) {
             if let deletion {
                 Button("Delete \(deletion.displayName)", role: .destructive) { Task { await model.delete(deletion) }; self.deletion = nil }

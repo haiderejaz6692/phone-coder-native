@@ -4,6 +4,132 @@ import Combine
 
 @MainActor
 final class PhoneCoderViewModelTests: XCTestCase {
+    // Catches physical RAM being presented as allocatable memory, mixing resident
+    // size with phys_footprint, and losing provenance when policy caps headroom.
+    func testDeviceSnapshotSeparatesCapacityFootprintCeilingAndHeadroom() {
+        let snapshot = deviceSnapshot()
+        XCTAssertEqual(snapshot.physicalMemoryBytes, 12_000_000_000)
+        XCTAssertEqual(snapshot.appFootprintBytes, 2_000_000_000)
+        XCTAssertEqual(snapshot.processAvailableBytes, 8_000_000_000)
+        XCTAssertEqual(snapshot.processCeilingBytes, 9_200_000_000)
+        XCTAssertEqual(snapshot.modelHeadroomBytes, 7_200_000_000)
+        XCTAssertEqual(snapshot.rows.first { $0.id == "physical" }?.kind, .raw)
+        XCTAssertEqual(snapshot.rows.first { $0.id == "footprint" }?.kind, .raw)
+        XCTAssertEqual(snapshot.rows.first { $0.id == "processAvailable" }?.kind, .raw)
+        XCTAssertEqual(snapshot.rows.first { $0.id == "ceiling" }?.kind, .derived)
+        XCTAssertEqual(snapshot.rows.first { $0.id == "modelHeadroom" }?.kind, .derived)
+        XCTAssertTrue(snapshot.rows.allSatisfy { !$0.title.isEmpty && !$0.value.isEmpty })
+    }
+
+    // A policy fallback may be shown as an estimate; it must never manufacture
+    // live headroom when either kernel reading failed.
+    func testDeviceSnapshotUnavailableReadingsNeverBecomeFreePhysicalMemory() {
+        for unavailable: Int64 in [0, -1] {
+            let snapshot = deviceSnapshot(physical: unavailable, footprint: unavailable,
+                                          available: unavailable, ceiling: 6_000_000_000)
+            XCTAssertNil(snapshot.physicalMemoryBytes)
+            XCTAssertNil(snapshot.appFootprintBytes)
+            XCTAssertNil(snapshot.processAvailableBytes)
+            XCTAssertNil(snapshot.modelHeadroomBytes)
+            XCTAssertEqual(snapshot.rows.first { $0.id == "ceiling" }?.kind, .estimated)
+            for id in ["physical", "footprint", "processAvailable", "modelHeadroom"] {
+                let row = snapshot.rows.first { $0.id == id }
+                XCTAssertEqual(row?.kind, .unavailable)
+                XCTAssertEqual(row?.value, "Unavailable")
+            }
+        }
+        XCTAssertNil(deviceSnapshot(available: 0).modelHeadroomBytes)
+        XCTAssertNil(deviceSnapshot(footprint: 0).modelHeadroomBytes)
+        XCTAssertNil(deviceSnapshot(ceiling: 0).processCeilingBytes)
+        XCTAssertNil(deviceSnapshot(ceiling: 0).modelHeadroomBytes)
+        // A real footprint can exceed the clamped policy ceiling. That is
+        // exhausted derived headroom, unlike a missing kernel measurement.
+        let exhausted = deviceSnapshot(footprint: 10_000_000_000)
+        XCTAssertEqual(exhausted.modelHeadroomBytes, 0)
+        XCTAssertEqual(exhausted.rows.first { $0.id == "modelHeadroom" }?.kind, .derived)
+    }
+
+    func testDeviceSnapshotReportsEntitlementWithoutPromisingAdmission() {
+        for (state, value) in [(PhoneCoderDeviceSnapshot.Entitlement.present, "Present"),
+                               (.absent, "Absent"), (.notApplicable, "Not applicable"),
+                               (.unavailable, "Unavailable")] {
+            let row = deviceSnapshot(entitlement: state).rows.first { $0.id == "entitlement" }
+            XCTAssertEqual(row?.value, value)
+            XCTAssertEqual(row?.kind, state == .unavailable ? .unavailable : .raw)
+        }
+    }
+
+    func testDeviceSnapshotKeepsRawThermalAndEffectiveSafetyStateDistinct() {
+        let snapshot = deviceSnapshot(thermal: .fair, effectiveThermal: .critical,
+                                      lowPower: true, stopReason: .thermal, throttling: true)
+        XCTAssertEqual(snapshot.rows.first { $0.id == "thermal" }?.value, "Fair")
+        XCTAssertEqual(snapshot.rows.first { $0.id == "effectiveThermal" }?.value, "Critical")
+        XCTAssertEqual(snapshot.rows.first { $0.id == "lowPower" }?.value, "On")
+        XCTAssertEqual(snapshot.rows.first { $0.id == "safety" }?.value, "Paused: thermal")
+        XCTAssertEqual(deviceSnapshot(stopReason: .memoryPressure).rows.first { $0.id == "safety" }?.value,
+                       "Paused: memory pressure")
+        XCTAssertEqual(deviceSnapshot(throttling: true).rows.first { $0.id == "safety" }?.value, "Throttling")
+        XCTAssertEqual(deviceSnapshot().rows.first { $0.id == "safety" }?.value, "No current stop signal")
+        for (state, value) in [(ProcessInfo.ThermalState.nominal, "Nominal"),
+                               (.fair, "Fair"), (.serious, "Serious"), (.critical, "Critical")] {
+            XCTAssertEqual(deviceSnapshot(thermal: state).rows.first { $0.id == "thermal" }?.value, value)
+        }
+    }
+
+    func testDeviceSnapshotDiagnosticsAreStableAllowlistedAndUseBytes() {
+        let diagnostic = deviceSnapshot().diagnostics
+        XCTAssertEqual(diagnostic, """
+        Device snapshot (advisory; runtime gates recheck)
+        Sampled at: 1970-01-01T00:00:00Z
+        Physical memory [raw]: 12000000000 bytes
+        App footprint [raw]: 2000000000 bytes
+        Process available [raw]: 8000000000 bytes
+        Process ceiling [derived]: 9200000000 bytes
+        Model headroom [derived]: 7200000000 bytes
+        Increased-memory entitlement [raw]: Present
+        Thermal [raw]: Nominal
+        Effective thermal [derived]: Nominal
+        Low power mode [raw]: Off
+        Runtime safety [derived]: No current stop signal
+        """)
+        XCTAssertEqual(diagnostic, deviceSnapshot().diagnostics)
+        for sentinel in ["/private/", "Bearer ", "prompt", "credential", "client", "192.168."] {
+            XCTAssertFalse(diagnostic.contains(sentinel))
+        }
+        XCTAssertTrue(deviceSnapshot(available: 0).diagnostics.contains("Model headroom [unavailable]: Unavailable"))
+    }
+
+    // Tests the real store consuming an injected sampler, including replacing
+    // stale state when readings become unavailable at a later refresh.
+    func testDeviceSnapshotRefreshReplacesPriorSampleThroughInjectedProvider() {
+        let provider = ViewModelDeviceSnapshotProvider(snapshot: deviceSnapshot())
+        let model = PhoneCoderDeviceSnapshotModel(provider: provider)
+        XCTAssertNil(model.snapshot)
+        model.refresh()
+        XCTAssertEqual(model.snapshot?.modelHeadroomBytes, 7_200_000_000)
+        provider.snapshot = deviceSnapshot(available: 0)
+        model.refresh()
+        XCTAssertNil(model.snapshot?.modelHeadroomBytes)
+        XCTAssertEqual(model.snapshot?.rows.first { $0.id == "processAvailable" }?.value, "Unavailable")
+    }
+
+    private func deviceSnapshot(physical: Int64 = 12_000_000_000,
+                                footprint: Int64 = 2_000_000_000,
+                                available: Int64 = 8_000_000_000,
+                                ceiling: Int64 = 9_200_000_000,
+                                entitlement: PhoneCoderDeviceSnapshot.Entitlement = .present,
+                                thermal: ProcessInfo.ThermalState = .nominal,
+                                effectiveThermal: ProcessInfo.ThermalState = .nominal,
+                                lowPower: Bool = false,
+                                stopReason: DeviceSafetyMonitor.StopReason? = nil,
+                                throttling: Bool = false) -> PhoneCoderDeviceSnapshot {
+        .init(sampledAt: Date(timeIntervalSince1970: 0), physicalMemoryBytes: physical,
+              appFootprintBytes: footprint, processAvailableBytes: available,
+              processCeilingBytes: ceiling, entitlement: entitlement,
+              thermalState: thermal, effectiveThermalState: effectiveThermal,
+              lowPowerMode: lowPower, stopReason: stopReason, isThrottling: throttling)
+    }
+
     func testSuccessfulStoredDataRefreshClearsPriorReadError() async throws {
         let storage = ViewModelPairingStorage()
         let pairings = PhoneCoderPairingStore(storage: storage)
@@ -451,4 +577,11 @@ private final class ViewModelPairingStorage: PhoneCoderPairingStorage {
         return value
     }
     func write(_ value: String) throws { self.value = value }
+}
+
+@MainActor
+private final class ViewModelDeviceSnapshotProvider: PhoneCoderDeviceSnapshotProviding {
+    var snapshot: PhoneCoderDeviceSnapshot
+    init(snapshot: PhoneCoderDeviceSnapshot) { self.snapshot = snapshot }
+    func sample() -> PhoneCoderDeviceSnapshot { snapshot }
 }
