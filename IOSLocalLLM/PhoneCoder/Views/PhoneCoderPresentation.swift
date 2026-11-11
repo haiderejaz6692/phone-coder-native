@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Hub
 
 enum PhoneCoderServerAction: Equatable {
     case start, stop, retry, models
@@ -136,5 +137,166 @@ final class PhoneCoderSettingsModel: ObservableObject {
     static func validPort(_ text: String) -> UInt16? {
         guard let value = UInt16(text.trimmingCharacters(in: .whitespacesAndNewlines)), value >= 1024 else { return nil }
         return value
+    }
+}
+
+enum PhoneCoderImageCancellation: String { case user, background, safety }
+
+enum PhoneCoderImagePhase: String {
+    case idle, preparing, downloading, loading, denoising, finalizing, cancelling, ready, failed, cancelled
+    var isBusy: Bool {
+        switch self { case .preparing, .downloading, .loading, .denoising, .finalizing, .cancelling: true; default: false }
+    }
+    var title: String {
+        switch self {
+        case .idle: "Ready for a new image"
+        case .preparing: "Preparing working memory"
+        case .downloading: "Downloading image model"
+        case .loading: "Loading image model"
+        case .denoising: "Denoising"
+        case .finalizing: "Finishing image"
+        case .cancelling: "Stopping safely"
+        case .ready: "Image ready"
+        case .failed: "Image could not finish"
+        case .cancelled: "Image generation stopped"
+        }
+    }
+}
+
+enum PhoneCoderImageFailure: String {
+    case memory, residency, network, access, incompleteDownload, imageEncode, imageDecode, priorInterruption, generation
+    static func category(for error: Error) -> Self {
+        let ns = error as NSError
+        if ns.domain == "ImageGen" {
+            switch ns.code { case -3: return .memory; case -2: return .residency; case -1: return .imageEncode; default: break }
+        }
+        if ns.domain == NSURLErrorDomain { return .network }
+        if ns.domain == "HFDownload", [401, 403, 404].contains(ns.code) { return .access }
+        if let hub = error as? Hub.HubClientError {
+            switch hub {
+            case .fileNotFound, .resourceNotFound, .authorizationRequired: return .access
+            case .httpStatusCode(let code) where [401, 403, 404].contains(code): return .access
+            default: break
+            }
+        }
+        return .generation
+    }
+    var recovery: String {
+        switch self {
+        case .memory: "Not enough working memory, or memory could not be measured. Close other apps or choose a lighter image model, then retry."
+        case .residency: "Another model is still retiring. Wait for it to stop, then retry."
+        case .network: "The download could not finish. Check connectivity, then retry."
+        case .access: "Model access is required. Check your Hugging Face token in Settings and accept the model license, then retry."
+        case .incompleteDownload: "The model download is incomplete. Retry the download."
+        case .imageEncode, .imageDecode: "The generated image could not be opened. Retry generation."
+        case .priorInterruption: "This model was disabled after repeated interrupted attempts. Choose a lighter image model."
+        case .generation: "The image model could not finish. Retry, or choose a lighter image model."
+        }
+    }
+}
+
+/// Presentation/publication seam only; never admits or releases a runtime.
+/// No prompt, credential, path or raw exception is retained here.
+@MainActor
+struct PhoneCoderImageOperation {
+    private(set) var id: UUID?
+    private(set) var modelID: String?
+    private(set) var phase: PhoneCoderImagePhase = .idle
+    private(set) var progress: Double = 0
+    private(set) var failure: PhoneCoderImageFailure?
+    private(set) var cancellation: PhoneCoderImageCancellation?
+    private(set) var steps: Int?
+    private(set) var effectivePixelEdge: Int?
+    private(set) var image: UIImage?
+    private(set) var resultOperationID: UUID?
+    private(set) var resultWidth: Int?
+    private(set) var resultHeight: Int?
+    private(set) var pngByteCount: Int?
+    var isBusy: Bool { phase.isBusy }
+
+    mutating func reset() { self = Self() }
+    mutating func begin(id: UUID, modelID: String, steps: Int, pixelEdge: Int) {
+        reset()
+        self.id = id
+        // Only known catalog identifiers can enter presentation/diagnostics.
+        self.modelID = ImageGenerationService.model(forID: modelID)?.id
+        self.steps = max(1, steps)
+        effectivePixelEdge = pixelEdge
+        phase = .preparing
+    }
+    mutating func setEffectivePixelEdge(_ edge: Int, id: UUID) {
+        guard self.id == id, isBusy else { return }
+        effectivePixelEdge = edge
+    }
+    mutating func advance(_ next: PhoneCoderImagePhase, id: UUID, progress: Double = 0) {
+        guard self.id == id, isBusy, phase != .cancelling else { return }
+        let order: [PhoneCoderImagePhase] = [.preparing, .downloading, .loading, .denoising, .finalizing]
+        guard let before = order.firstIndex(of: phase), let after = order.firstIndex(of: next), after >= before else { return }
+        if next != phase { self.progress = 0 }
+        phase = next
+        self.progress = max(self.progress, min(1, max(0, progress)))
+    }
+    mutating func fail(_ failure: PhoneCoderImageFailure, id: UUID) {
+        guard self.id == id, isBusy, phase != .cancelling else { return }
+        self.failure = failure
+        phase = .failed
+        image = nil
+        resultOperationID = nil
+    }
+    mutating func requestCancellation(_ reason: PhoneCoderImageCancellation) {
+        guard isBusy, phase != .cancelling else { return }
+        cancellation = reason
+        phase = .cancelling
+        image = nil
+    }
+    mutating func finishCancellation(id: UUID) {
+        guard self.id == id, isBusy else { return }
+        cancellation = cancellation ?? .safety
+        phase = .cancelled
+        image = nil
+        resultOperationID = nil
+    }
+    @discardableResult
+    mutating func publish(pngData: Data, id: UUID) -> Bool {
+        guard self.id == id, phase == .finalizing else { return false }
+        guard let decoded = UIImage(data: pngData), let cg = decoded.cgImage, cg.width > 0, cg.height > 0 else {
+            fail(.imageDecode, id: id)
+            return false
+        }
+        image = decoded
+        resultWidth = cg.width
+        resultHeight = cg.height
+        pngByteCount = pngData.count
+        resultOperationID = id
+        phase = .ready
+        return true
+    }
+    func diagnostics(snapshot: PhoneCoderDeviceSnapshot?) -> String {
+        // Fixed allowlist only; never stringify service state or an Error.
+        ["Image diagnostics (local generation)",
+         "Operation: \(id?.uuidString ?? "Unavailable")",
+         "Model: \(modelID ?? "Unavailable")", "Phase: \(phase.rawValue)",
+         "Failure: \(failure?.rawValue ?? "None")", "Cancellation: \(cancellation?.rawValue ?? "None")",
+         "Steps: \(steps.map(String.init) ?? "Unavailable")",
+         "Effective requested edge: \(effectivePixelEdge.map(String.init) ?? "Unavailable")",
+         "Result: \(resultWidth.map(String.init) ?? "Unavailable") × \(resultHeight.map(String.init) ?? "Unavailable")",
+         "PNG bytes: \(pngByteCount.map(String.init) ?? "Unavailable")",
+         snapshot?.diagnostics ?? "Device snapshot: Unavailable"].joined(separator: "\n")
+    }
+}
+
+struct PhoneCoderImageReadiness {
+    enum Action: Equatable { case download, generate, downloading }
+    let title: String
+    let detail: String
+    let memoryFit: String
+    let action: Action
+    init(installed: Bool, downloading: Bool, snapshot: PhoneCoderDeviceSnapshot?, requiredBytes: Int64) {
+        title = installed ? "Downloaded on this phone" : downloading ? "Downloading image model" : "Download an image model"
+        detail = installed ? "Files are on disk. Phone Coder rechecks working memory, temperature and foreground access before generation." : "Download the model before generating locally."
+        action = installed ? .generate : downloading ? .downloading : .download
+        if let bytes = snapshot?.modelHeadroomBytes {
+            memoryFit = bytes >= requiredBytes ? "Estimated memory fit; recheck required before generation" : "Estimated memory is tight; recheck required before generation"
+        } else { memoryFit = "Memory fit unavailable" }
     }
 }

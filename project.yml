@@ -263,6 +263,7 @@ targets:
       - path: IOSLocalLLMTests/PhoneCoderServerControllerTests.swift
       - path: IOSLocalLLMTests/PhoneCoderAPIServerTests.swift
       - path: IOSLocalLLMTests/PhoneCoderViewModelTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderImageGenerationTests.swift
       - path: IOSLocalLLMTests/HighRiskServiceTests.swift
     dependencies:
       - target: PhoneCoder
