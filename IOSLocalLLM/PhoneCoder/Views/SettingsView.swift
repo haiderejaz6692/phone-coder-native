@@ -15,6 +15,8 @@ struct PhoneCoderSettingsView: View {
     @State private var clearConversations = false
     @State private var clearActivity = false
     @State private var loadedModel = "None loaded"
+    private enum Field: Hashable { case port }
+    @FocusState private var focusedField: Field?
     init(services: PhoneCoderServerServices, settings: PhoneCoderSettingsModel,
          chat: PhoneCoderChatModel, controller: PhoneCoderServerController,
          deviceSnapshotProvider: (any PhoneCoderDeviceSnapshotProviding)? = nil) {
@@ -30,6 +32,7 @@ struct PhoneCoderSettingsView: View {
         Form {
             Section("Server") {
                 TextField("Port", text: $port).keyboardType(.numberPad).phoneCoderTarget()
+                    .focused($focusedField, equals: .port).accessibilityIdentifier("phonecoder.settings.port")
                 Button("Apply port") {
                     guard let value = PhoneCoderSettingsModel.validPort(port) else {
                         error = "Use a port from 1024 through 65535."; return
@@ -38,8 +41,9 @@ struct PhoneCoderSettingsView: View {
                         try services.listener.setPort(value)
                         AppSettings.shared.localAPIPort = Int(value)
                         error = nil; notice = "Port saved. Start the server when ready."
+                        focusedField = PhoneCoderKeyboardFocus.afterSubmission(accepted: true, current: focusedField)
                     } catch { self.error = phoneCoderError(error) }
-                }.disabled(controller.servingRequested).phoneCoderTarget()
+                }.disabled(controller.servingRequested).phoneCoderTarget().accessibilityIdentifier("phonecoder.settings.apply-port")
                 Text("Stop the server before changing its port. Your client must use the same port.").font(.footnote).foregroundStyle(.secondary)
                 PhoneCoderInlineError(message: error)
                 if let notice { Text(notice).font(.callout) }
@@ -47,8 +51,8 @@ struct PhoneCoderSettingsView: View {
             Section("Local data") {
                 Toggle("Save local conversation history", isOn: $settings.historyEnabled).phoneCoderTarget()
                 Text("Turning history off keeps the current conversation private from then on and prevents later backfill. Previously saved chats remain until you clear them.").font(.footnote).foregroundStyle(.secondary)
-                Button("Clear conversations", role: .destructive) { clearConversations = true }.phoneCoderTarget()
-                Button("Clear server activity", role: .destructive) { clearActivity = true }.phoneCoderTarget()
+                Button("Clear conversations", role: .destructive) { focusedField = nil; clearConversations = true }.phoneCoderTarget()
+                Button("Clear server activity", role: .destructive) { focusedField = nil; clearActivity = true }.phoneCoderTarget()
             }
             Section("This device") {
                 LabeledContent("Device", value: UIDevice.current.model)
@@ -77,6 +81,8 @@ struct PhoneCoderSettingsView: View {
                 Text("Diagnostics include only build, device and server state. They exclude chat text, model output, clients, addresses and credentials.").font(.footnote).foregroundStyle(.secondary)
             }
         }
+        .scrollDismissesKeyboard(.interactively)
+        .phoneCoderKeyboard($focusedField)
         .task {
             device.refresh()
             port = "\(services.listener.port)"; downloads.refreshStorageStats()

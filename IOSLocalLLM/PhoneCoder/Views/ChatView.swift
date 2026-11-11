@@ -147,6 +147,8 @@ struct PhoneCoderChatView: View {
     @ObservedObject var settings: PhoneCoderSettingsModel
     @ObservedObject private var history = ConversationStore.shared
     @State private var showHistory = false
+    private enum Field: Hashable { case draft }
+    @FocusState private var focusedField: Field?
     let openModels: () -> Void
     var body: some View {
         List {
@@ -177,28 +179,41 @@ struct PhoneCoderChatView: View {
                 if !model.usage.isEmpty { Text(model.usage).font(.caption).foregroundStyle(.secondary) }
                 if model.budgetError != nil {
                     Button("Shorten last input", systemImage: "pencil") { model.shortenLastInput() }.phoneCoderTarget()
-                    Button("Start a new conversation", systemImage: "square.and.pencil") { model.newConversation() }.phoneCoderTarget()
+                    Button("Start a new conversation", systemImage: "square.and.pencil") {
+                        focusedField = nil; model.newConversation()
+                    }.phoneCoderTarget()
                 } else if model.canRetry {
                     Button("Retry last response", systemImage: "arrow.clockwise") { model.retry() }.phoneCoderTarget()
                 }
             }
         }
+        .scrollDismissesKeyboard(.interactively)
+        .phoneCoderKeyboard($focusedField)
         .safeAreaInset(edge: .bottom) {
             HStack(alignment: .bottom) {
                 TextField("Message your local model", text: $model.draft, axis: .vertical)
+                    .focused($focusedField, equals: .draft)
+                    .accessibilityIdentifier("phonecoder.chat.draft")
                     .lineLimit(1...6).textFieldStyle(.roundedBorder).phoneCoderTarget()
                 if model.isGenerating {
                     Button("Stop", systemImage: "stop.fill") { model.stop() }.phoneCoderTarget()
                 } else {
-                    Button("Send", systemImage: "arrow.up.circle.fill") { model.send() }
+                    Button("Send", systemImage: "arrow.up.circle.fill") {
+                        let previousCount = model.messages.count
+                        model.send()
+                        focusedField = PhoneCoderKeyboardFocus.afterSubmission(
+                            accepted: model.messages.count > previousCount, current: focusedField)
+                    }
+                        .accessibilityIdentifier("phonecoder.chat.send")
                         .disabled(model.budgetError != nil || model.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty).phoneCoderTarget()
                 }
             }.padding().background(.regularMaterial)
         }
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                Button("History", systemImage: "clock") { showHistory = true }.disabled(!settings.historyEnabled)
-                Button("New chat", systemImage: "square.and.pencil") { model.newConversation() }
+                Button("History", systemImage: "clock") { focusedField = nil; showHistory = true }
+                    .disabled(!settings.historyEnabled).accessibilityIdentifier("phonecoder.chat.history")
+                Button("New chat", systemImage: "square.and.pencil") { focusedField = nil; model.newConversation() }
             }
         }
         .sheet(isPresented: $showHistory) {
@@ -206,7 +221,7 @@ struct PhoneCoderChatView: View {
                 List(history.conversations) { conversation in
                     Button(conversation.title) { model.open(conversation); showHistory = false }.phoneCoderTarget()
                 }.navigationTitle("Local conversations")
-                    .toolbar { Button("Done") { showHistory = false } }
+                    .toolbar { Button("Done") { showHistory = false }.accessibilityIdentifier("phonecoder.chat.history.done") }
             }
         }
         .task { model.historyEnabled = settings.historyEnabled; await model.refresh() }

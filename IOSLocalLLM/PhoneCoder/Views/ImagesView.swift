@@ -11,6 +11,8 @@ struct PhoneCoderImagesView: View {
     @State private var seed = ""
     @State private var error: String?
     @State private var deleteModel = false
+    private enum Field: Hashable { case prompt, negativePrompt, steps, seed }
+    @FocusState private var focusedField: Field?
 
     var body: some View {
         let operation = service.imageOperation
@@ -46,11 +48,15 @@ struct PhoneCoderImagesView: View {
 
                 Section("Create an image") {
                     TextField("Describe your image", text: $prompt, axis: .vertical).lineLimit(3...10).phoneCoderTarget()
+                        .focused($focusedField, equals: .prompt).accessibilityIdentifier("phonecoder.images.prompt")
                         .disabled(operation.isBusy)
                     DisclosureGroup("Generation options") {
                         TextField("Negative prompt (optional)", text: $negativePrompt, axis: .vertical).phoneCoderTarget()
+                            .focused($focusedField, equals: .negativePrompt).accessibilityIdentifier("phonecoder.images.negative")
                         TextField("Steps (1–100)", text: $steps).keyboardType(.numberPad).phoneCoderTarget()
+                            .focused($focusedField, equals: .steps).accessibilityIdentifier("phonecoder.images.steps")
                         TextField("Seed (empty for random)", text: $seed).keyboardType(.numberPad).phoneCoderTarget()
+                            .focused($focusedField, equals: .seed).accessibilityIdentifier("phonecoder.images.seed")
                     }.disabled(operation.isBusy)
                     if operation.isBusy {
                         if operation.phase == .denoising || operation.phase == .downloading {
@@ -83,9 +89,14 @@ struct PhoneCoderImagesView: View {
                                     let parameters = try PhoneCoderImageParameters(prompt: prompt, steps: steps, seed: seed)
                                     error = nil
                                     device.refresh()
+                                    let previousID = service.imageOperation.id
                                     service.generate(prompt: prompt, negativePrompt: negativePrompt, steps: parameters.steps, seed: parameters.seed)
+                                    focusedField = PhoneCoderKeyboardFocus.afterSubmission(
+                                        accepted: service.imageOperation.id != previousID && service.imageOperation.isBusy,
+                                        current: focusedField)
                                 } catch { self.error = phoneCoderError(error) }
                             }.buttonStyle(.borderedProminent).phoneCoderTarget()
+                                .accessibilityIdentifier("phonecoder.images.generate")
                         }
                     }
                     Text("Images generate on this phone. Text and image models share working memory; you may need to reload your text model afterwards.")
@@ -109,20 +120,22 @@ struct PhoneCoderImagesView: View {
                         ShareLink(item: diagnostics) { Label("Share diagnostics", systemImage: "square.and.arrow.up") }.phoneCoderTarget()
                         Text("Diagnostics include operation and device metadata only.").font(.caption).foregroundStyle(.secondary)
                         if service.isInstalled(service.selectedModel) {
-                            Button("Delete image model", role: .destructive) { deleteModel = true }
+                            Button("Delete image model", role: .destructive) { focusedField = nil; deleteModel = true }
                                 .disabled(operation.isBusy || service.isDownloading(service.selectedModel)).phoneCoderTarget()
                         }
                     }
                 }
             }
+            .scrollDismissesKeyboard(.interactively)
             .onChange(of: operation.resultOperationID) { _, id in
                 if id != nil { withAnimation { scroll.scrollTo("image-result", anchor: .top) } }
             }
         }
+        .phoneCoderKeyboard($focusedField)
         .onAppear { steps = "\(service.selectedModel.defaultSteps)"; device.refresh() }
         .onChange(of: service.imageOperation.phase) { _, _ in device.refresh() }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { service.cancel(reason: .background) }
+            if phase != .active { focusedField = nil; service.cancel(reason: .background) }
             else { device.refresh() }
         }
         .confirmationDialog("Delete the image model download?", isPresented: $deleteModel, titleVisibility: .visible) {

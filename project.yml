@@ -289,6 +289,24 @@ targets:
           - "$(SRCROOT)/ThirdParty/llama.cpp/ggml/include"
           - "$(SRCROOT)/ThirdParty/whisper.cpp/include"
 
+  PhoneCoderUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: IOSLocalLLMUITests/PhoneCoderKeyboardTests.swift
+    dependencies:
+      - target: PhoneCoder
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.haider.phonecoder.uitests
+        TEST_TARGET_NAME: PhoneCoder
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_EMIT_LOC_STRINGS: NO
+        SWIFT_OBJC_BRIDGING_HEADER: ""
+
   # Independent iOS 27/Core AI server product. This deliberately owns a
   # separate bundle and settings namespace while reusing the reference
   # dashboard/API source tree. CORE_AI_SERVER_APP switches only the inference
@@ -413,10 +431,12 @@ schemes:
       targets:
         PhoneCoder: all
         PhoneCoderTests: [test]
+        PhoneCoderUITests: [test]
     test:
       config: Debug
       targets:
         - PhoneCoderTests
+        - PhoneCoderUITests
     archive:
       config: Release
 

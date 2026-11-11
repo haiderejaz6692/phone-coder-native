@@ -119,8 +119,35 @@ struct PhoneCoderInlineError: View {
     }
 }
 
+/// Validation and runtime admission can reject an action. Keep editing in that
+/// case; a queued action releases only this view's focus, never its input values.
+enum PhoneCoderKeyboardFocus {
+    static func afterSubmission<Field>(accepted: Bool, current: Field?) -> Field? {
+        accepted ? nil : current
+    }
+}
+
+private struct PhoneCoderKeyboardModifier<Field: Hashable>: ViewModifier {
+    let focus: FocusState<Field?>.Binding
+    func body(content: Content) -> some View {
+        content
+            .toolbar {
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { focus.wrappedValue = nil }
+                        .accessibilityIdentifier("phonecoder.keyboard.done")
+                        .accessibilityHint("Hide the keyboard and keep your input")
+                }
+            }
+            .onDisappear { focus.wrappedValue = nil }
+    }
+}
+
 extension View {
     func phoneCoderTarget() -> some View { frame(minWidth: 44, minHeight: 44) }
+    func phoneCoderKeyboard<Field: Hashable>(_ focus: FocusState<Field?>.Binding) -> some View {
+        modifier(PhoneCoderKeyboardModifier(focus: focus))
+    }
 }
 
 @MainActor

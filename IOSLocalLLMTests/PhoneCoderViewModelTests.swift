@@ -4,6 +4,42 @@ import Combine
 
 @MainActor
 final class PhoneCoderViewModelTests: XCTestCase {
+    // Losing acceptance detection would dismiss rejected drafts (including the
+    // 1 MiB guard) or leave the keyboard over a successfully queued message.
+    func testChatSubmissionFocusTracksActualAcceptanceWithoutChangingDraftValidation() async throws {
+        let runtime = ViewModelRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        _ = try await coordinator.switchModel(to: "model")
+        let model = PhoneCoderChatModel(coordinator: coordinator, history: ViewModelHistory())
+        for draft in [" \n ", String(repeating: "x", count: 1_048_577), "first line\nsecond line"] {
+            model.draft = draft
+            let count = model.messages.count
+            let task = model.send()
+            let focus = PhoneCoderKeyboardFocus.afterSubmission(accepted: model.messages.count > count, current: "draft")
+            if draft == "first line\nsecond line" {
+                XCTAssertNil(focus)
+                XCTAssertEqual(model.messages.first?.content, "first line\nsecond line")
+                XCTAssertEqual(model.draft, "")
+            } else {
+                XCTAssertEqual(focus, "draft")
+                XCTAssertEqual(model.draft, draft)
+                XCTAssertEqual(model.messages.count, count)
+                if draft.utf8.count > 1_048_576 { XCTAssertNotNil(model.error) }
+            }
+            await task.value
+        }
+    }
+
+    // The same production policy must keep each failed image/port field owned
+    // by its current view. Successful validation alone is not service acceptance.
+    func testRejectedSubmissionKeepsEachFocusedFieldAndAcceptedSubmissionClearsIt() {
+        for field in ["prompt", "negativePrompt", "steps", "seed", "port"] {
+            XCTAssertEqual(PhoneCoderKeyboardFocus.afterSubmission(accepted: false, current: field), field)
+            XCTAssertNil(PhoneCoderKeyboardFocus.afterSubmission(accepted: true, current: field))
+        }
+        XCTAssertNil(PhoneCoderKeyboardFocus.afterSubmission(accepted: false, current: Optional<String>.none))
+    }
+
     // Catches physical RAM being presented as allocatable memory, mixing resident
     // size with phys_footprint, and losing provenance when policy caps headroom.
     func testDeviceSnapshotSeparatesCapacityFootprintCeilingAndHeadroom() {
