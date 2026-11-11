@@ -123,6 +123,69 @@ final class PhoneCoderImageGenerationTests: XCTestCase {
     }
 
     @MainActor
+    func testProductionUnloadCancelsForSafetyAndRetainsReservationUntilDrain() async throws {
+        let service = ImageGenerationService.shared
+        let residency = ModelResidency.shared
+        guard !residency.imageOperationReserved else { return XCTFail("Image test requires an idle shared owner") }
+        // Both calls run in the same main-actor turn. Cancellation is signalled
+        // before runGeneration can enter native work or a download.
+        service.generate(prompt: "cancellation fixture")
+        let id = try XCTUnwrap(service.imageOperation.id)
+        service.unload()
+        XCTAssertEqual(service.imageOperation.cancellation, .safety)
+        XCTAssertEqual(service.imageOperation.phase, .cancelling)
+        XCTAssertTrue(residency.imageOperationReserved)
+        await waitForImageReservationToRetire()
+        XCTAssertEqual(service.imageOperation.id, id)
+        XCTAssertEqual(service.imageOperation.phase, .cancelled)
+        XCTAssertEqual(service.imageOperation.cancellation, .safety)
+        XCTAssertTrue(service.statusMessage.contains("device safety"))
+        XCTAssertTrue(service.imageOperation.diagnostics(snapshot: nil).contains("Cancellation: safety"))
+        XCTAssertNil(service.image)
+    }
+
+    @MainActor
+    func testProductionBackgroundCancelRetainsOriginWhenUserCancelArrivesDuringDrain() async throws {
+        let service = ImageGenerationService.shared
+        guard !ModelResidency.shared.imageOperationReserved else { return XCTFail("Image test requires an idle shared owner") }
+        service.generate(prompt: "cancellation fixture")
+        service.cancel(reason: .background)
+        service.cancel()
+        XCTAssertEqual(service.imageOperation.cancellation, .background)
+        XCTAssertTrue(ModelResidency.shared.imageOperationReserved)
+        await waitForImageReservationToRetire()
+        XCTAssertEqual(service.imageOperation.phase, .cancelled)
+        XCTAssertEqual(service.imageOperation.cancellation, .background)
+        XCTAssertTrue(service.statusMessage.contains("background"))
+        XCTAssertNil(service.image)
+    }
+
+    @MainActor
+    func testProductionUserCancelRetainsOriginWhenSafetyUnloadArrivesDuringDrain() async throws {
+        let service = ImageGenerationService.shared
+        guard !ModelResidency.shared.imageOperationReserved else { return XCTFail("Image test requires an idle shared owner") }
+        service.generate(prompt: "cancellation fixture")
+        service.cancel()
+        service.unload()
+        XCTAssertEqual(service.imageOperation.cancellation, .user)
+        XCTAssertTrue(ModelResidency.shared.imageOperationReserved)
+        await waitForImageReservationToRetire()
+        XCTAssertEqual(service.imageOperation.phase, .cancelled)
+        XCTAssertEqual(service.imageOperation.cancellation, .user)
+        XCTAssertEqual(service.statusMessage, "Generation stopped. You can retry.")
+        XCTAssertNil(service.image)
+    }
+
+    @MainActor
+    private func waitForImageReservationToRetire() async {
+        for _ in 0..<100 {
+            if !ModelResidency.shared.imageOperationReserved { return }
+            await Task.yield()
+        }
+        XCTFail("Cancelled image operation did not retire its reservation")
+    }
+
+    @MainActor
     func testKnownErrorsMapWithoutRawExceptionText() {
         XCTAssertEqual(PhoneCoderImageFailure.category(for: NSError(domain: "ImageGen", code: -3)), .memory)
         XCTAssertEqual(PhoneCoderImageFailure.category(for: NSError(domain: "ImageGen", code: -2)), .residency)

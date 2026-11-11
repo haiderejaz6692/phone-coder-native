@@ -145,7 +145,7 @@ final class LifecycleController: Sendable {
         // so the next token-iteration sees it and unwinds.
         CodingAssistantService.shared.stopGeneration()
         FastVLMService.shared.stopGeneration()
-        ImageGenerationService.shared.cancel()
+        ImageGenerationService.shared.cancel(reason: .background)
         MLXVisionService.shared.cancelCurrentInference()
 
         guard epoch == lifecycleEpoch else { return }

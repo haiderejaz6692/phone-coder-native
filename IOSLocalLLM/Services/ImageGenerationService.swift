@@ -889,8 +889,8 @@ final class ImageGenerationService: ObservableObject {
     /// Cancel this image operation (keeps weights on disk). The single-use
     /// diffusion container and reservation remain owned until native work
     /// drains; readiness cannot be published by the unload caller.
-    func unload() {
-        cancel()
+    func unload(reason: PhoneCoderImageCancellation = .safety) {
+        cancel(reason: reason)
     }
 
     // MARK: - Crash-aware adaptive sizing
