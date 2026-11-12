@@ -38,7 +38,7 @@ final class PhoneCoderKeyboardTests: XCTestCase {
         // acceptance here means the user message was queued, not inference success.
     }
 
-    func testHistorySheetAndTabTransitionsReleaseChatFocusWithoutErasingDraft() throws {
+    func testHistorySheetAndReachableTabTransitionsPreserveDraft() throws {
         open("Chat")
         let draft = input("phonecoder.chat.draft")
         draft.tap()
@@ -51,6 +51,9 @@ final class PhoneCoderKeyboardTests: XCTestCase {
         assertKeyboardHidden()
         XCTAssertEqual(draft.value as? String, "keep this draft")
         draft.tap()
+        // The native keyboard covers the dock. Done is the visible escape
+        // route; a tap on an obscured tab cannot exercise view disappearance.
+        hideKeyboard()
         open("Models")
         assertKeyboardHidden()
         open("Chat")
@@ -151,39 +154,66 @@ final class PhoneCoderKeyboardTests: XCTestCase {
     func testSettingsScrollDismissesNumberPadWithoutApplyingInput() {
         open("Settings")
         let port = input("phonecoder.settings.port")
+        let original = port.value as? String
         replace(port, with: "12345")
         let keyboard = app.keyboards.firstMatch
         XCTAssertTrue(keyboard.waitForExistence(timeout: 3))
-        // Start in the scrollable content immediately above the live keyboard,
-        // then pull down through it. Screen Y increases toward the bottom.
-        let start = keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0))
-            .withOffset(CGVector(dx: 0, dy: -48))
-        let end = keyboard.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.8))
+        // SwiftUI Form is a collection view on the pinned iOS simulator.
+        // Keep both endpoints in visible Form content, clear of the keyboard
+        // accessory, so the Form owns the downward interactive dismissal.
+        let form = app.collectionViews.firstMatch
+        XCTAssertTrue(form.waitForExistence(timeout: 3))
+        let contentTop = max(form.frame.minY, app.navigationBars.firstMatch.frame.maxY) + 24
+        let contentBottom = min(form.frame.maxY, keyboard.frame.minY - 80)
+        XCTAssertGreaterThan(contentBottom - contentTop, 120, "Need visible Form content for a downward drag")
+        let origin = form.coordinate(withNormalizedOffset: .zero)
+        let x = form.frame.width * 0.85
+        let start = origin.withOffset(CGVector(dx: x, dy: contentTop - form.frame.minY))
+        let end = origin.withOffset(CGVector(dx: x, dy: contentBottom - form.frame.minY))
         start.press(forDuration: 0.05, thenDragTo: end)
         assertKeyboardHidden()
         // Return to the top without tapping Apply.
         for _ in 0..<3 where !port.isHittable { app.swipeDown() }
         XCTAssertEqual(port.value as? String, "12345")
+        // Dismissal must not apply the edited port. Relaunch reads the saved
+        // listener port through the normal app path, without tapping Apply.
+        app.terminate()
+        app.launch()
+        open("Settings")
+        XCTAssertEqual(input("phonecoder.settings.port").value as? String, original)
     }
 
-    func testTabChangesReleaseImageAndPortFocus() {
+    func testDoneThenReachableTabChangesPreserveImageAndPortInput() {
         open("Images")
         let prompt = input("phonecoder.images.prompt")
         prompt.tap(); prompt.typeText("keep image prompt")
+        hideKeyboard()
         open("Server")
         assertKeyboardHidden()
         open("Images")
         assertKeyboardHidden()
         XCTAssertEqual(prompt.value as? String, "keep image prompt")
         open("Settings")
-        input("phonecoder.settings.port").tap()
+        let port = input("phonecoder.settings.port")
+        let original = port.value as? String
+        port.tap()
+        hideKeyboard()
+        XCTAssertEqual(port.value as? String, original)
         open("Server")
         assertKeyboardHidden()
         open("Settings")
         assertKeyboardHidden()
+        XCTAssertEqual(port.value as? String, original)
     }
 
-    private func open(_ tab: String) { app.tabBars.buttons[tab].tap() }
+    private func open(_ tab: String) {
+        let button = app.tabBars.buttons[tab]
+        XCTAssertTrue(button.waitForExistence(timeout: 5), tab)
+        XCTAssertTrue(button.isHittable, "Dismiss the keyboard before opening " + tab)
+        button.tap()
+        let selected = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in button.isSelected }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [selected], timeout: 3), .completed, "Tab transition must select " + tab)
+    }
     private func input(_ id: String) -> XCUIElement {
         let field = app.descendants(matching: .any)[id].firstMatch
         XCTAssertTrue(field.waitForExistence(timeout: 5), id)

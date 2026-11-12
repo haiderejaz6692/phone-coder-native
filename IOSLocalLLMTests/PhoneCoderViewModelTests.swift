@@ -64,6 +64,52 @@ final class PhoneCoderViewModelTests: XCTestCase {
         }
     }
 
+    // Characterize the real shared modifier on an actual hosted tab transition.
+    // Programmatic selection reaches disappearance while a field is focused;
+    // tapping the production dock cannot do that when a keyboard covers it.
+    func testTabDisappearanceClearsFocusedFieldWithoutChangingInput() async throws {
+        let scene = try XCTUnwrap(UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first)
+        for field in ["draft", "prompt", "negativePrompt", "steps", "seed", "port"] {
+            let probe = KeyboardLifecycleProbe()
+            let appeared = expectation(description: field + " appeared")
+            let focused = expectation(description: field + " focused")
+            let disappeared = expectation(description: field + " disappeared")
+            probe.onAppear = { appeared.fulfill() }
+            probe.onFocus = { if $0 == field { focused.fulfill() } }
+            probe.onDisappear = { disappeared.fulfill() }
+            let previousWindow = scene.windows.first { $0.isKeyWindow }
+            let window = UIWindow(windowScene: scene)
+            window.rootViewController = UIHostingController(rootView: KeyboardLifecycleTabs(probe: probe, field: field))
+            window.makeKeyAndVisible()
+            defer {
+                window.isHidden = true
+                window.rootViewController = nil
+                previousWindow?.makeKeyAndVisible()
+            }
+            await fulfillment(of: [appeared], timeout: 3)
+            probe.onAppear = nil
+            let focus = try XCTUnwrap(probe.focus)
+            focus.wrappedValue = field
+            await fulfillment(of: [focused], timeout: 3)
+            XCTAssertEqual(focus.wrappedValue, field)
+            probe.selection = 1
+            await fulfillment(of: [disappeared], timeout: 3)
+            probe.onDisappear = nil
+            XCTAssertEqual(probe.selection, 1)
+            XCTAssertEqual(probe.disappearances, 1)
+            XCTAssertNil(focus.wrappedValue)
+            XCTAssertEqual(probe.text, "keep this input")
+
+            let returned = expectation(description: field + " returned")
+            probe.onAppear = { returned.fulfill() }
+            probe.selection = 0
+            await fulfillment(of: [returned], timeout: 3)
+            probe.onAppear = nil
+            XCTAssertNil(probe.focus?.wrappedValue)
+            XCTAssertEqual(probe.text, "keep this input")
+        }
+    }
+
     // The same production policy must keep each failed image/port field owned
     // by its current view. Successful validation alone is not service acceptance.
     func testRejectedSubmissionKeepsEachFocusedFieldAndAcceptedSubmissionClearsIt() {
@@ -551,6 +597,51 @@ final class PhoneCoderViewModelTests: XCTestCase {
     // all five native tabs in light/dark, accessibility XXXL, Arabic RTL,
     // landscape, Reduce Motion and VoiceOver. Exercise 80-character client
     // names and 200-character model names; no fixed row height or truncation.
+}
+
+// Test-only lifecycle controls; production owns the actual focus and dismissal.
+@MainActor
+private final class KeyboardLifecycleProbe: ObservableObject {
+    @Published var selection = 0
+    @Published var text = "keep this input"
+    var focus: FocusState<String?>.Binding?
+    var disappearances = 0
+    var onAppear: (() -> Void)?
+    var onFocus: ((String?) -> Void)?
+    var onDisappear: (() -> Void)?
+}
+
+private struct KeyboardLifecycleTabs: View {
+    @ObservedObject var probe: KeyboardLifecycleProbe
+    let field: String
+    var body: some View {
+        TabView(selection: $probe.selection) {
+            KeyboardLifecycleInput(probe: probe, field: field)
+                .tabItem { Text("Input") }.tag(0)
+            Text("Other tab").tabItem { Text("Other") }.tag(1)
+        }
+    }
+}
+
+private struct KeyboardLifecycleInput: View {
+    @ObservedObject var probe: KeyboardLifecycleProbe
+    let field: String
+    @FocusState private var focusedField: String?
+    var body: some View {
+        Form {
+            TextField("Input", text: $probe.text).focused($focusedField, equals: field)
+        }
+        .phoneCoderKeyboard($focusedField)
+        .onAppear {
+            probe.focus = $focusedField
+            probe.onAppear?()
+        }
+        .onChange(of: focusedField) { _, value in probe.onFocus?(value) }
+        .onDisappear {
+            probe.disappearances += 1
+            probe.onDisappear?()
+        }
+    }
 }
 
 @MainActor
