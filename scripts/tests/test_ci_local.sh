@@ -36,6 +36,8 @@ make_fixture() {
     scripts/tests/test_validate_phone_coder_workflows.sh \
     scripts/tests/test_build_native_frameworks.sh \
     scripts/tests/test_prepare_metal_toolchain_for_codeql.sh \
+    scripts/tests/test_resolve_simulator_udid.sh \
+    scripts/tests/test_run_with_timeout.sh \
     scripts/tests/test_prepare_unsigned_archive.sh \
     scripts/tests/test_package_unsigned_ipa.sh \
     scripts/validate_dco.sh; do
@@ -98,6 +100,8 @@ test_validate_open_source.sh
 test_validate_phone_coder_workflows.sh
 test_build_native_frameworks.sh
 test_prepare_metal_toolchain_for_codeql.sh
+test_resolve_simulator_udid.sh
+test_run_with_timeout.sh
 test_prepare_unsigned_archive.sh
 test_package_unsigned_ipa.sh
 validate_dco.sh	$(git -C "$success_fixture" rev-parse refs/remotes/origin/main)	$(git -C "$success_fixture" rev-parse HEAD)

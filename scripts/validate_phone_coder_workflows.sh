@@ -159,6 +159,8 @@ try:
              "bash scripts/tests/test_validate_open_source.sh",
              "bash scripts/tests/test_build_native_frameworks.sh",
              "bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh",
+             "bash scripts/tests/test_resolve_simulator_udid.sh",
+             "bash scripts/tests/test_run_with_timeout.sh",
              "bash scripts/tests/test_prepare_unsigned_archive.sh",
              "bash scripts/tests/test_package_unsigned_ipa.sh",
              "swift test --package-path Packages/VoiceAgentOrb"):
@@ -178,11 +180,68 @@ try:
              "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved")
     executes("dependencies", "xcodebuild -resolvePackageDependencies", "-onlyUsePackageVersionsFromResolvedFile")
     for step_id, command in (("dependencies", "xcodebuild -resolvePackageDependencies"),
-                             ("unit-tests", "xcodebuild test"), ("archive", "xcodebuild archive")):
+                             ("archive", "xcodebuild archive")):
         executes(step_id, command, "-workspace", "PhoneCoder.xcworkspace", "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO")
-    executes("unit-tests", "xcodebuild test", "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1",
-             "-resultBundlePath", "$RUNNER_TEMP/PhoneCoderTests.xcresult",
-             "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile")
+    executes("unit-tests", "trap", "diagnose_simulator", "EXIT")
+    unit_test_commands = command_lines("unit-tests")
+
+    def invokes_bounded(words, seconds, command, *arguments):
+        prefix = ["python3", "scripts/run_with_timeout.py", "--timeout-seconds", seconds, "--"]
+        command_prefix = shlex.split(command)
+        return (words[:len(prefix)] == prefix
+                and words[len(prefix):len(prefix) + len(command_prefix)] == command_prefix
+                and all(argument in words for argument in arguments)
+                and not any(re.fullmatch(r"[;&|]+", word) for word in words))
+
+    bounded_runtime_inventory = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl list runtimes", "-j", "$simulator_runtimes")), None)
+    require(bounded_runtime_inventory is not None,
+            "unit-tests must bound simulator runtime inventory to 60 seconds")
+    bounded_device_inventory = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl list devices", "available", "-j", "$simulator_inventory")), None)
+    require(bounded_device_inventory is not None,
+            "unit-tests must bound simulator device inventory to 60 seconds")
+    bounded_shutdown = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl shutdown all")), None)
+    require(bounded_shutdown is not None,
+            "unit-tests must bound stale simulator shutdown to 60 seconds")
+    bounded_launch = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl boot", "$SIMULATOR_UDID")), None)
+    require(bounded_launch is not None,
+            "unit-tests must bound pinned simulator boot launch to 60 seconds")
+    bounded_boot = next((words for words in unit_test_commands if invokes_bounded(
+        words, "300", "xcrun simctl bootstatus", "$SIMULATOR_UDID", "-b")), None)
+    require(bounded_boot is not None,
+            "unit-tests must bound pinned simulator boot readiness to 300 seconds")
+    bounded_diagnostic_boot = next((words for words in unit_test_commands if invokes_bounded(
+        words, "20", "xcrun simctl bootstatus", "$SIMULATOR_UDID")), None)
+    require(bounded_diagnostic_boot is not None,
+            "unit-tests must bound failure-path simulator diagnostics to 20 seconds")
+    bounded_diagnostic_list = next((words for words in unit_test_commands if invokes_bounded(
+        words, "20", "xcrun simctl list devices")), None)
+    require(bounded_diagnostic_list is not None,
+            "unit-tests must bound failure-path simulator inventory to 20 seconds")
+    bounded_test = next((words for words in unit_test_commands if invokes_bounded(
+        words, "4200", "xcodebuild test", "-workspace", "PhoneCoder.xcworkspace",
+        "-scheme", "PhoneCoder", "platform=iOS Simulator,id=$SIMULATOR_UDID",
+        "-resultBundlePath", "$RUNNER_TEMP/PhoneCoderTests.xcresult",
+        "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile",
+        "CODE_SIGNING_ALLOWED=NO")), None)
+    require(bounded_test is not None,
+            "unit-tests must execute the pinned simulator test through the 4200-second bound")
+    unit_test_text = script("unit-tests")
+    require('SIMULATOR_UDID="$(python3 scripts/resolve_simulator_udid.py' in unit_test_text
+            and '--runtimes "$simulator_runtimes"' in unit_test_text
+            and '--devices "$simulator_inventory"' in unit_test_text
+            and "--version 26.0.1 --name 'iPhone 17 Pro')\"" in unit_test_text,
+            "unit-tests must execute the exact runtime/device resolver into SIMULATOR_UDID")
+    require("trap diagnose_simulator EXIT" in unit_test_text
+            and "set +e" in unit_test_text
+            and unit_test_text.count("xcrun simctl list devices") == 2
+            and unit_test_text.count('xcrun simctl bootstatus "$SIMULATOR_UDID"') == 2
+            and re.search(r"(?m)^\s*ps -axo pid,etime,comm \| grep -E ", unit_test_text)
+            and "[t]estmanagerd" in unit_test_text,
+            "unit-tests must report bounded simulator diagnostics on failure")
     executes("archive", "xcodebuild archive", "generic/platform=iOS", "-configuration", "Release",
              "-archivePath", "$RUNNER_TEMP/PhoneCoder.xcarchive",
              "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile")

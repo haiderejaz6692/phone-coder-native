@@ -165,6 +165,8 @@ run_step "workflow mutation regressions" bash scripts/tests/test_validate_phone_
 run_step "native framework orchestration regressions" bash scripts/tests/test_build_native_frameworks.sh
 run_step "CodeQL Metal preparation regressions" \
   bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh
+run_step "simulator resolver regressions" bash scripts/tests/test_resolve_simulator_udid.sh
+run_step "bounded command runner regressions" bash scripts/tests/test_run_with_timeout.sh
 run_step "unsigned archive preparation regressions" \
   bash scripts/tests/test_prepare_unsigned_archive.sh
 run_step "unsigned IPA security regressions" bash scripts/tests/test_package_unsigned_ipa.sh

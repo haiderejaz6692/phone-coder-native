@@ -30,7 +30,27 @@ mutations = [
     ("commented IPA verifier", "package", "bash scripts/verify_unsigned_ipa.sh", "# bash scripts/verify_unsigned_ipa.sh"),
     ("commented Swift package tests", "repository-tests", "swift test --package-path Packages/VoiceAgentOrb", "# swift test --package-path Packages/VoiceAgentOrb"),
     ("commented CodeQL Metal preparation tests", "repository-tests", "bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh", "# bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh"),
+    ("commented simulator resolver tests", "repository-tests", "bash scripts/tests/test_resolve_simulator_udid.sh", "# bash scripts/tests/test_resolve_simulator_udid.sh"),
+    ("commented bounded runner tests", "repository-tests", "bash scripts/tests/test_run_with_timeout.sh", "# bash scripts/tests/test_run_with_timeout.sh"),
     ("echoed XCTest command", "unit-tests", "xcodebuild test", "echo xcodebuild test"),
+    ("skipped simulator inventory", "unit-tests", 'xcrun simctl list devices available -j', 'echo xcrun simctl list devices available -j'),
+    ("skipped simulator runtime inventory", "unit-tests", "xcrun simctl list runtimes -j", "echo xcrun simctl list runtimes -j"),
+    ("skipped exact simulator resolver", "unit-tests", "python3 scripts/resolve_simulator_udid.py", "echo python3 scripts/resolve_simulator_udid.py"),
+    ("weakened exact simulator version", "unit-tests", "--version 26.0.1", "--version 26.0"),
+    ("skipped simulator shutdown", "unit-tests", "xcrun simctl shutdown all", "echo xcrun simctl shutdown all"),
+    ("skipped pinned simulator boot", "unit-tests", 'xcrun simctl boot "$SIMULATOR_UDID"', 'echo xcrun simctl boot "$SIMULATOR_UDID"'),
+    ("removed runtime inventory deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl list runtimes -j", "xcrun simctl list runtimes -j"),
+    ("removed device inventory deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl list devices available -j", "xcrun simctl list devices available -j"),
+    ("removed simulator shutdown deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl shutdown all", "xcrun simctl shutdown all"),
+    ("removed simulator launch deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl boot \"$SIMULATOR_UDID\"", "xcrun simctl boot \"$SIMULATOR_UDID\""),
+    ("removed simulator boot deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 300 --", "python3 scripts/run_with_timeout.py --timeout-seconds 9999 --"),
+    ("removed diagnostic inventory deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 20 -- \\\n      xcrun simctl list devices", "xcrun simctl list devices"),
+    ("removed diagnostic boot deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 20 -- \\\n        xcrun simctl bootstatus \"$SIMULATOR_UDID\"", "xcrun simctl bootstatus \"$SIMULATOR_UDID\""),
+    ("skipped pinned simulator boot wait", "unit-tests", 'xcrun simctl bootstatus "$SIMULATOR_UDID" -b', 'echo xcrun simctl bootstatus "$SIMULATOR_UDID" -b'),
+    ("removed simulator test deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 4200 --", "python3 scripts/run_with_timeout.py --timeout-seconds 9999 --"),
+    ("reverted simulator destination to a name", "unit-tests", 'platform=iOS Simulator,id=$SIMULATOR_UDID', "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1"),
+    ("disabled simulator failure diagnostics", "unit-tests", "trap diagnose_simulator EXIT", "true # trap diagnose_simulator EXIT"),
+    ("removed safe simulator process snapshot", "unit-tests", "ps -axo pid,etime,comm", "echo ps -axo pid,etime,comm"),
     ("printed IPA verifier", "package", "bash scripts/verify_unsigned_ipa.sh", "printf '%s\\n' 'bash scripts/verify_unsigned_ipa.sh'"),
     ("multiline quoted test text", "repository-tests", "swift test --package-path Packages/VoiceAgentOrb", "printf '%s\\n' 'example:\nswift test --package-path Packages/VoiceAgentOrb\n'"),
     ("heredoc verifier text", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<'EXAMPLE'\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
@@ -68,6 +88,37 @@ with tempfile.TemporaryDirectory() as temporary:
     baseline = validate(original)
     assert baseline.returncode == 0, baseline.stdout + baseline.stderr
     print("PASS: unchanged workflow is accepted")
+    unit_test_script = next(
+        step["run"] for step in original["jobs"]["phone-coder-ios"]["steps"]
+        if step["id"] == "unit-tests"
+    )
+    simulator_reliability_contract = {
+        'xcrun simctl list devices available -j': 1,
+        'xcrun simctl list runtimes -j': 1,
+        'python3 scripts/resolve_simulator_udid.py': 1,
+        '--version 26.0.1': 1,
+        'xcrun simctl shutdown all': 1,
+        'xcrun simctl boot "$SIMULATOR_UDID"': 1,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 300 --': 1,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 60 --': 4,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 20 --': 2,
+        'xcrun simctl bootstatus "$SIMULATOR_UDID" -b': 1,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 4200 --': 1,
+        "platform=iOS Simulator,id=$SIMULATOR_UDID": 1,
+        'xcrun simctl list devices': 2,
+        'ps -axo pid,etime,comm': 1,
+        '[t]estmanagerd': 1,
+    }
+    missing_reliability_commands = [
+        command for command, count in simulator_reliability_contract.items()
+        if unit_test_script.count(command) != count
+    ]
+    if missing_reliability_commands:
+        failures.extend(f"missing simulator reliability command: {command}"
+                        for command in missing_reliability_commands)
+        print("FAIL: workflow lacks explicit simulator preflight, timeout, or diagnostics")
+    else:
+        print("PASS: workflow has explicit simulator preflight, timeout, and diagnostics")
     local_gate_test = "bash scripts/tests/test_ci_local.sh"
     repository_test_script = next(
         step["run"] for step in original["jobs"]["phone-coder-ios"]["steps"]

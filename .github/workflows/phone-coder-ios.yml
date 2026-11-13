@@ -65,6 +65,8 @@ jobs:
           bash scripts/tests/test_validate_open_source.sh
           bash scripts/tests/test_build_native_frameworks.sh
           bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh
+          bash scripts/tests/test_resolve_simulator_udid.sh
+          bash scripts/tests/test_run_with_timeout.sh
           bash scripts/tests/test_prepare_unsigned_archive.sh
           bash scripts/tests/test_package_unsigned_ipa.sh
           swift test --package-path Packages/VoiceAgentOrb
@@ -98,10 +100,45 @@ jobs:
         id: unit-tests
         run: |
           set -euo pipefail
-          xcodebuild test \
+          SIMULATOR_UDID=""
+          diagnose_simulator() {
+            status=$?
+            trap - EXIT
+            if [[ "$status" -ne 0 ]]; then
+              set +e
+              echo "::group::Pinned simulator diagnostics"
+              python3 scripts/run_with_timeout.py --timeout-seconds 20 -- \
+                xcrun simctl list devices
+              if [[ -n "$SIMULATOR_UDID" ]]; then
+                python3 scripts/run_with_timeout.py --timeout-seconds 20 -- \
+                  xcrun simctl bootstatus "$SIMULATOR_UDID"
+              fi
+              ps -axo pid,etime,comm | grep -E '[C]oreSimulator|[S]imulator|[t]estmanagerd|[x]codebuild|[x]ctest'
+              echo "::endgroup::"
+            fi
+            exit "$status"
+          }
+          trap diagnose_simulator EXIT
+          simulator_runtimes="$RUNNER_TEMP/PhoneCoderSimulatorRuntimes.json"
+          simulator_inventory="$RUNNER_TEMP/PhoneCoderSimulatorDevices.json"
+          python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \
+            xcrun simctl list runtimes -j > "$simulator_runtimes"
+          python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \
+            xcrun simctl list devices available -j > "$simulator_inventory"
+          SIMULATOR_UDID="$(python3 scripts/resolve_simulator_udid.py \
+            --runtimes "$simulator_runtimes" --devices "$simulator_inventory" \
+            --version 26.0.1 --name 'iPhone 17 Pro')"
+          python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \
+            xcrun simctl shutdown all
+          python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \
+            xcrun simctl boot "$SIMULATOR_UDID"
+          python3 scripts/run_with_timeout.py --timeout-seconds 300 -- \
+            xcrun simctl bootstatus "$SIMULATOR_UDID" -b
+          python3 scripts/run_with_timeout.py --timeout-seconds 4200 -- \
+            xcodebuild test \
             -workspace PhoneCoder.xcworkspace -scheme PhoneCoder \
             -configuration Debug \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1' \
+            -destination "platform=iOS Simulator,id=$SIMULATOR_UDID" \
             -derivedDataPath "$RUNNER_TEMP/PhoneCoder-TestDerivedData" \
             -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-SourcePackages" \
             -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
