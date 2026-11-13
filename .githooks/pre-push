@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Opt-in local CI gate. Enable with: git config core.hooksPath .githooks
+set -euo pipefail
+
+repository_root="$(git rev-parse --show-toplevel)"
+head_sha="$(git -C "$repository_root" rev-parse 'HEAD^{commit}')"
+zero_sha="0000000000000000000000000000000000000000"
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  if [[ -z "${local_ref:-}" || -z "${local_sha:-}" ||
+        -z "${remote_ref:-}" || -z "${remote_sha:-}" ]]; then
+    echo "error: malformed pre-push ref record" >&2
+    exit 1
+  fi
+  if [[ "$local_sha" == "$zero_sha" ]]; then
+    continue
+  fi
+  if ! pushed_commit="$(git -C "$repository_root" rev-parse --verify \
+      "$local_sha^{commit}" 2>/dev/null)"; then
+    echo "error: pre-push hook cannot validate non-commit ref $local_ref" >&2
+    exit 1
+  fi
+  if [[ "$pushed_commit" != "$head_sha" ]]; then
+    echo "error: pre-push hook refuses a commit other than checked-out HEAD" >&2
+    echo "Ref $local_ref resolves to $pushed_commit; HEAD is $head_sha." >&2
+    echo "Check out that branch and run its local gate before pushing it." >&2
+    exit 1
+  fi
+done
+
+exec "$repository_root/scripts/ci_local.sh"

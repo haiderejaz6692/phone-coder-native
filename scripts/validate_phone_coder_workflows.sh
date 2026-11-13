@@ -5,6 +5,7 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python3 - "$repository_root" <<'PY'
 from pathlib import Path
+import hashlib
 import re
 import shlex
 import sys
@@ -44,6 +45,8 @@ try:
     workflow = read_workflow(workflow_path)
     require(set(workflow["on"]) == {"push", "pull_request", "workflow_dispatch"},
             "build must use ordinary push/PR/manual events only")
+    require(workflow["on"]["push"]["branches"] == ["main"],
+            "feature branches must build through pull requests, not a reserved prefix")
     require(workflow["permissions"] == {"contents": "read"}, "build permissions must be read-only")
     require(set(workflow["jobs"]) == {"phone-coder-ios"}, "expected one Phone Coder build job")
     job = workflow["jobs"]["phone-coder-ios"]
@@ -146,13 +149,19 @@ try:
         require(invokes(command_lines(step_id), command, *arguments), f"{step_id} must execute {command}")
 
     executes("tools", "xcodebuild -version")
+    executes("tools", "xcodebuild -downloadComponent MetalToolchain")
     executes("tools", "xcodegen --version")
     contains_text("tools", "17A400", "PyYAML==6.0.3")
     for command in ("bash scripts/validate_open_source.sh",
              "bash scripts/validate_phone_coder_workflows.sh",
+             "bash scripts/tests/test_ci_local.sh",
              "bash scripts/tests/test_validate_phone_coder_workflows.sh",
              "bash scripts/tests/test_validate_open_source.sh",
              "bash scripts/tests/test_build_native_frameworks.sh",
+             "bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh",
+             "bash scripts/tests/test_resolve_simulator_udid.sh",
+             "bash scripts/tests/test_run_with_timeout.sh",
+             "bash scripts/tests/test_prepare_unsigned_archive.sh",
              "bash scripts/tests/test_package_unsigned_ipa.sh",
              "swift test --package-path Packages/VoiceAgentOrb"):
         executes("repository-tests", command)
@@ -166,20 +175,78 @@ try:
             and any(invokes([words], "df -h") for words in native[build_index + 1:]),
             "native compilation must report disk space before and after")
     executes("dependencies", "xcodegen generate")
-    executes("dependencies", "pod install")
+    executes("dependencies", "pod install --deployment")
     executes("dependencies", "cp", "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
              "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved")
     executes("dependencies", "xcodebuild -resolvePackageDependencies", "-onlyUsePackageVersionsFromResolvedFile")
     for step_id, command in (("dependencies", "xcodebuild -resolvePackageDependencies"),
-                             ("unit-tests", "xcodebuild test"), ("archive", "xcodebuild archive")):
+                             ("archive", "xcodebuild archive")):
         executes(step_id, command, "-workspace", "PhoneCoder.xcworkspace", "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO")
-    executes("unit-tests", "xcodebuild test", "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1",
-             "-resultBundlePath", "$RUNNER_TEMP/PhoneCoderTests.xcresult",
-             "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile")
+    executes("unit-tests", "trap", "diagnose_simulator", "EXIT")
+    unit_test_commands = command_lines("unit-tests")
+
+    def invokes_bounded(words, seconds, command, *arguments):
+        prefix = ["python3", "scripts/run_with_timeout.py", "--timeout-seconds", seconds, "--"]
+        command_prefix = shlex.split(command)
+        return (words[:len(prefix)] == prefix
+                and words[len(prefix):len(prefix) + len(command_prefix)] == command_prefix
+                and all(argument in words for argument in arguments)
+                and not any(re.fullmatch(r"[;&|]+", word) for word in words))
+
+    bounded_runtime_inventory = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl list runtimes", "-j", "$simulator_runtimes")), None)
+    require(bounded_runtime_inventory is not None,
+            "unit-tests must bound simulator runtime inventory to 60 seconds")
+    bounded_device_inventory = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl list devices", "available", "-j", "$simulator_inventory")), None)
+    require(bounded_device_inventory is not None,
+            "unit-tests must bound simulator device inventory to 60 seconds")
+    bounded_shutdown = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl shutdown all")), None)
+    require(bounded_shutdown is not None,
+            "unit-tests must bound stale simulator shutdown to 60 seconds")
+    bounded_launch = next((words for words in unit_test_commands if invokes_bounded(
+        words, "60", "xcrun simctl boot", "$SIMULATOR_UDID")), None)
+    require(bounded_launch is not None,
+            "unit-tests must bound pinned simulator boot launch to 60 seconds")
+    bounded_boot = next((words for words in unit_test_commands if invokes_bounded(
+        words, "300", "xcrun simctl bootstatus", "$SIMULATOR_UDID", "-b")), None)
+    require(bounded_boot is not None,
+            "unit-tests must bound pinned simulator boot readiness to 300 seconds")
+    bounded_diagnostic_boot = next((words for words in unit_test_commands if invokes_bounded(
+        words, "20", "xcrun simctl bootstatus", "$SIMULATOR_UDID")), None)
+    require(bounded_diagnostic_boot is not None,
+            "unit-tests must bound failure-path simulator diagnostics to 20 seconds")
+    bounded_diagnostic_list = next((words for words in unit_test_commands if invokes_bounded(
+        words, "20", "xcrun simctl list devices")), None)
+    require(bounded_diagnostic_list is not None,
+            "unit-tests must bound failure-path simulator inventory to 20 seconds")
+    bounded_test = next((words for words in unit_test_commands if invokes_bounded(
+        words, "4200", "xcodebuild test", "-workspace", "PhoneCoder.xcworkspace",
+        "-scheme", "PhoneCoder", "platform=iOS Simulator,id=$SIMULATOR_UDID",
+        "-resultBundlePath", "$RUNNER_TEMP/PhoneCoderTests.xcresult",
+        "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile",
+        "CODE_SIGNING_ALLOWED=NO")), None)
+    require(bounded_test is not None,
+            "unit-tests must execute the pinned simulator test through the 4200-second bound")
+    unit_test_text = script("unit-tests")
+    require('SIMULATOR_UDID="$(python3 scripts/resolve_simulator_udid.py' in unit_test_text
+            and '--runtimes "$simulator_runtimes"' in unit_test_text
+            and '--devices "$simulator_inventory"' in unit_test_text
+            and "--version 26.0.1 --name 'iPhone 17 Pro')\"" in unit_test_text,
+            "unit-tests must execute the exact runtime/device resolver into SIMULATOR_UDID")
+    require("trap diagnose_simulator EXIT" in unit_test_text
+            and "set +e" in unit_test_text
+            and unit_test_text.count("xcrun simctl list devices") == 2
+            and unit_test_text.count('xcrun simctl bootstatus "$SIMULATOR_UDID"') == 2
+            and re.search(r"(?m)^\s*ps -axo pid,etime,comm \| grep -E ", unit_test_text)
+            and "[t]estmanagerd" in unit_test_text,
+            "unit-tests must report bounded simulator diagnostics on failure")
     executes("archive", "xcodebuild archive", "generic/platform=iOS", "-configuration", "Release",
              "-archivePath", "$RUNNER_TEMP/PhoneCoder.xcarchive",
              "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile")
     executes("archive", "rm -rf", "$RUNNER_TEMP/PhoneCoder-TestDerivedData")
+    executes("package", "bash scripts/prepare_unsigned_archive.sh", "$RUNNER_TEMP/PhoneCoder.xcarchive")
     executes("package", "bash scripts/package_unsigned_ipa.sh")
     executes("package", "bash scripts/verify_unsigned_ipa.sh")
     executes("package", "shasum -a 256 -c")
@@ -219,6 +286,117 @@ try:
                 for item in jobs.values() for step in item["steps"]), "Validate must run workflow invariants")
     require(any(invokes(command_lines("Validate", step.get("run", "")), "bash scripts/tests/test_validate_phone_coder_workflows.sh")
                 for item in jobs.values() for step in item["steps"]), "Validate must run workflow mutation regressions")
+
+    codeql = read_workflow(root / ".github/workflows/codeql.yml")
+    swift_job = codeql["jobs"]["swift"]
+    require(swift_job["env"]["DEVELOPER_DIR"] == "/Applications/Xcode_26.0.1.app/Contents/Developer",
+            "CodeQL must select exact Xcode 26.0.1")
+    require(swift_job["env"]["CODEQL_TOOLCHAINS"] ==
+            "com.apple.dt.toolchain.XcodeDefault",
+            "CodeQL must use the prepared default Xcode toolchain")
+    codeql_commands = [
+        words
+        for step in swift_job["steps"]
+        if "run" in step
+        for words in command_lines("CodeQL", step["run"])
+    ]
+    codeql_steps = swift_job["steps"]
+    codeql_by_name = {step.get("name"): step for step in codeql_steps}
+    prepare_metal_name = "Prepare Xcode Metal toolchain for CodeQL tracing"
+    prime_name = "Prime dependency and Metal build outputs before tracing"
+    reset_name = "Reset only first-party build outputs for analysis"
+    init_name = "Initialize CodeQL"
+    verify_metal_name = "Verify Metal toolchain under CodeQL tracing"
+    analysis_name = "Build the iOS app for analysis"
+    require(all(name in codeql_by_name for name in
+                (prepare_metal_name, prime_name, reset_name, init_name,
+                 verify_metal_name, analysis_name)),
+            "CodeQL must prepare Metal, prime dependencies, and verify Metal under tracing")
+    positions = {name: next(index for index, step in enumerate(codeql_steps)
+                            if step.get("name") == name)
+                 for name in
+                 (prepare_metal_name, prime_name, reset_name, init_name,
+                  verify_metal_name, analysis_name)}
+    require(positions[prepare_metal_name] < positions[prime_name] < positions[reset_name]
+            < positions[init_name] < positions[verify_metal_name] < positions[analysis_name],
+            "CodeQL Metal preparation/priming must precede initialization and traced verification")
+    prepare_metal_commands = command_lines(
+        "CodeQL Metal preparation", codeql_by_name[prepare_metal_name]["run"])
+    require(invokes(prepare_metal_commands,
+                    "bash scripts/prepare_metal_toolchain_for_codeql.sh"),
+            "CodeQL must use the reviewed Metal preparation helper before tracer initialization")
+    verify_metal_commands = command_lines(
+        "CodeQL traced Metal verification", codeql_by_name[verify_metal_name]["run"])
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and
+                invokes([words], "xcrun metal -v") for words in verify_metal_commands),
+            "CodeQL must prove prepared XcodeDefault Metal remains executable under tracing")
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes(
+                    [words], "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal", "-v")
+                for words in verify_metal_commands),
+            "CodeQL must verify the exact grafted Xcode Metal driver used by the app build")
+    prime_commands = command_lines("CodeQL prime", codeql_by_name[prime_name]["run"])
+    require(invokes(prime_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
+                    "-scheme", "PhoneCoder", "-derivedDataPath",
+                    "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData", "ARCHS=arm64",
+                    "COMPILATION_CACHE_ENABLE_CACHING=NO", "SWIFT_ENABLE_COMPILE_CACHE=NO",
+                    "SWIFT_USE_INTEGRATED_DRIVER=NO",
+                    "-disableAutomaticPackageResolution", "-onlyUsePackageVersionsFromResolvedFile",
+                    "CODE_SIGNING_ALLOWED=NO"),
+            "CodeQL must prime the locked arm64 app build before tracer initialization")
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes([words], "xcodebuild")
+                for words in prime_commands),
+            "CodeQL priming must use the prepared default Xcode toolchain")
+    reset_commands = command_lines("CodeQL reset", codeql_by_name[reset_name]["run"])
+    require(invokes(reset_commands, "rm -rf",
+                    "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build",
+                    "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Products/Debug-iphonesimulator/Phone Coder.app"),
+            "CodeQL must invalidate only first-party target outputs before tracing")
+    require(invokes(codeql_commands, "pod install --deployment"),
+            "CodeQL must install the locked CocoaPods workspace")
+    require(invokes(codeql_commands, "xcodebuild -downloadComponent MetalToolchain"),
+            "CodeQL must install the pinned Xcode Metal toolchain")
+    require(invokes(codeql_commands, "cp",
+                    "OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved",
+                    "PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved"),
+            "CodeQL must copy the reviewed Swift package graph")
+    require(invokes(codeql_commands, "xcodebuild -resolvePackageDependencies",
+                    "-workspace", "PhoneCoder.xcworkspace", "-scheme", "PhoneCoder",
+                    "-onlyUsePackageVersionsFromResolvedFile"),
+            "CodeQL must resolve only the reviewed Swift package graph")
+    require(invokes(codeql_commands, "./scripts/build_native_frameworks.sh --llama-only"),
+            "CodeQL must build only the release-one native framework")
+    require(invokes(codeql_commands, "xcodebuild", "-workspace", "PhoneCoder.xcworkspace",
+                    "-scheme", "PhoneCoder", "CODE_SIGNING_ALLOWED=NO",
+                    "-derivedDataPath", "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData", "ARCHS=arm64",
+                    "COMPILATION_CACHE_ENABLE_CACHING=NO", "SWIFT_ENABLE_COMPILE_CACHE=NO",
+                    "SWIFT_USE_INTEGRATED_DRIVER=NO", "-disableAutomaticPackageResolution",
+                    "-onlyUsePackageVersionsFromResolvedFile"),
+            "CodeQL must build the Phone Coder workspace and scheme")
+    analysis_commands = command_lines("CodeQL analysis build", codeql_by_name[analysis_name]["run"])
+    require(any("TOOLCHAINS=$CODEQL_TOOLCHAINS" in words and invokes([words], "xcodebuild")
+                for words in analysis_commands),
+            "CodeQL traced build must use the prepared default Xcode toolchain")
+    podfile_checksum = hashlib.sha1((root / "Podfile").read_bytes()).hexdigest()
+    lock_text = (root / "Podfile.lock").read_text(encoding="utf-8")
+    require(f"PODFILE CHECKSUM: {podfile_checksum}" in lock_text,
+            "Podfile.lock checksum must match Podfile for deployment installs")
+
+    source_release = read_workflow(root / ".github/workflows/source-release.yml")
+    require(source_release["on"] == {"push": {"tags": ["v[0-9]+.[0-9]+.[0-9]+"]}},
+            "source releases must run only for semantic-version tags")
+    release_job = source_release["jobs"]["source-release"]
+    release_steps = {step.get("id", step.get("name")): step for step in release_job["steps"]}
+    package_script = release_steps["package"]["run"]
+    publish_script = release_steps["Publish GitHub release"]["run"]
+    require('artifact="phone-coder-${version}-source.tar.gz"' in package_script,
+            "source archive must use Phone Coder naming")
+    require('--prefix="phone-coder-${version}/"' in package_script,
+            "source archive root must use Phone Coder naming")
+    require('--title "Phone Coder $RELEASE_TAG"' in publish_script,
+            "GitHub source release must use Phone Coder naming")
+    release_text = (root / ".github/workflows/source-release.yml").read_text(encoding="utf-8")
+    require("ios-local-llm" not in release_text.lower(),
+            "source release must not publish the retired product name")
 except (KeyError, TypeError, ValueError, AttributeError):
     sys.exit("FAIL: missing or invalid workflow configuration")
 print("PASS: Phone Coder CI pins, test gates, unsigned packaging, metadata, and artifact allowlist")

@@ -22,6 +22,9 @@ jobs:
     name: Swift security analysis
     runs-on: macos-15
     timeout-minutes: 120
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
+      CODEQL_TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
     permissions:
       contents: read
       security-events: write
@@ -31,6 +34,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
+          persist-credentials: false
+
+      - name: Check pinned Xcode
+        run: |
+          test -d "$DEVELOPER_DIR"
+          test "$(xcodebuild -version)" = $'Xcode 26.0.1\nBuild version 17A400'
+          xcodebuild -downloadComponent MetalToolchain
+
+      - name: Prepare Xcode Metal toolchain for CodeQL tracing
+        run: bash scripts/prepare_metal_toolchain_for_codeql.sh
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -41,6 +54,17 @@ jobs:
       - name: Install locked CocoaPods dependencies
         run: pod install --deployment
 
+      - name: Resolve locked Swift package dependencies
+        run: |
+          mkdir -p PhoneCoder.xcworkspace/xcshareddata/swiftpm
+          cp OnDeviceLAS.xcworkspace/xcshareddata/swiftpm/Package.resolved \
+            PhoneCoder.xcworkspace/xcshareddata/swiftpm/Package.resolved
+          xcodebuild -resolvePackageDependencies \
+            -workspace PhoneCoder.xcworkspace -scheme PhoneCoder \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO
+
       - name: Derive the native framework cache key
         id: native-cache-key
         run: |
@@ -49,8 +73,7 @@ jobs:
               git submodule status
               git hash-object \
                 Patches/llama.cpp-ios-only-xcframework.patch \
-                scripts/build_native_frameworks.sh \
-                scripts/native/build_whisper_ios.sh
+                scripts/build_native_frameworks.sh
             } | shasum -a 256 | awk '{ print $1 }'
           )"
           echo "key=native-ios-${RUNNER_OS}-${RUNNER_ARCH}-${native_hash}" >>"$GITHUB_OUTPUT"
@@ -61,12 +84,37 @@ jobs:
         with:
           path: |
             ThirdParty/llama.cpp/build-apple/llama.xcframework
-            ThirdParty/whisper.cpp/build-apple/whisper.xcframework
           key: ${{ steps.native-cache-key.outputs.key }}
 
       - name: Build pinned native inference frameworks
         if: steps.native-cache.outputs.cache-hit != 'true'
-        run: ./scripts/build_native_frameworks.sh
+        run: ./scripts/build_native_frameworks.sh --llama-only
+
+      # CodeQL's macOS tracer currently hides Xcode 26's optional Metal
+      # cryptex (github/codeql-action#3978). The preparation step grafts the
+      # signed compiler into XcodeDefault; priming also keeps analysis focused
+      # on first-party source by retaining reviewed dependency outputs.
+      - name: Prime dependency and Metal build outputs before tracing
+        run: |
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" xcodebuild \
+            -workspace PhoneCoder.xcworkspace \
+            -scheme PhoneCoder \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
+            -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO \
+            SWIFT_ENABLE_COMPILE_CACHE=NO SWIFT_USE_INTEGRATED_DRIVER=NO \
+            build
+
+      - name: Reset only first-party build outputs for analysis
+        run: |
+          rm -rf \
+            "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build" \
+            "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Products/Debug-iphonesimulator/Phone Coder.app"
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
@@ -75,15 +123,27 @@ jobs:
           build-mode: manual
           queries: security-extended
 
+      - name: Verify Metal toolchain under CodeQL tracing
+        run: |
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" \
+            xcrun metal -v
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" \
+            "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal" -v
+
       - name: Build the iOS app for analysis
         run: |
-          xcodebuild \
-            -workspace OnDeviceLAS.xcworkspace \
-            -scheme OnDeviceLAS \
+          TOOLCHAINS="$CODEQL_TOOLCHAINS" xcodebuild \
+            -workspace PhoneCoder.xcworkspace \
+            -scheme PhoneCoder \
             -configuration Debug \
             -sdk iphonesimulator \
             -destination "generic/platform=iOS Simulator" \
-            CODE_SIGNING_ALLOWED=NO \
+            -derivedDataPath "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData" \
+            -clonedSourcePackagesDirPath "$RUNNER_TEMP/PhoneCoder-CodeQLSourcePackages" \
+            -disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO COMPILATION_CACHE_ENABLE_CACHING=NO \
+            SWIFT_ENABLE_COMPILE_CACHE=NO SWIFT_USE_INTEGRATED_DRIVER=NO \
             build
 
       - name: Analyze Swift

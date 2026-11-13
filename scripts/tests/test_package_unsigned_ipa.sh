@@ -255,6 +255,16 @@ try:
             reject(run(verify, output), "credential content")
         print("PASS: credential content is rejected without exposing values")
 
+        # Documentation/setup placeholders are intentionally embedded in the
+        # app binary. They are instructions for the owner to substitute a
+        # runtime-generated local key, not bundled credentials.
+        placeholder = app_fixture(temp / "credential-placeholder")
+        (placeholder / "setup.txt").write_bytes(
+            b"AIDER_API_KEY=YOUR_LOCAL_API_KEY aider --model local"
+        )
+        success(run(package, placeholder, temp / "credential-placeholder.ipa"))
+        print("PASS: documented local API-key placeholder is not treated as a credential")
+
         # ZIP can preserve both spellings even when an Apple filesystem would
         # map them to the same path. Test member and ancestor collision keys.
         for label, descendant in [("members", ""), ("file-parent", "/child"),
@@ -304,7 +314,11 @@ try:
             member.write_bytes(data)
             output = temp / ("signed-macho-" + label + ".ipa")
             raw_zip(dirty, output)
-            reject(run(verify, output), "embedded Mach-O signature: " + label)
+            verified = run(verify, output)
+            reject(verified, "embedded Mach-O signature: " + label)
+            expected_member = "Payload/Phone Coder.app/" + members[index % len(members)]
+            check(expected_member in verified.stdout,
+                  f"Mach-O rejection did not identify its safe bundle member for {label}: {verified.stdout}")
             packaged = temp / ("signed-macho-packaged-" + label + ".ipa")
             reject(run(package, dirty, packaged), "packaged embedded Mach-O signature: " + label)
             check(not packaged.exists() and not Path(str(packaged) + ".sha256").exists(),

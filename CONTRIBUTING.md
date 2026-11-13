@@ -16,10 +16,21 @@ Thanks for helping improve iOS Local LLM.
 2. Create a branch from `main`.
 3. Follow [SETUP_INSTRUCTIONS.md](SETUP_INSTRUCTIONS.md).
 4. Add or update tests for behavior changes.
-5. Run the relevant tests and `./scripts/validate_open_source.sh`.
+5. Run `./scripts/ci_local.sh`. It fails on the first locally reproducible CI
+   problem and reports the macOS/GitHub checks that still require CI.
 6. Sign off each commit with `git commit -s` to certify the
    [Developer Certificate of Origin](https://developercertificate.org/).
 7. Open a pull request using the repository template.
+
+To run the same gate automatically before each push, opt in once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The hook never installs dependencies, changes files, pushes, or claims that
+Xcode and GitHub-hosted service checks passed. It rejects pushes of another
+local branch; check out that branch so its own `HEAD` is validated first.
 
 ## Code style
 

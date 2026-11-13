@@ -14,6 +14,9 @@ import yaml
 
 root = Path(sys.argv[1])
 original = yaml.load((root / ".github/workflows/phone-coder-ios.yml").read_text(), Loader=yaml.BaseLoader)
+original_codeql = (root / ".github/workflows/codeql.yml").read_text()
+original_source_release = (root / ".github/workflows/source-release.yml").read_text()
+original_lock = (root / "Podfile.lock").read_text()
 
 def replace_command(workflow, step_id, command, replacement):
     step = next(step for step in workflow["jobs"]["phone-coder-ios"]["steps"] if step["id"] == step_id)
@@ -21,9 +24,33 @@ def replace_command(workflow, step_id, command, replacement):
     step["run"] = step["run"].replace(command, replacement)
 
 mutations = [
+    ("skipped Metal toolchain installation", "tools", "xcodebuild -downloadComponent MetalToolchain", "echo xcodebuild -downloadComponent MetalToolchain"),
+    ("unlocked CocoaPods install", "dependencies", "pod install --deployment", "pod install"),
+    ("skipped Xcode compatibility signature normalization", "package", "bash scripts/prepare_unsigned_archive.sh", "echo scripts/prepare_unsigned_archive.sh"),
     ("commented IPA verifier", "package", "bash scripts/verify_unsigned_ipa.sh", "# bash scripts/verify_unsigned_ipa.sh"),
     ("commented Swift package tests", "repository-tests", "swift test --package-path Packages/VoiceAgentOrb", "# swift test --package-path Packages/VoiceAgentOrb"),
+    ("commented CodeQL Metal preparation tests", "repository-tests", "bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh", "# bash scripts/tests/test_prepare_metal_toolchain_for_codeql.sh"),
+    ("commented simulator resolver tests", "repository-tests", "bash scripts/tests/test_resolve_simulator_udid.sh", "# bash scripts/tests/test_resolve_simulator_udid.sh"),
+    ("commented bounded runner tests", "repository-tests", "bash scripts/tests/test_run_with_timeout.sh", "# bash scripts/tests/test_run_with_timeout.sh"),
     ("echoed XCTest command", "unit-tests", "xcodebuild test", "echo xcodebuild test"),
+    ("skipped simulator inventory", "unit-tests", 'xcrun simctl list devices available -j', 'echo xcrun simctl list devices available -j'),
+    ("skipped simulator runtime inventory", "unit-tests", "xcrun simctl list runtimes -j", "echo xcrun simctl list runtimes -j"),
+    ("skipped exact simulator resolver", "unit-tests", "python3 scripts/resolve_simulator_udid.py", "echo python3 scripts/resolve_simulator_udid.py"),
+    ("weakened exact simulator version", "unit-tests", "--version 26.0.1", "--version 26.0"),
+    ("skipped simulator shutdown", "unit-tests", "xcrun simctl shutdown all", "echo xcrun simctl shutdown all"),
+    ("skipped pinned simulator boot", "unit-tests", 'xcrun simctl boot "$SIMULATOR_UDID"', 'echo xcrun simctl boot "$SIMULATOR_UDID"'),
+    ("removed runtime inventory deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl list runtimes -j", "xcrun simctl list runtimes -j"),
+    ("removed device inventory deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl list devices available -j", "xcrun simctl list devices available -j"),
+    ("removed simulator shutdown deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl shutdown all", "xcrun simctl shutdown all"),
+    ("removed simulator launch deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 60 -- \\\n  xcrun simctl boot \"$SIMULATOR_UDID\"", "xcrun simctl boot \"$SIMULATOR_UDID\""),
+    ("removed simulator boot deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 300 --", "python3 scripts/run_with_timeout.py --timeout-seconds 9999 --"),
+    ("removed diagnostic inventory deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 20 -- \\\n      xcrun simctl list devices", "xcrun simctl list devices"),
+    ("removed diagnostic boot deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 20 -- \\\n        xcrun simctl bootstatus \"$SIMULATOR_UDID\"", "xcrun simctl bootstatus \"$SIMULATOR_UDID\""),
+    ("skipped pinned simulator boot wait", "unit-tests", 'xcrun simctl bootstatus "$SIMULATOR_UDID" -b', 'echo xcrun simctl bootstatus "$SIMULATOR_UDID" -b'),
+    ("removed simulator test deadline", "unit-tests", "python3 scripts/run_with_timeout.py --timeout-seconds 4200 --", "python3 scripts/run_with_timeout.py --timeout-seconds 9999 --"),
+    ("reverted simulator destination to a name", "unit-tests", 'platform=iOS Simulator,id=$SIMULATOR_UDID', "platform=iOS Simulator,name=iPhone 17 Pro,OS=26.0.1"),
+    ("disabled simulator failure diagnostics", "unit-tests", "trap diagnose_simulator EXIT", "true # trap diagnose_simulator EXIT"),
+    ("removed safe simulator process snapshot", "unit-tests", "ps -axo pid,etime,comm", "echo ps -axo pid,etime,comm"),
     ("printed IPA verifier", "package", "bash scripts/verify_unsigned_ipa.sh", "printf '%s\\n' 'bash scripts/verify_unsigned_ipa.sh'"),
     ("multiline quoted test text", "repository-tests", "swift test --package-path Packages/VoiceAgentOrb", "printf '%s\\n' 'example:\nswift test --package-path Packages/VoiceAgentOrb\n'"),
     ("heredoc verifier text", "package", 'bash scripts/verify_unsigned_ipa.sh "$ipa"', "cat <<'EXAMPLE'\nbash scripts/verify_unsigned_ipa.sh \"$ipa\"\nEXAMPLE"),
@@ -49,6 +76,10 @@ with tempfile.TemporaryDirectory() as temporary:
     (fixture / ".github/workflows").mkdir(parents=True)
     shutil.copyfile(root / "scripts/validate_phone_coder_workflows.sh", fixture / "scripts/validate_phone_coder_workflows.sh")
     shutil.copyfile(root / ".github/workflows/validate.yml", fixture / ".github/workflows/validate.yml")
+    shutil.copyfile(root / ".github/workflows/codeql.yml", fixture / ".github/workflows/codeql.yml")
+    shutil.copyfile(root / ".github/workflows/source-release.yml", fixture / ".github/workflows/source-release.yml")
+    shutil.copyfile(root / "Podfile", fixture / "Podfile")
+    shutil.copyfile(root / "Podfile.lock", fixture / "Podfile.lock")
 
     def validate(workflow):
         (fixture / ".github/workflows/phone-coder-ios.yml").write_text(yaml.safe_dump(workflow, sort_keys=False))
@@ -57,6 +88,114 @@ with tempfile.TemporaryDirectory() as temporary:
     baseline = validate(original)
     assert baseline.returncode == 0, baseline.stdout + baseline.stderr
     print("PASS: unchanged workflow is accepted")
+    unit_test_script = next(
+        step["run"] for step in original["jobs"]["phone-coder-ios"]["steps"]
+        if step["id"] == "unit-tests"
+    )
+    simulator_reliability_contract = {
+        'xcrun simctl list devices available -j': 1,
+        'xcrun simctl list runtimes -j': 1,
+        'python3 scripts/resolve_simulator_udid.py': 1,
+        '--version 26.0.1': 1,
+        'xcrun simctl shutdown all': 1,
+        'xcrun simctl boot "$SIMULATOR_UDID"': 1,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 300 --': 1,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 60 --': 4,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 20 --': 2,
+        'xcrun simctl bootstatus "$SIMULATOR_UDID" -b': 1,
+        'python3 scripts/run_with_timeout.py --timeout-seconds 4200 --': 1,
+        "platform=iOS Simulator,id=$SIMULATOR_UDID": 1,
+        'xcrun simctl list devices': 2,
+        'ps -axo pid,etime,comm': 1,
+        '[t]estmanagerd': 1,
+    }
+    missing_reliability_commands = [
+        command for command, count in simulator_reliability_contract.items()
+        if unit_test_script.count(command) != count
+    ]
+    if missing_reliability_commands:
+        failures.extend(f"missing simulator reliability command: {command}"
+                        for command in missing_reliability_commands)
+        print("FAIL: workflow lacks explicit simulator preflight, timeout, or diagnostics")
+    else:
+        print("PASS: workflow has explicit simulator preflight, timeout, and diagnostics")
+    local_gate_test = "bash scripts/tests/test_ci_local.sh"
+    repository_test_script = next(
+        step["run"] for step in original["jobs"]["phone-coder-ios"]["steps"]
+        if step["id"] == "repository-tests"
+    )
+    if repository_test_script.count(local_gate_test) != 1:
+        failures.append("missing local gate regression test")
+        print("FAIL: workflow must execute the local gate regression test exactly once")
+    else:
+        changed = copy.deepcopy(original)
+        replace_command(changed, "repository-tests", local_gate_test, f"# {local_gate_test}")
+        result = validate(changed)
+        if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+            failures.append("commented local gate regression test")
+            print("FAIL: accepted commented local gate regression test")
+        else:
+            print("PASS: rejects commented local gate regression test")
+    prefixed_branch = copy.deepcopy(original)
+    prefixed_branch["on"]["push"]["branches"].append("codex/**")
+    result = validate(prefixed_branch)
+    if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+        failures.append("reserved feature-branch prefix")
+        print("FAIL: accepted reserved feature-branch prefix")
+    else:
+        print("PASS: rejects reserved feature-branch prefix")
+    for name, old, new in [
+        ("stale CodeQL product identity", "PhoneCoder.xcworkspace -scheme PhoneCoder", "OnDeviceLAS.xcworkspace -scheme OnDeviceLAS"),
+        ("full native CodeQL build", "./scripts/build_native_frameworks.sh --llama-only", "./scripts/build_native_frameworks.sh"),
+        ("unpinned CodeQL Xcode", "/Applications/Xcode_26.0.1.app/Contents/Developer", "/Applications/Xcode.app/Contents/Developer"),
+        ("skipped locked Swift resolution", "xcodebuild -resolvePackageDependencies", "echo xcodebuild -resolvePackageDependencies"),
+        ("automatic CodeQL package resolution", "-disableAutomaticPackageResolution -onlyUsePackageVersionsFromResolvedFile", "-onlyUsePackageVersionsFromResolvedFile"),
+        ("skipped CodeQL Metal toolchain installation", "xcodebuild -downloadComponent MetalToolchain", "echo xcodebuild -downloadComponent MetalToolchain"),
+        ("skipped CodeQL Metal preparation", "bash scripts/prepare_metal_toolchain_for_codeql.sh", "echo scripts/prepare_metal_toolchain_for_codeql.sh"),
+        ("skipped traced CodeQL Metal verification", "xcrun metal -v", "echo xcrun metal -v"),
+        ("selected the inaccessible cryptex toolchain", "com.apple.dt.toolchain.XcodeDefault", "com.apple.dt.toolchain.Metal.32023 com.apple.dt.toolchain.XcodeDefault"),
+        ("skipped exact Xcode Metal shim verification", "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal", "xcrun metal"),
+        ("unpinned CodeQL prime toolchain selection", 'TOOLCHAINS="$CODEQL_TOOLCHAINS" xcodebuild', "xcodebuild"),
+        ("skipped untraced CodeQL Metal priming", "Prime dependency and Metal build outputs before tracing", "Prime dependency outputs before tracing"),
+        ("broad CodeQL output reset", "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex/PhoneCoder.build", "$RUNNER_TEMP/PhoneCoder-CodeQLDerivedData/Build/Intermediates.noindex"),
+        ("enabled CodeQL Swift compile cache", "SWIFT_ENABLE_COMPILE_CACHE=NO", "SWIFT_ENABLE_COMPILE_CACHE=YES"),
+    ]:
+        assert original_codeql.count(old) >= 1
+        (fixture / ".github/workflows/codeql.yml").write_text(original_codeql.replace(old, new, 1))
+        result = validate(original)
+        if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+            failures.append(name)
+            print(f"FAIL: accepted {name}")
+        else:
+            print(f"PASS: rejects {name}")
+        (fixture / ".github/workflows/codeql.yml").write_text(original_codeql)
+    (fixture / "Podfile.lock").write_text(original_lock.replace(
+        "PODFILE CHECKSUM: c176ac6b0ef2b4994d263d02cba18cacc5c5e633",
+        "PODFILE CHECKSUM: 0000000000000000000000000000000000000000",
+    ))
+    result = validate(original)
+    if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+        failures.append("stale Podfile checksum")
+        print("FAIL: accepted stale Podfile checksum")
+    else:
+        print("PASS: rejects stale Podfile checksum")
+    (fixture / "Podfile.lock").write_text(original_lock)
+    for name, old, new in [
+        ("retired source artifact name", "phone-coder-${version}-source.tar.gz", "ios-local-llm-${version}-source.tar.gz"),
+        ("retired source archive root", "phone-coder-${version}/", "ios-local-llm-${version}/"),
+        ("retired source release title", "Phone Coder $RELEASE_TAG", "iOS Local LLM $RELEASE_TAG"),
+    ]:
+        assert original_source_release.count(old) == 1
+        (fixture / ".github/workflows/source-release.yml").write_text(
+            original_source_release.replace(old, new)
+        )
+        result = validate(original)
+        if result.returncode != 1 or "FAIL:" not in result.stdout + result.stderr:
+            failures.append(name)
+            print(f"FAIL: accepted {name}")
+        else:
+            print(f"PASS: rejects {name}")
+        (fixture / ".github/workflows/source-release.yml").write_text(original_source_release)
     for name, step_id, command, replacement in mutations:
         changed = copy.deepcopy(original)
         replace_command(changed, step_id, command, replacement)

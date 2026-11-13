@@ -1700,8 +1700,15 @@ enum LocalAPIToolCalling {
         validateSchemas: Bool = true,
         parser: ModelToolParser = .hermes,
         maximumCalls: Int? = nil,
-        attemptRepair: Bool = true
+        attemptRepair: Bool = true,
+        strictPrivacy: Bool = false,
+        diagnostic: ((String) -> Void)? = nil
     ) -> LocalAPIToolCallParseResult {
+        func report(_ message: String, level: RuntimeLogCenter.Level = .error) {
+            guard !strictPrivacy else { return }
+            if let diagnostic { diagnostic(message) }
+            else { RuntimeLogCenter.emit(message, level: level, subsystem: "api") }
+        }
         let toolsByName = Dictionary(uniqueKeysWithValues: tools.map { ($0.name, $0) })
         guard !toolsByName.isEmpty else {
             return LocalAPIToolCallParseResult(calls: [], failure: nil, dialect: "none")
@@ -1722,8 +1729,13 @@ enum LocalAPIToolCalling {
         let xmlResult = xmlFunctionCalls(
                 in: cleanedOutput,
                 toolsByName: toolsByName,
-                validateSchemas: validateSchemas
+                validateSchemas: validateSchemas,
+                strictPrivacy: strictPrivacy,
+                diagnostic: { report($0, level: .warning) }
             )
+        if strictPrivacy, xmlResult.rejectedArguments {
+            return LocalAPIToolCallParseResult(calls: [], failure: .malformed(dialect: dialect, rawPreview: ""), dialect: dialect)
+        }
         if xmlResult.foundEnvelope {
             foundToolEnvelope = true
             parsedCalls.append(contentsOf: xmlResult.calls)
@@ -1786,7 +1798,7 @@ enum LocalAPIToolCalling {
             }
         }
         if parsedCalls.isEmpty,
-           attemptRepair,
+           attemptRepair, !strictPrivacy,
            let repaired = repairedToolEnvelope(cleanedOutput),
            repaired != cleanedOutput {
             let repairedCalls = parseResult(
@@ -1796,7 +1808,9 @@ enum LocalAPIToolCalling {
                 validateSchemas: validateSchemas,
                 parser: parser,
                 maximumCalls: maximumCalls,
-                attemptRepair: false
+                attemptRepair: false,
+                strictPrivacy: strictPrivacy,
+                diagnostic: diagnostic
             )
             if !repairedCalls.calls.isEmpty { return repairedCalls }
         }
@@ -1804,11 +1818,12 @@ enum LocalAPIToolCalling {
         // tool call. Dropping it turned one extra key into a 502 and told the
         // caller to shorten their prompt, which never helped.
         if parsedCalls.isEmpty, !schemaRejectedCalls.isEmpty {
-            RuntimeLogCenter.emit(
+            if strictPrivacy {
+                return LocalAPIToolCallParseResult(calls: [], failure: .malformed(dialect: dialect, rawPreview: ""), dialect: dialect)
+            }
+            report(
                 "Tool call arguments did not match the declared schema; forwarding unvalidated · "
-                    + "tools=\(schemaRejectedCalls.map(\.name).joined(separator: ","))",
-                level: .error,
-                subsystem: "api"
+                    + "tools=\(schemaRejectedCalls.map(\.name).joined(separator: ","))"
             )
             return LocalAPIToolCallParseResult(
                 calls: Array(schemaRejectedCalls.prefix(callLimit)),
@@ -1817,11 +1832,9 @@ enum LocalAPIToolCalling {
             )
         }
         if parsedCalls.isEmpty, let unavailable = unavailableToolNames.first {
-            RuntimeLogCenter.emit(
+            report(
                 "Tool call named unavailable tool · parser=\(parser.rawValue) · "
-                    + "tool=\(unavailable) · tools=\(tools.map(\.name).joined(separator: ","))",
-                level: .error,
-                subsystem: "api"
+                    + "tool=\(unavailable) · tools=\(tools.map(\.name).joined(separator: ","))"
             )
             return LocalAPIToolCallParseResult(
                 calls: [],
@@ -1831,14 +1844,12 @@ enum LocalAPIToolCalling {
         }
         if parsedCalls.isEmpty, foundToolEnvelope {
             let detectedDialect = dialect == "none" ? "unknown" : dialect
-            let rawPreview = String(output.prefix(200))
-            RuntimeLogCenter.emit(
+            let rawPreview = strictPrivacy ? "" : String(output.prefix(200))
+            report(
                 "Tool call parsing failed · parser=\(parser.rawValue) · "
                     + "dialect=\(detectedDialect) · "
                     + "tools=\(tools.map(\.name).joined(separator: ",")) · "
-                    + "raw=\(output.prefix(600))",
-                level: .error,
-                subsystem: "api"
+                    + "raw=\(output.prefix(600))"
             )
             return LocalAPIToolCallParseResult(
                 calls: [],
@@ -1939,12 +1950,15 @@ enum LocalAPIToolCalling {
         let calls: [LocalAPIToolCall]
         let unavailableToolNames: [String]
         let foundEnvelope: Bool
+        var rejectedArguments = false
     }
 
     private static func xmlFunctionCalls(
         in output: String,
         toolsByName: [String: LocalAPIToolDefinition],
-        validateSchemas: Bool
+        validateSchemas: Bool,
+        strictPrivacy: Bool,
+        diagnostic: (String) -> Void
     ) -> XMLFunctionCallResult {
         let blockPattern = #"(?is)<tool_call\b[^>]*>(.*?)</tool_call\s*>"#
         guard let blockRegex = try? NSRegularExpression(pattern: blockPattern) else {
@@ -1954,6 +1968,7 @@ enum LocalAPIToolCalling {
         let matches = blockRegex.matches(in: output, range: outputRange)
         var calls: [LocalAPIToolCall] = []
         var unavailableToolNames: [String] = []
+        var rejectedArguments = false
         let hasOpeningEnvelope = output.range(
             of: "<tool_call",
             options: [.caseInsensitive]
@@ -2001,20 +2016,16 @@ enum LocalAPIToolCalling {
                     guard !key.isEmpty else { continue }
                     let rawValue = String(functionBody[valueRange])
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    arguments[key] = coerceXMLValue(
-                        rawValue,
-                        schemaType: propertyTypes[key]
-                    )
+                    // XML parameters are text. The strict API never repairs
+                    // their type using a schema; typed values must use JSON.
+                    arguments[key] = strictPrivacy ? rawValue : coerceXMLValue(rawValue, schemaType: propertyTypes[key])
                 }
 
                 guard let argumentsJSON = normalizedArguments(arguments) else { continue }
                 if validateSchemas,
                    !argumentsMatchSchema(argumentsJSON, schemaJSON: tool.parametersJSON) {
-                    RuntimeLogCenter.emit(
-                        "XML tool call did not fully match the declared schema; forwarding coerced values · tool=\(name)",
-                        level: .warning,
-                        subsystem: "api"
-                    )
+                    if strictPrivacy { rejectedArguments = true; continue }
+                    diagnostic("XML tool call did not fully match the declared schema; forwarding coerced values · tool=\(name)")
                 }
                 calls.append(LocalAPIToolCall(
                     id: "call_\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))",
@@ -2026,7 +2037,8 @@ enum LocalAPIToolCalling {
         return XMLFunctionCallResult(
             calls: calls,
             unavailableToolNames: unavailableToolNames,
-            foundEnvelope: hasOpeningEnvelope || !matches.isEmpty
+            foundEnvelope: hasOpeningEnvelope || !matches.isEmpty,
+            rejectedArguments: rejectedArguments
         )
     }
 
@@ -2164,8 +2176,7 @@ enum LocalAPIToolCalling {
                 }
             }
             if schema["additionalProperties"] as? Bool == false,
-               let properties = schema["properties"] as? [String: Any],
-               object.keys.contains(where: { properties[$0] == nil }) {
+               object.keys.contains(where: { (schema["properties"] as? [String: Any] ?? [:])[$0] == nil }) {
                 return false
             }
         }
@@ -2183,7 +2194,9 @@ enum LocalAPIToolCalling {
         case "object": return value is [String: Any]
         case "array": return value is [Any]
         case "string": return value is String
-        case "boolean": return value is Bool
+        case "boolean":
+            guard let number = value as? NSNumber else { return false }
+            return CFGetTypeID(number) == CFBooleanGetTypeID()
         case "number":
             guard let number = value as? NSNumber else { return false }
             return CFGetTypeID(number) != CFBooleanGetTypeID()

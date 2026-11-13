@@ -24,6 +24,11 @@ upstream builds are not migrated into this fork.
 Original upstream code and documentation retain their [MIT license](LICENSE).
 Phone Coder is independent of the upstream OnDevice product line.
 
+Phone Coder's `phone-coder-api/1` chat and Responses endpoints accept at most
+four nonempty `stop` strings, each limited to 256 UTF-8 bytes. Oversized stops
+return `invalid_request` before inference. This bound limits incremental
+matching work; it does not classify prompt or output content.
+
 ## Upstream reference
 
 The material below describes inherited upstream capabilities and assets,
