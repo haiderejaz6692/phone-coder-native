@@ -154,27 +154,43 @@ final class PhoneCoderKeyboardTests: XCTestCase {
     func testSettingsScrollDismissesNumberPadWithoutApplyingInput() {
         open("Settings")
         let port = input("phonecoder.settings.port")
-        let original = port.value as? String
-        replace(port, with: "12345")
+        guard let original = port.value as? String, !original.isEmpty else {
+            return XCTFail("Expected a saved Settings port before editing")
+        }
+        let draft = original == "12345" ? "12346" : "12345"
+        replace(port, with: draft)
         let keyboard = app.keyboards.firstMatch
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 3))
-        // SwiftUI Form is a collection view on the pinned iOS simulator.
-        // Keep both endpoints in visible Form content, clear of the keyboard
-        // accessory, so the Form owns the downward interactive dismissal.
+        guard keyboard.waitForExistence(timeout: 3) else {
+            return XCTFail("Expected the Settings number pad before dragging")
+        }
         let form = app.collectionViews.firstMatch
-        XCTAssertTrue(form.waitForExistence(timeout: 3))
-        let contentTop = max(form.frame.minY, app.navigationBars.firstMatch.frame.maxY) + 24
-        let contentBottom = min(form.frame.maxY, keyboard.frame.minY - 80)
-        XCTAssertGreaterThan(contentBottom - contentTop, 120, "Need visible Form content for a downward drag")
-        let origin = form.coordinate(withNormalizedOffset: .zero)
-        let x = form.frame.width * 0.85
-        let start = origin.withOffset(CGVector(dx: x, dy: contentTop - form.frame.minY))
-        let end = origin.withOffset(CGVector(dx: x, dy: contentBottom - form.frame.minY))
+        guard form.waitForExistence(timeout: 3) else {
+            return XCTFail("Expected the Settings Form before dragging")
+        }
+        let formFrame = form.frame
+        let keyboardFrame = keyboard.frame
+        let screen = app.frame
+        // Start in the Form above the accessory. Interactive dismissal only
+        // tracks the drag once the finger crosses into the keyboard area.
+        let startY = max(formFrame.minY, app.navigationBars.firstMatch.frame.maxY) + 24
+        let endY = screen.maxY - 32
+        let x = formFrame.minX + formFrame.width * 0.85
+        guard formFrame.contains(CGPoint(x: x, y: startY)),
+              keyboardFrame.minX < x, x < keyboardFrame.maxX,
+              startY < keyboardFrame.minY - 80,
+              endY > keyboardFrame.midY else {
+            return XCTFail("Cannot drag from visible Form content through the number pad. Form: \(formFrame), keyboard: \(keyboardFrame), app: \(screen)")
+        }
+        let origin = app.coordinate(withNormalizedOffset: .zero)
+        let start = origin.withOffset(CGVector(dx: x - screen.minX, dy: startY - screen.minY))
+        let end = origin.withOffset(CGVector(dx: x - screen.minX, dy: endY - screen.minY))
         start.press(forDuration: 0.05, thenDragTo: end)
-        assertKeyboardHidden()
+        guard keyboard.waitForNonExistence(timeout: 3) else {
+            return XCTFail("Number pad remained visible after dragging from y=\(startY) to y=\(endY) through \(keyboardFrame)")
+        }
         // Return to the top without tapping Apply.
         for _ in 0..<3 where !port.isHittable { app.swipeDown() }
-        XCTAssertEqual(port.value as? String, "12345")
+        XCTAssertEqual(port.value as? String, draft)
         // Dismissal must not apply the edited port. Relaunch reads the saved
         // listener port through the normal app path, without tapping Apply.
         app.terminate()
