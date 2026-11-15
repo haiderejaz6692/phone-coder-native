@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Package an app built with CODE_SIGNING_ALLOWED=NO; never sign or strip it.
+# Package a prepared app built with CODE_SIGNING_ALLOWED=NO; never sign or strip while packaging.
 set -euo pipefail
 if [[ "$#" != 2 ]]; then
   echo "usage: $0 <archive-or-app-path> <output.ipa>" >&2

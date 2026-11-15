@@ -148,6 +148,40 @@ frameworks.
 
 ## Tests
 
+Before pushing, run the deterministic local CI gate from Linux or macOS:
+
+```bash
+python3 -m venv .venv-ci
+. .venv-ci/bin/activate
+python3 -m pip install PyYAML==6.0.3
+./scripts/ci_local.sh
+```
+
+The gate validates repository hygiene, workflow contracts, shell orchestration,
+IPA packaging/security regressions, submodule pins, whitespace, and DCO
+sign-offs. It stops on the first failure and verifies that its checks did not
+change the checkout. Its final `REMOTE REQUIRED` section is intentional:
+Ubuntu cannot prove Xcode builds, Simulator tests, Swift CodeQL tracing, or
+GitHub service checks.
+
+The gate has a disposable-repository regression suite. CI runs it separately
+to avoid the gate recursively invoking its own test:
+
+```bash
+bash scripts/tests/test_ci_local.sh
+```
+
+To enable the tracked pre-push hook for this clone only:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This changes only the current clone's Git configuration. It does not affect
+other computers or clones. The hook validates the checked-out `HEAD` and
+rejects commands such as `git push origin other-branch` until that branch is
+checked out and gated directly.
+
 Run the native-build orchestration regression tests on Linux or macOS:
 
 ```bash

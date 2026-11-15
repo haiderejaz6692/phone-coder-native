@@ -1,5 +1,58 @@
 import Foundation
 
+struct LocalAPIStrictBudgetError: Error, Equatable, Sendable {
+    let code: String
+    let promptTokens: Int
+    let outputTokens: Int
+    let contextWindow: Int
+}
+
+/// API input is never compacted, sanitized, or augmented by global chat
+/// settings. These helpers are also used inside the native execution path.
+enum LocalAPIStrictInput {
+    static func usesJSONMode(strictAPI: Bool, explicit: Bool, global: Bool) -> Bool {
+        !strictAPI && (explicit || global)
+    }
+
+    static func prompt(messages: [ChatMessage], template: ChatTemplate, thinking: Bool) -> String {
+        var result = ""
+        for message in messages {
+            switch message.role {
+            case .system:
+                result += template.systemPrefix.isEmpty
+                    ? template.userPrefix + "System: " + message.content + template.userSuffix
+                    : template.systemPrefix + message.content + template.systemSuffix
+            case .user: result += template.userPrefix + message.content + template.userSuffix
+            case .assistant: result += template.assistantPrefix + message.content + template.assistantSuffix
+            case .tool: result += template.userPrefix + message.content + template.userSuffix
+            }
+        }
+        result += template.generationPrompt
+        if template.supportsThinking { result += (thinking ? template.thinkTag : template.noThinkTag) ?? "" }
+        return result
+    }
+
+    static func upperBound(prompt: String) -> LocalAPITokenCount {
+        // Byte-fallback tokenization cannot consume more than one token per
+        // UTF-8 byte; reserve additional special tokens. Native exact counting
+        // still guards the prepared input immediately before generation.
+        LocalAPITokenCount(tokens: prompt.utf8.count + 32, mode: .conservativeApproximation)
+    }
+
+    static func outputTokens(requested: Int?, promptTokens: Int, limits: LocalAPIRuntimeLimits) throws -> Int {
+        let output = requested ?? limits.defaultOutputTokens
+        guard limits.isRunnable, output > 0, output <= limits.maximumOutputTokens else {
+            throw LocalAPIStrictBudgetError(code: "output_tokens_exceeded", promptTokens: promptTokens,
+                                           outputTokens: output, contextWindow: limits.contextWindow)
+        }
+        guard promptTokens >= 0, promptTokens <= limits.contextWindow - output - 16 else {
+            throw LocalAPIStrictBudgetError(code: "context_length_exceeded", promptTokens: promptTokens,
+                                           outputTokens: output, contextWindow: limits.contextWindow)
+        }
+        return output
+    }
+}
+
 enum LocalAPITokenCountMode: String, Codable, Hashable, Equatable, Sendable {
     case exact
     case conservativeApproximation = "conservative_approximation"

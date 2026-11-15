@@ -20,6 +20,55 @@ struct AssistantGenerationResult: Sendable, Equatable {
     let stopReason: StopReason
 }
 
+/// Explicit local-generation terminal state. Missing metadata is unavailable,
+/// never evidence of an engine fault that a caller may safely retry.
+enum AssistantGenerationOutcome: Equatable, Sendable {
+    case completed(AssistantGenerationResult)
+    case rejected(LocalAPIStrictBudgetError)
+    case cancelled, memoryPressure, thermal, unavailable, failed
+
+    static func resolve(result: AssistantGenerationResult?, error: Error? = nil,
+                        cancelled: Bool, safetyStop: DeviceSafetyMonitor.StopReason? = nil) -> Self {
+        switch safetyStop {
+        case .thermal: return .thermal
+        case .memoryPressure: return .memoryPressure
+        case nil: break
+        }
+        if let nativeError = error as? LlamaCppError, case .cancelled = nativeError { return .cancelled }
+        if cancelled || error is CancellationError || error is MLXGenerationGate.Cancelled
+            || result?.stopReason == .cancelled { return .cancelled }
+        if let error = error as? LocalAPIStrictBudgetError { return .rejected(error) }
+        if error != nil { return .failed }
+        guard let result else { return .unavailable }
+        return .completed(result)
+    }
+}
+
+/// Native completion paths may race cancellation. Publish one typed terminal
+/// before the legacy completion callback closes the consumer's token stream.
+final class AssistantGenerationCompletion: Sendable {
+    private let finished = OSAllocatedUnfairLock(initialState: false)
+    private let onTerminal: (@Sendable (AssistantGenerationOutcome) -> Void)?
+    private let onComplete: @Sendable (Double) -> Void
+
+    init(onTerminal: (@Sendable (AssistantGenerationOutcome) -> Void)?,
+         onComplete: @escaping @Sendable (Double) -> Void) {
+        self.onTerminal = onTerminal
+        self.onComplete = onComplete
+    }
+
+    func finish(_ outcome: AssistantGenerationOutcome, rate: Double) {
+        let first = finished.withLock { value in
+            guard !value else { return false }
+            value = true
+            return true
+        }
+        guard first else { return }
+        onTerminal?(outcome)
+        onComplete(rate)
+    }
+}
+
 // MARK: - Per-family Assistant execution policy
 
 /// Text generation has a very different memory envelope from image analysis,
@@ -268,6 +317,18 @@ final class CodingAssistantService: ObservableObject {
         return max(320, context - output - 256)
     }
 
+    /// Typed admission outcome for non-UI runtime adapters. Never classify a
+    /// refusal by parsing its user-facing/localized message.
+    enum AdmissionRefusal: Equatable, Sendable { case memory, thermal, residency }
+    private(set) var admissionRefusal: AdmissionRefusal?
+    /// Changes synchronously when teardown starts, even if native cleanup is
+    /// still draining. Adapters can reject callbacks from a reclaimed runtime.
+    private(set) var runtimeSessionID = UUID()
+    var hasUsableLocalRuntime: Bool {
+        activeExecutionLocation == .localDownloaded && hasResidentRuntime
+            && (state == .ready || state == .generating)
+    }
+
     @Published private(set) var state: ServiceState = .unloaded
     @Published private(set) var tokenRate: Double = 0
     /// Estimated token count of the trimmed input sent on the last generate().
@@ -348,6 +409,25 @@ final class CodingAssistantService: ObservableObject {
                 DeviceSafetyMonitor.shared.recommendedMaxTokens
             )
         )
+    }
+
+    var localAPIStrictRuntimeLimits: LocalAPIRuntimeLimits {
+        let profile = ModelCapabilityProfile.resolve(for: activeModel)
+        let context = activeModel.runtime == .llamaCpp
+            ? Int(Self.importedGGUFContextTokens(repoID: activeModel.repoID))
+            : MLXAssistantExecutionProfile.resolve(repoID: activeModel.repoID,
+                catalogContextLength: activeModel.contextWindowTokens,
+                supportsThinking: activeModel.supportsThinking).maxContextTokens
+        let maximum = min(localAPIEffectiveMaximumOutputTokens,
+                          activeModel.runtime == .llamaCpp ? context / 4 : max(1, context - 16))
+        return .init(contextWindow: context, maximumOutputTokens: maximum,
+                     defaultOutputTokens: min(profile.defaultOutputTokens, maximum),
+                     limitSource: .runtime, tokenCountMode: .conservativeApproximation)
+    }
+
+    func localAPIStrictPromptBound(messages: [ChatMessage]) -> LocalAPITokenCount {
+        LocalAPIStrictInput.upperBound(prompt: LocalAPIStrictInput.prompt(messages: messages,
+            template: activeModel.chatTemplate, thinking: resolvedThinkingEnabled(forceNoThinking: false)))
     }
 
     enum ServiceState: Equatable {
@@ -447,7 +527,9 @@ final class CodingAssistantService: ObservableObject {
         container ?? LensInferenceLoop.shared.sharedContainer(for: activeModel.repoID)
     }
 
-    private var hasResidentRuntime: Bool {
+    /// Physical ownership, independent of UI readiness or execution location.
+    /// The shared residency authority uses this before allocating another runtime.
+    var hasResidentRuntime: Bool {
 #if CORE_AI_SERVER_APP
         return CoreAIInferenceService.shared.isReady
 #else
@@ -1348,13 +1430,26 @@ final class CodingAssistantService: ObservableObject {
     a heading, label, sentence, or list item directly into the next one.
     """
 
+    /// Direct service callers share the same image reservation as the API
+    /// adapter. Recheck after preparation awaits before native allocation.
+    private func admitTextDuringImageOperation() -> Bool {
+        guard !ModelResidency.shared.imageOperationReserved else {
+            admissionRefusal = .residency
+            return false
+        }
+        return true
+    }
+
     // MARK: - Load
 
     func load(
         allowStorageFallback: Bool = true,
         reselectFromSettings: Bool = true,
-        allowUnsafeMemoryLoad: Bool = false
+        allowUnsafeMemoryLoad: Bool = false,
+        requireLocalFiles: Bool = false
     ) async {
+        admissionRefusal = nil
+        guard admitTextDuringImageOperation() else { return }
         if let unloadTask {
             Diagnostics.shared.breadcrumb(
                 "assistant load waiting for pending unload",
@@ -1371,6 +1466,7 @@ final class CodingAssistantService: ObservableObject {
         // Resolve `model_type: nanbeige` before MLX reads config.json.
         // Registration is actor-isolated and idempotent.
         await NanbeigeMLXRegistration.register()
+        guard admitTextDuringImageOperation() else { return }
 
         // Loading/generation cannot be re-entered. A `.ready` state is only a
         // no-op when its actual runtime still exists; a shared Lens container
@@ -1427,6 +1523,8 @@ final class CodingAssistantService: ObservableObject {
             guard !Task.isCancelled else { return }
         }
 
+        guard admitTextDuringImageOperation() else { return }
+
         // The Lens runtime is the neutral owner for unified text+vision
         // packages. If it already has this model, attach instantly instead of
         // unloading it and loading identical weights through MLXLLM.
@@ -1451,6 +1549,8 @@ final class CodingAssistantService: ObservableObject {
         await LlamaCppVLMService.shared.unloadAndWaitForCleanup()
         await MLXGenerationGate.shared.clearCacheWhenIdle()
 
+        guard !Task.isCancelled, admitTextDuringImageOperation() else { return }
+
         // Resolve and measure the exact directory the native loader will use
         // before admission. Imported models live under a synthetic
         // `local/<folder>` repo id; the older generic lookup missed that path
@@ -1459,6 +1559,10 @@ final class CodingAssistantService: ObservableObject {
         // materializing weights. Weight bytes × workingSetOverhead is the same
         // single peak estimate used by MemoryAdvisor for known local models.
         let stagedDirectory = Self.preStagedDirectory(for: activeModel)
+        if requireLocalFiles, stagedDirectory == nil {
+            state = .failed("The selected model is not installed locally.")
+            return
+        }
         let probedWarm = stagedDirectory != nil
         let measuredWeightBytes = stagedDirectory.map {
             Self.sumWeightFiles(in: $0)
@@ -1485,6 +1589,7 @@ final class CodingAssistantService: ObservableObject {
                 allowUnsafeMemoryLoad: allowUnsafeMemoryLoad,
                 measuredFootprintBytes: measuredFootprintBytes
             ) {
+            admissionRefusal = DeviceSafetyMonitor.shared.thermalState == .critical ? .thermal : .memory
             state = .failed(block)
             RuntimeLogCenter.emit(
                 "Memory/safety gate blocked \(activeModel.displayName) · weights=\(Int64(measuredWeightBytes).formattedBytes) · estimatedPeak=\(measuredFootprintBytes?.formattedBytes ?? "unknown") · kv=\(capabilityProfile.maximumKVCacheTokens) tokens · \(block)",
@@ -1571,6 +1676,7 @@ final class CodingAssistantService: ObservableObject {
                 return
             }
             if let reason = DeviceSafetyMonitor.shared.stopReason {
+                admissionRefusal = reason == .thermal ? .thermal : .memory
                 state = .failed(reason.detail)
                 finishLoadDebug(phase: .failed, operation: "Safety gate blocked load", detail: reason.detail, error: reason.detail)
                 return
@@ -1600,6 +1706,7 @@ final class CodingAssistantService: ObservableObject {
                     availableBytes: available,
                     hasIncreasedMemoryEntitlement: MemoryAdvisor.hasIncreasedMemoryLimitEntitlement
                 ) else {
+                    admissionRefusal = .memory
                     throw RuntimeError.modelLoadBlocked(reason: String(
                         format: "This GGUF needs about %.1f GB available in the selected loading mode; the app currently has %.1f GB. Close other apps, enable storage-backed paging, or use a smaller quantization.",
                         Double(minimumNeeded) / 1_000_000_000,
@@ -1805,6 +1912,9 @@ final class CodingAssistantService: ObservableObject {
             // Gated so weight uploads can't race a concurrent MLXVision /
             // FastVLM load or another service's in-flight generate.
             let loadedContainer = try await MLXGenerationGate.shared.run { [weak self, latch, loadID] in
+                guard await MainActor.run(body: { !ModelResidency.shared.imageOperationReserved }) else {
+                    throw MLXGenerationGate.Cancelled()
+                }
                 let previousMemoryLimit = MLX.Memory.memoryLimit
                 let previousCacheLimit = MLX.Memory.cacheLimit
                 if let limit = lowMemoryPolicy.memoryLimitBytes {
@@ -2286,6 +2396,7 @@ final class CodingAssistantService: ObservableObject {
         maxTokensOverride: Int? = nil,
         temperatureOverride: Double? = nil,
         topPOverride: Double? = nil,
+        strictLocalAPI: Bool = false,
         samplerConfig: SamplerConfig? = nil,
         jsonMode: Bool = false,
         toolConstraint: MLXToolCallConstraintConfiguration? = nil,
@@ -2299,18 +2410,34 @@ final class CodingAssistantService: ObservableObject {
         // it (benchmark, compare, quality eval, titler) skip the default.
         onLogprobToken: (@Sendable (TokenLogprob) -> Void)? = nil,
         onGenerationResult: (@Sendable (AssistantGenerationResult) -> Void)? = nil,
+        onTerminal: (@Sendable (AssistantGenerationOutcome) -> Void)? = nil,
         onComplete: @escaping @Sendable (Double) -> Void
     ) {
+        let completion = AssistantGenerationCompletion(onTerminal: onTerminal, onComplete: onComplete)
+        if strictLocalAPI {
+            guard activeExecutionLocation == .localDownloaded, state == .ready, hasUsableLocalRuntime else {
+                completion.finish(.unavailable, rate: 0)
+                return
+            }
+            do {
+                _ = try LocalAPIStrictInput.outputTokens(requested: maxTokensOverride,
+                    promptTokens: localAPIStrictPromptBound(messages: messages).tokens,
+                    limits: localAPIStrictRuntimeLimits)
+            } catch let error as LocalAPIStrictBudgetError {
+                completion.finish(.rejected(error), rate: 0)
+                return
+            } catch { completion.finish(.failed, rate: 0); return }
+        }
 #if CORE_AI_SERVER_APP
         guard CoreAIInferenceService.shared.isReady else {
-            onComplete(0)
+            completion.finish(.unavailable, rate: 0)
             return
         }
         state = .generating
         let started = Date()
         generateTask?.cancel()
         generateTask = Task { @MainActor [weak self] in
-            guard let self else { return }
+            guard let self else { completion.finish(.cancelled, rate: 0); return }
             do {
                 try await CoreAIInferenceService.shared.generate(
                     messages: messages,
@@ -2319,13 +2446,13 @@ final class CodingAssistantService: ObservableObject {
                     onToken: onToken
                 )
                 state = .ready
-                onComplete(Date().timeIntervalSince(started))
+                completion.finish(.unavailable, rate: Date().timeIntervalSince(started))
             } catch is CancellationError {
                 state = .ready
-                onComplete(0)
+                completion.finish(.cancelled, rate: 0)
             } catch {
                 state = .failed(error.localizedDescription)
-                onComplete(0)
+                completion.finish(.failed, rate: 0)
             }
             generateTask = nil
         }
@@ -2339,7 +2466,7 @@ final class CodingAssistantService: ObservableObject {
                 jsonMode: jsonMode,
                 forceNoThinking: forceNoThinking,
                 onToken: onToken,
-                onComplete: onComplete
+                onComplete: { rate in completion.finish(.unavailable, rate: rate) }
             )
             return
         }
@@ -2352,14 +2479,14 @@ final class CodingAssistantService: ObservableObject {
         if case .generating = state {
             let epoch = stopEpoch
             Task { @MainActor [weak self] in
-                guard let self else { onComplete(0); return }
+                guard let self else { completion.finish(.cancelled, rate: 0); return }
                 var waited = 0
                 while case .generating = self.state, waited < 40, self.stopEpoch == epoch {
                     try? await Task.sleep(nanoseconds: 50_000_000)
                     waited += 1
                 }
                 guard self.stopEpoch == epoch, case .ready = self.state else {
-                    onComplete(0)
+                    completion.finish(self.stopEpoch != epoch ? .cancelled : .unavailable, rate: 0)
                     return
                 }
                 self.generate(
@@ -2377,6 +2504,7 @@ final class CodingAssistantService: ObservableObject {
                     onToken: onToken,
                     onLogprobToken: onLogprobToken,
                     onGenerationResult: onGenerationResult,
+                    onTerminal: onTerminal,
                     onComplete: onComplete
                 )
             }
@@ -2395,21 +2523,21 @@ final class CodingAssistantService: ObservableObject {
         if state != .ready || !hasRuntimeModel {
             let epoch = stopEpoch
             Task { [weak self] in
-                guard let self else { onComplete(0); return }
+                guard let self else { completion.finish(.cancelled, rate: 0); return }
                 if case .loading = state {
                     // Another caller is already loading — wait it out, with a
                     // deadline so a wedged load (network stall, HubApi hang)
                     // can't spin this poll forever and freeze the send.
                     let deadline = Date().addingTimeInterval(60)
                     while case .loading = self.state, self.stopEpoch == epoch {
-                        if Date() >= deadline { onComplete(0); return }
+                        if Date() >= deadline { completion.finish(.unavailable, rate: 0); return }
                         try? await Task.sleep(nanoseconds: 100_000_000)
                     }
                 } else if state != .ready {
                     await self.load()
                 }
                 // Stop while this send waited drops it, like a running decode.
-                guard self.stopEpoch == epoch else { onComplete(0); return }
+                guard self.stopEpoch == epoch else { completion.finish(.cancelled, rate: 0); return }
                 let isLoaded = self.activeModel.runtime == .llamaCpp
                     ? self.ggufModel != nil
                     : self.resolvedMLXContainer != nil
@@ -2429,15 +2557,21 @@ final class CodingAssistantService: ObservableObject {
                         onToken: onToken,
                         onLogprobToken: onLogprobToken,
                         onGenerationResult: onGenerationResult,
+                        onTerminal: onTerminal,
                         onComplete: onComplete
                     )
                 } else {
-                    onComplete(0)
+                    let outcome: AssistantGenerationOutcome = switch self.admissionRefusal {
+                    case .memory: .memoryPressure
+                    case .thermal: .thermal
+                    case .residency, nil: .unavailable
+                    }
+                    completion.finish(outcome, rate: 0)
                 }
             }
             return
         }
-        guard case .ready = state else { onComplete(0); return }
+        guard case .ready = state else { completion.finish(.unavailable, rate: 0); return }
 
         // Device-safety gate — refuse to start a fresh generation only when
         // the device is genuinely at .critical thermal state or under
@@ -2446,11 +2580,12 @@ final class CodingAssistantService: ObservableObject {
         let safety = DeviceSafetyMonitor.shared
         if let reason = safety.stopReason {
             ToastCenter.shared.error(reason.title, detail: reason.detail)
-            onComplete(0)
+            completion.finish(.resolve(result: nil, cancelled: false, safetyStop: reason), rate: 0)
             return
         }
 
         generateTask?.cancel()
+        let generationStopEpoch = stopEpoch
         state = .generating
         // User started inference — cancel any pending background
         // prefetch so it doesn't compete for disk bandwidth with
@@ -2566,7 +2701,7 @@ final class CodingAssistantService: ObservableObject {
         // --- JSON Mode (Feature #2) ---
         // Inject JSON-output instructions into the last system message.
         var effectiveMessages = messages
-        let useJSONMode = jsonMode || s.jsonModeEnabled
+        let useJSONMode = LocalAPIStrictInput.usesJSONMode(strictAPI: strictLocalAPI, explicit: jsonMode, global: s.jsonModeEnabled)
         if useJSONMode {
             let jsonHint = s.jsonSchemaHint.isEmpty
                 ? "Respond with valid JSON only. No markdown fences, no commentary."
@@ -2590,7 +2725,7 @@ final class CodingAssistantService: ObservableObject {
         // per-token cost; this cap bounds the count.
         let isImportedGGUF = activeModel.runtime == .llamaCpp
         let messagesForRuntime: [ChatMessage]
-        if isImportedGGUF {
+        if isImportedGGUF && !strictLocalAPI {
             // Imported recurrent Gemma models do not accept system turns, but
             // long-conversation memory must not disappear with the rest of the
             // system prompt. Recast only our bounded memory record as ordinary
@@ -2617,7 +2752,7 @@ final class CodingAssistantService: ObservableObject {
                 deviceContextCap: executionProfile.maxContextTokens,
                 requestedOutputTokens: safeMaxTokens
             )
-        let trimmedMessages = Self.trimToInputBudget(messagesForRuntime, maxTokens: inputBudget)
+        let trimmedMessages = strictLocalAPI ? messagesForRuntime : Self.trimToInputBudget(messagesForRuntime, maxTokens: inputBudget)
 
         // Expose estimated input token count so the UI can render context-window bar.
         estimatedInputTokens = trimmedMessages.map {
@@ -2629,7 +2764,9 @@ final class CodingAssistantService: ObservableObject {
         // Non-ChatML models (Llama, Gemma, Phi) now get proper formatting.
         let template = activeModel.chatTemplate
         let enableThinking = resolvedThinkingEnabled(forceNoThinking: forceNoThinking)
-        let manualPrompt: String? = template.supportsThinking
+        let manualPrompt: String? = strictLocalAPI
+            ? LocalAPIStrictInput.prompt(messages: trimmedMessages, template: template, thinking: enableThinking)
+            : template.supportsThinking
             ? trimmedMessages.formattedWithTemplate(template, enableThinking: enableThinking)
             : trimmedMessages.formattedWithTemplate(template)
 
@@ -2675,6 +2812,7 @@ final class CodingAssistantService: ObservableObject {
                 safeMaxTokens,
                 Self.importedGGUFMaxOutputTokens(repoID: activeModel.repoID)
             )
+            let strictLimits = localAPIStrictRuntimeLimits
             let ggufPrompt: String = {
                 if let manualPrompt, !manualPrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     return manualPrompt
@@ -2743,6 +2881,11 @@ final class CodingAssistantService: ObservableObject {
                         rate = completedRate.withLock { $0 }
                         generationResult = nil
                     } else {
+                        if strictLocalAPI {
+                            let exact = try ggufModel.tokenCount(for: ggufPrompt)
+                            _ = try LocalAPIStrictInput.outputTokens(requested: ggufMaxTokens,
+                                promptTokens: exact, limits: strictLimits)
+                        }
                         let result = try ggufModel.generateText(
                             // Imported GGUFs are standalone community models.
                             // Use the app chat template (not a bare role: transcript)
@@ -2784,7 +2927,9 @@ final class CodingAssistantService: ObservableObject {
                                 tokensPerSecond: rate
                             )
                         }
-                        onComplete(rate)
+                        completion.finish(.resolve(result: generationResult,
+                            cancelled: Task.isCancelled || !ownsState || service.stopEpoch != generationStopEpoch,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: rate)
                     }
                 } catch is CancellationError {
                     await MainActor.run {
@@ -2793,7 +2938,8 @@ final class CodingAssistantService: ObservableObject {
                             service.generateTask = nil
                             if case .generating = service.state { service.state = .ready }
                         }
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                     }
                 } catch LlamaCppError.cancelled {
                     await MainActor.run {
@@ -2809,7 +2955,8 @@ final class CodingAssistantService: ObservableObject {
                             "GGUF assistant generation cancelled",
                             category: "assistant"
                         )
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                     }
                 } catch {
                     await MainActor.run {
@@ -2823,20 +2970,23 @@ final class CodingAssistantService: ObservableObject {
                             // "not loaded or busy" until the user reloads it.
                             service.state = service.hasResidentRuntime
                                 ? .ready
-                                : .failed(error.localizedDescription)
+                                : .failed(strictLocalAPI ? "Local API generation failed." : error.localizedDescription)
                         }
                         Diagnostics.shared.error(
-                            "GGUF assistant generation failed · \(error.localizedDescription)",
+                            strictLocalAPI ? "GGUF local API generation failed." : "GGUF assistant generation failed · \(error.localizedDescription)",
                             category: "assistant"
                         )
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, error: error,
+                            cancelled: Task.isCancelled || service.stopEpoch != generationStopEpoch,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                     }
                 }
             }
             return
         }
 
-        guard let container = resolvedMLXContainer else { onComplete(0); return }
+        guard let container = resolvedMLXContainer else { completion.finish(.unavailable, rate: 0); return }
+        let strictLimits = localAPIStrictRuntimeLimits
 
         let generationID = UUID()
         activeMLXGenerationID = generationID
@@ -2933,9 +3083,9 @@ final class CodingAssistantService: ObservableObject {
                         // `UserInput.tools` through the tokenizer's own chat
                         // template. A manually formatted prompt cannot carry
                         // tool schemas or correlate tool results.
-                        let useManualPrompt = nativeTools.isEmpty
+                        let useManualPrompt = strictLocalAPI || (nativeTools.isEmpty
                             && !template.format.hasPrefix("generic")
-                            && !useVisionChat
+                            && !useVisionChat)
                         var userInput: UserInput
                         if useManualPrompt, let manualPrompt {
                             userInput = UserInput(prompt: manualPrompt)
@@ -3001,6 +3151,10 @@ final class CodingAssistantService: ObservableObject {
                             }
                         }
                         let lmInput = try await generationContext.processor.prepare(input: userInput)
+                        if strictLocalAPI {
+                            _ = try LocalAPIStrictInput.outputTokens(requested: safeMaxTokens,
+                                promptTokens: lmInput.text.tokens.size, limits: strictLimits)
+                        }
                         let cache = generationContext.model.newCache(parameters: params)
 
                         let generationStream: AsyncStream<Generation>
@@ -3095,7 +3249,8 @@ final class CodingAssistantService: ObservableObject {
                         activeID: self?.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(rate)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: rate)
                         return
                     }
                     self?.activeMLXGenerationID = nil
@@ -3112,7 +3267,9 @@ final class CodingAssistantService: ObservableObject {
                         tokens: generatedTokens,
                         tokensPerSecond: rate
                     )
-                    onComplete(rate)
+                    completion.finish(.resolve(result: generationResult,
+                        cancelled: Task.isCancelled || self?.stopEpoch != generationStopEpoch,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: rate)
                     // Re-arm the background prefetch now that the LLM
                     // is idle again. If the user is between messages
                     // we'll prime the VLM's page cache for the next
@@ -3126,13 +3283,15 @@ final class CodingAssistantService: ObservableObject {
                         activeID: self?.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     self?.activeMLXGenerationID = nil
                     self?.generateTask = nil
                     if case .generating = self?.state { self?.state = .ready }
-                    onComplete(0)
+                    completion.finish(.resolve(result: nil, cancelled: true,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                 }
 
             } catch is MLXGenerationGate.Cancelled {
@@ -3142,26 +3301,30 @@ final class CodingAssistantService: ObservableObject {
                         activeID: self?.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     self?.activeMLXGenerationID = nil
                     self?.generateTask = nil
                     if case .generating = self?.state { self?.state = .ready }
-                    onComplete(0)
+                    completion.finish(.resolve(result: nil, cancelled: true,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                 }
 
             } catch {
                 await MainActor.run { [weak self] in
                     guard let self else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     guard AssistantGenerationOwnership.isCurrent(
                         activeID: self.activeMLXGenerationID,
                         completingID: generationID
                     ) else {
-                        onComplete(0)
+                        completion.finish(.resolve(result: nil, cancelled: true,
+                            safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                         return
                     }
                     self.activeMLXGenerationID = nil
@@ -3172,8 +3335,10 @@ final class CodingAssistantService: ObservableObject {
                     // the model was still loaded and could recover.
                     self.state = self.hasResidentRuntime
                         ? .ready
-                        : .failed(error.localizedDescription)
-                    onComplete(0)
+                        : .failed(strictLocalAPI ? "Local API generation failed." : error.localizedDescription)
+                    completion.finish(.resolve(result: nil, error: error,
+                        cancelled: Task.isCancelled || self.stopEpoch != generationStopEpoch,
+                        safetyStop: DeviceSafetyMonitor.shared.stopReason), rate: 0)
                 }
             }
         }
@@ -3588,6 +3753,15 @@ final class CodingAssistantService: ObservableObject {
         return state == .ready && hasResidentRuntime
     }
 
+    /// Adapter handoff barrier. Capture and await the actual task, without a
+    /// timeout or cancellation, before releasing the caller's inference lease.
+    func drainGeneration() async {
+        let inflight = generateTask
+        let pccInflight = pccGenerateTask
+        await inflight?.value
+        await pccInflight?.value
+    }
+
     /// Called during background transition. Cooperatively cancels the active
     /// generation and waits briefly for it to unwind. Does NOT block
     /// indefinitely — the background task expiration handler cancels the
@@ -3644,6 +3818,7 @@ final class CodingAssistantService: ObservableObject {
         policy: AssistantUnloadDrainPolicy
     ) -> Task<Void, Never> {
         if let unloadTask { return unloadTask }
+        runtimeSessionID = UUID()
 
         let taskID = UUID()
         unloadTaskID = taskID
@@ -3794,7 +3969,8 @@ final class CodingAssistantService: ObservableObject {
     /// opt into making the choice the default. No-op when already active.
     func switchTo(
         _ model: AssistantModel,
-        persistAsDefault: Bool = true
+        persistAsDefault: Bool = true,
+        requireLocalFiles: Bool = false
     ) async {
 #if CORE_AI_SERVER_APP
         // The Core AI product has one manifest-selected runtime. The picker is
@@ -3887,7 +4063,8 @@ final class CodingAssistantService: ObservableObject {
         // intentionally do not persist that choice as the default, so a
         // settings reselect here would immediately replace `model` with the
         // saved default before loading it.
-        await load(reselectFromSettings: false)
+        await load(allowStorageFallback: !requireLocalFiles, reselectFromSettings: false,
+                   requireLocalFiles: requireLocalFiles)
     }
 
     /// Loads a small model for a one-shot background analysis without changing

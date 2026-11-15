@@ -45,10 +45,10 @@ jobs:
             exit 1
           fi
 
-          artifact="ios-local-llm-${version}-source.tar.gz"
+          artifact="phone-coder-${version}-source.tar.gz"
           git archive \
             --format=tar \
-            --prefix="ios-local-llm-${version}/" \
+            --prefix="phone-coder-${version}/" \
             HEAD |
             gzip --best --no-name > "$artifact"
           shasum -a 256 "$artifact" > "$artifact.sha256"
@@ -76,5 +76,5 @@ jobs:
             --fail-on-no-commits \
             --generate-notes \
             --notes "Source-only release. No signed app binary or model weights are included. Verify the attached archive with Docs/RELEASE_VERIFICATION.md." \
-            --title "iOS Local LLM $RELEASE_TAG" \
+            --title "Phone Coder $RELEASE_TAG" \
             --verify-tag

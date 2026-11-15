@@ -554,7 +554,7 @@ final class MemoryPressureCoordinator {
         MLXVisionService.shared.unload()
         LlamaCppVLMService.shared.unload()
         FastVLMService.shared.unload()
-        ImageGenerationService.shared.unload()
+        ImageGenerationService.shared.unload(reason: .safety)
         Task { await MLXGenerationGate.shared.clearCacheWhenIdle() }
     }
 }

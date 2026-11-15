@@ -98,7 +98,7 @@ targets:
           # Phone Coder owns the native five-tab shell under PhoneCoder/App.
           # Retain the inference and safety services, while keeping the legacy
           # assistant, lens, voice, settings, and bridge UI surfaces excluded.
-          - "**/Views/**"
+          - "Views/**"
           - "**/ViewModels/**"
           - "**/TipsManager.swift"
           - "**/Services/Intents/**"
@@ -256,6 +256,15 @@ targets:
       - path: IOSLocalLLMTests/URLSafetyValidatorTests.swift
       - path: IOSLocalLLMTests/PhoneCoderAppIdentityTests.swift
       - path: IOSLocalLLMTests/PhoneCoderRootNavigationTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderAPIContractTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderRequestLedgerTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderPairingTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderInferenceCoordinatorTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderServerControllerTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderAPIServerTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderViewModelTests.swift
+      - path: IOSLocalLLMTests/PhoneCoderImageGenerationTests.swift
+      - path: IOSLocalLLMTests/HighRiskServiceTests.swift
     dependencies:
       - target: PhoneCoder
     settings:
@@ -279,6 +288,25 @@ targets:
           - "$(SRCROOT)/ThirdParty/llama.cpp/include"
           - "$(SRCROOT)/ThirdParty/llama.cpp/ggml/include"
           - "$(SRCROOT)/ThirdParty/whisper.cpp/include"
+
+  PhoneCoderUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "18.0"
+    sources:
+      - path: IOSLocalLLMUITests/PhoneCoderKeyboardTests.swift
+      - path: IOSLocalLLMUITests/PhoneCoderPresentationTests.swift
+    dependencies:
+      - target: PhoneCoder
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.haider.phonecoder.uitests
+        TEST_TARGET_NAME: PhoneCoder
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_EMIT_LOC_STRINGS: NO
+        SWIFT_OBJC_BRIDGING_HEADER: ""
 
   # Independent iOS 27/Core AI server product. This deliberately owns a
   # separate bundle and settings namespace while reusing the reference
@@ -404,10 +432,12 @@ schemes:
       targets:
         PhoneCoder: all
         PhoneCoderTests: [test]
+        PhoneCoderUITests: [test]
     test:
       config: Debug
       targets:
         - PhoneCoderTests
+        - PhoneCoderUITests
     archive:
       config: Release
 

@@ -381,6 +381,18 @@ Accessibility, localization stress, diagnostics, migration, battery/thermal obse
 
 ## Acceptance criteria
 
+### Live-device remediation amendment — 2026-11-11
+
+- Preserve the approved native dock exactly: Chat, Models, Server, Images, Settings; Server remains the default center tab.
+- Every Phone Coder text and numeric input has explicit native focus ownership and a visible keyboard-dismiss action. Dismissing the keyboard preserves drafts; successful Send, Generate, and Apply actions clear focus.
+- Chat remains a text-only local conversation surface with a compact model/privacy header, readable message groups, a bottom composer, inline recovery, Dynamic Type, VoiceOver, RTL, light/dark mode, and 44-point targets.
+- Image generation distinguishes download presence, readiness/admission, loading, denoising, decoding/finalizing, success, cancellation, and failure. A failed or cancelled operation cannot leave a previous image presented as the new result, and undecodable output is a failure rather than success.
+- Image diagnostics use fixed, redacted categories and expose only model/stage/dimensions/steps plus safe memory, thermal, entitlement, and file-validation summaries. Prompts, negative prompts, images, credentials, file paths, and raw exception dumps are excluded.
+- Settings, Models, and Images share one advisory device snapshot that separates physical RAM, current app footprint, estimated process ceiling, current model headroom, process-available memory, thermal state, increased-memory entitlement, and sample time. Unavailable measurements are never displayed as zero.
+- Displayed memory is advisory. Existing runtime admission, `ModelResidency`, `MLXGenerationGate`, thermal, lifecycle, crash-recovery, and cancellation-drain owners remain authoritative and recheck immediately before heavy work.
+- Core screens use system typography, semantic system colors, SF Symbols, restrained native surfaces, one clear primary action, progressive disclosure for technical details, and the existing navigation hierarchy. No custom dock, cloud fallback, content classifier, or second model loader is introduced.
+- Automated verification is separated into deterministic unit/presentation tests, native integration/UI checks, and live physical iPhone evidence. The amendment is not release-qualified until the exact packaged build passes the affected flows on the iPhone 17 Pro Max.
+
 ### Installation
 
 - A clean Ubuntu machine can trigger/download the documented IPA artifact and install it using the supported Linux SideStore bootstrap.

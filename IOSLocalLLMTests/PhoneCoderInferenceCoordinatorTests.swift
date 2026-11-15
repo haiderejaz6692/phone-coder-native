@@ -1,0 +1,766 @@
+import XCTest
+import CryptoKit
+import os
+@testable import PhoneCoder
+
+final class PhoneCoderInferenceCoordinatorTests: XCTestCase {
+    @MainActor
+    func testImageDownloadReservationRejectsTextLoadUntilOperationRetires() async throws {
+        let residency = ModelResidency()
+        let download = ImageOperationBarrier()
+        let operation = try XCTUnwrap(residency.startImageOperation { _ in await download.wait() })
+        await download.waitForEntry()
+        let adapter = OnDeviceTextRuntimeAdapter(residency: residency)
+        do {
+            _ = try await adapter.load(modelID: "text-during-image-download")
+            XCTFail("Text load must refuse before looking up or allocating a model")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .residencyUnavailable) }
+        XCTAssertTrue(residency.imageOperationReserved)
+        download.release()
+        await operation.value
+        XCTAssertFalse(residency.imageOperationReserved)
+    }
+
+    @MainActor
+    func testDirectTextLoadHonorsTheSharedImageReservation() async throws {
+        let residency = ModelResidency.shared
+        let native = ImageOperationBarrier()
+        let operation = try XCTUnwrap(residency.startImageOperation { _ in await native.wait() })
+        await native.waitForEntry()
+        await CodingAssistantService.shared.load(requireLocalFiles: true)
+        XCTAssertEqual(CodingAssistantService.shared.admissionRefusal, .residency)
+        native.release()
+        await operation.value
+    }
+
+    @MainActor
+    func testCancelledImageRetainsReservationUntilNativeDrainBeforeReplacement() async throws {
+        let residency = ModelResidency()
+        let native = ImageOperationBarrier()
+        var firstCancelled = false
+        let first = try XCTUnwrap(residency.startImageOperation { _ in
+            await native.wait()
+            firstCancelled = Task.isCancelled
+        })
+        await native.waitForEntry()
+        residency.cancelImageOperation()
+        XCTAssertTrue(residency.imageOperationReserved)
+        XCTAssertNil(residency.startImageOperation { _ in XCTFail("Replacement overlapped native work") })
+        XCTAssertFalse(residency.textRuntimeAvailable)
+        native.release()
+        await first.value
+        XCTAssertTrue(firstCancelled)
+        XCTAssertFalse(residency.imageOperationReserved)
+        let replacement = ImageOperationBarrier()
+        let second = try XCTUnwrap(residency.startImageOperation { _ in await replacement.wait() })
+        await replacement.waitForEntry()
+        await first.value
+        XCTAssertTrue(residency.imageOperationReserved, "Old completion cannot clear replacement")
+        residency.cancelImageOperation()
+        XCTAssertTrue(residency.imageOperationReserved)
+        replacement.release()
+        await second.value
+        XCTAssertFalse(residency.imageOperationReserved)
+    }
+
+    func testCancellationSignalClosesTheCrossActorAdmissionWindow() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let loaded = try await coordinator.switchModel(to: "model")
+        var input = request("cancel-before-admission")
+        input.strictAPI = true; input.expectedModelSessionID = loaded.id
+        let cancellation = PhoneCoderRequestCancellation()
+        input.cancellationSignal = cancellation
+        cancellation.cancel()
+        do { _ = try await coordinator.enqueue(input) { _ in }; XCTFail("Already cancelled work cannot enter the queue") }
+        catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .cancelled) }
+        let starts = await runtime.startedIDs
+        XCTAssertTrue(starts.isEmpty)
+    }
+
+    func testCancellationMarkedDuringRuntimeActorHopNeverInvokesGenerateOrReload() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+            XCTFail("Cancellation must never reconstruct")
+            return runtime
+        })
+        let loaded = try await coordinator.switchModel(to: "model")
+        let baseline = await runtime.operations
+        await runtime.holdAvailability()
+        var input = request("cancel-in-hop")
+        input.strictAPI = true; input.expectedModelSessionID = loaded.id
+        let cancellation = PhoneCoderRequestCancellation()
+        input.cancellationSignal = cancellation
+        let pending = try await coordinator.enqueue(input) { _ in XCTFail("Cancelled admission emitted output") }
+        await runtime.waitForAvailability()
+        cancellation.cancel()
+        await runtime.releaseAvailability()
+        await assertError(pending, .cancelled)
+        let operations = await runtime.operations
+        // Catches any generate/reload/unload after cancellation, independently
+        // of the conservative unload performed by switchModel during setup.
+        XCTAssertEqual(operations, baseline)
+    }
+
+    func testMarkedCancellationWinsAConcurrentNativeFaultWithoutRetry() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+            XCTFail("Cancellation must never reconstruct")
+            return runtime
+        })
+        var input = request("cancel-fault")
+        let cancellation = PhoneCoderRequestCancellation()
+        input.cancellationSignal = cancellation
+        let pending = try await coordinator.enqueue(input) { _ in }
+        await runtime.waitForStarts(1)
+        cancellation.cancel()
+        await runtime.fail(.runtimeFailure)
+        await assertError(pending, .cancelled)
+    }
+
+    @MainActor
+    func testAdapterRejectsMarkedSignalBeforeAccessingNativeGeneration() async throws {
+        let adapter = OnDeviceTextRuntimeAdapter()
+        let before = CodingAssistantService.shared.runtimeSessionID
+        var input = request("adapter-cancel")
+        input.cancellationSignal = PhoneCoderRequestCancellation()
+        input.cancellationSignal?.cancel()
+        do {
+            _ = try await adapter.generate(input, session: .init(id: UUID(), modelID: "model")) { _ in XCTFail("Unexpected native output") }
+            XCTFail("Marked signal must reject before native/session admission")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .cancelled) }
+        XCTAssertEqual(CodingAssistantService.shared.runtimeSessionID, before)
+    }
+
+    func testStrictAPIRequiresExplicitLoadedSessionAndPreservesPreflightLimits() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        var input = request("strict")
+        input.strictAPI = true
+        do { _ = try await coordinator.enqueue(input) { _ in }; XCTFail("API must never autoload") }
+        catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .staleSession) }
+        let untouched = await runtime.operations
+        XCTAssertTrue(untouched.isEmpty)
+        let loaded = try await coordinator.switchModel(to: "model")
+        input.expectedModelSessionID = loaded.id
+        let limits = try await coordinator.capabilities()
+        XCTAssertEqual(limits.limits.maximumOutputTokens, 64)
+        let prepared = try await coordinator.preflight(input)
+        XCTAssertEqual(prepared.prompt.mode, .conservativeApproximation)
+        XCTAssertEqual(prepared.outputTokens, 32)
+        input.maxTokens = 65
+        do { _ = try await coordinator.preflight(input); XCTFail("Output cannot be silently clamped") }
+        catch { XCTAssertEqual((error as? LocalAPIStrictBudgetError)?.code, "output_tokens_exceeded") }
+        var oversized = PhoneCoderGenerationRequest(id: input.id, sessionID: sessionID, modelID: "model",
+            messages: [ChatMessage(role: .system, content: String(repeating: "s", count: 600))])
+        oversized.strictAPI = true; oversized.expectedModelSessionID = loaded.id
+        do { _ = try await coordinator.preflight(oversized); XCTFail("System input cannot be dropped to fit") }
+        catch { XCTAssertEqual((error as? LocalAPIStrictBudgetError)?.code, "context_length_exceeded") }
+        _ = try await coordinator.switchModel(to: "model")
+        do { _ = try await coordinator.enqueue(input) { _ in }; XCTFail("Stale preflight cannot generate") }
+        catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .staleSession) }
+    }
+
+    func testStrictBudgetRejectionSurvivesNativeOutcomeMapping() {
+        let refusal = LocalAPIStrictBudgetError(code: "context_length_exceeded", promptTokens: 900, outputTokens: 32, contextWindow: 512)
+        XCTAssertThrowsError(try PhoneCoderRuntimeMapping.result(from: .rejected(refusal))) {
+            XCTAssertEqual($0 as? LocalAPIStrictBudgetError, refusal)
+        }
+    }
+
+    func testLifecycleDrainWaitsForInFlightModelSwitchAndRejectsItsLateSession() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        await runtime.holdLoad()
+        let switching = Task { try await coordinator.switchModel(to: "model") }
+        await runtime.waitForLoad()
+        let drain = await coordinator.suspendForLifecycle()
+        let resumption = await coordinator.resumeAfterLifecycle()
+        do {
+            _ = try await coordinator.enqueue(request("during-load-drain")) { _ in }
+            XCTFail("Foreground resume must wait for the interrupted native load")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .lifecycleUnavailable) }
+        await runtime.releaseLoad()
+        do { _ = try await switching.value; XCTFail("An interrupted load cannot publish its session") }
+        catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .lifecycleUnavailable) }
+        await drain.value
+        let reopened = await resumption.value
+        XCTAssertTrue(reopened)
+        let state = await coordinator.state()
+        XCTAssertNil(state.modelSession)
+        XCTAssertEqual(state.availability, .unavailable(.modelUnavailable))
+    }
+
+    func testLifecycleSuspensionCancelsQueueAndRejectsAdmissionUntilDrain() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let sink = EventCollector()
+        let active = try await coordinator.enqueue(request("active")) { await sink.append($0) }
+        await runtime.waitForStarts(1)
+        let queued = try await coordinator.enqueue(request("queued")) { await sink.append($0) }
+        await runtime.holdCancellation()
+        let drain = await coordinator.suspendForLifecycle()
+        await runtime.waitForCancellation()
+        await assertError(queued, .cancelled)
+        do {
+            _ = try await coordinator.enqueue(request("background")) { _ in }
+            XCTFail("Suspended admission must fail")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .lifecycleUnavailable) }
+        await runtime.emitFromStart(0, text: "late")
+        let events = await sink.events
+        XCTAssertTrue(events.isEmpty)
+        let health = await coordinator.state()
+        XCTAssertEqual(health.availability, .unavailable(.lifecycleUnavailable))
+        await runtime.releaseCancellation()
+        await drain.value
+        await assertError(active, .cancelled)
+        let resumption = await coordinator.resumeAfterLifecycle()
+        let resumed = await resumption.value
+        XCTAssertTrue(resumed)
+        let next = try await coordinator.enqueue(request("new")) { _ in }
+        await runtime.waitForStarts(2)
+        let starts = await runtime.startedIDs
+        XCTAssertEqual(starts, ["active", "new"])
+        await runtime.succeed()
+        _ = try await next.value
+        let operations = await runtime.operations
+        XCTAssertFalse(operations.contains("unload"))
+    }
+
+    func testNewSuspensionInvalidatesResumeWaitingForNativeDrain() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let handle = try await coordinator.enqueue(request("active")) { _ in }
+        await runtime.waitForStarts(1)
+        await runtime.holdCancellation()
+        _ = await coordinator.suspendForLifecycle()
+        await runtime.waitForCancellation()
+        // The actor captures the epoch before returning its drain-wait task.
+        let resume = await coordinator.resumeAfterLifecycle()
+        let newestDrain = await coordinator.suspendForLifecycle()
+        await runtime.releaseCancellation()
+        await newestDrain.value
+        let reopened = await resume.value
+        XCTAssertFalse(reopened)
+        await assertError(handle, .cancelled)
+        do {
+            _ = try await coordinator.enqueue(request("stale-resume")) { _ in }
+            XCTFail("Newer suspension must remain closed")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .lifecycleUnavailable) }
+    }
+
+    func testExternalNativeCancellationDoesNotReconstruct() async throws {
+        let outcomes = [CancellationError() as Error, LlamaCppError.cancelled, MLXGenerationGate.Cancelled()]
+            .map { AssistantGenerationOutcome.resolve(result: nil, error: $0, cancelled: false) }
+            + [.resolve(result: nil, cancelled: true)]
+        for outcome in outcomes {
+            let runtime = ControlledTextRuntime()
+            let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+                XCTFail("An upstream stop must never restart generation")
+                return runtime
+            })
+            let handle = try await coordinator.enqueue(request("external-stop")) { _ in }
+            await runtime.waitForStarts(1)
+            // No coordinator.cancel: exercise the production native-error and
+            // adapter classifiers at the expensive runtime boundary.
+            await runtime.finishFromUpstream(outcome)
+            await assertError(handle, .cancelled)
+            let operations = await runtime.operations
+            XCTAssertEqual(operations, ["load:model", "start:external-stop"])
+        }
+    }
+
+    func testNativeTerminalClassificationPreservesCancellationSafetyAndFaults() throws {
+        let result = AssistantGenerationResult(promptTokenCount: 2, completionTokenCount: 3, stopReason: .stop)
+        XCTAssertEqual(try PhoneCoderRuntimeMapping.result(from: .completed(result)), result)
+        let cases: [(AssistantGenerationOutcome, PhoneCoderRuntimeError)] = [
+            (.cancelled, .cancelled), (.memoryPressure, .memoryPressure), (.thermal, .thermal),
+            (.unavailable, .modelUnavailable), (.failed, .runtimeFailure),
+            (.resolve(result: nil, cancelled: false), .modelUnavailable),
+            (.resolve(result: result, cancelled: true), .cancelled),
+            (.resolve(result: nil, error: NSError(domain: "engine", code: 1), cancelled: false), .runtimeFailure),
+            (.resolve(result: nil, error: CancellationError(), cancelled: false, safetyStop: .memoryPressure), .memoryPressure),
+            (.resolve(result: nil, error: MLXGenerationGate.Cancelled(), cancelled: false, safetyStop: .thermal), .thermal)
+        ]
+        for (outcome, expected) in cases {
+            XCTAssertThrowsError(try PhoneCoderRuntimeMapping.result(from: outcome)) {
+                XCTAssertEqual($0 as? PhoneCoderRuntimeError, expected)
+            }
+        }
+        let cancelled = AssistantGenerationResult(promptTokenCount: 2, completionTokenCount: 0, stopReason: .cancelled)
+        XCTAssertEqual(AssistantGenerationOutcome.resolve(result: cancelled, cancelled: false), .cancelled)
+    }
+
+    func testNativeTerminalCallbackIsExactlyOnceAndPrecedesLegacyCompletion() {
+        let observations = OSAllocatedUnfairLock(initialState: [String]())
+        let completion = AssistantGenerationCompletion(onTerminal: { _ in
+            observations.withLock { $0.append("terminal") }
+        }, onComplete: { _ in observations.withLock { $0.append("legacy") } })
+        completion.finish(.cancelled, rate: 0)
+        completion.finish(.failed, rate: 0)
+        XCTAssertEqual(observations.withLock { $0 }, ["terminal", "legacy"])
+    }
+
+    @MainActor
+    func testProductionResidencyAndSafetyMappingUsesUpstreamStates() {
+        func residency(image: ImageGenerationService.State = .ready,
+                       lens: LensInferenceLoop.State = .unloaded,
+                       llama: LlamaCppVLMService.State = .unloaded,
+                       fast: FastVLMComponentStatus = .init()) -> Bool {
+            ModelResidency.textRuntimeAvailable(image: image, lens: lens, llama: llama,
+                                                fast: fast, fastGenerating: false)
+        }
+        XCTAssertTrue(residency()) // diffusion ready means installed, not resident
+        XCTAssertFalse(residency(image: .downloading(0.25)))
+        XCTAssertFalse(residency(image: .loading))
+        XCTAssertFalse(residency(image: .generating(0.5)))
+        XCTAssertFalse(residency(lens: .ready))
+        XCTAssertFalse(residency(llama: .generating))
+        XCTAssertFalse(residency(fast: .init(encoder: .ready)))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: nil,
+            textResidencyAvailable: residency(image: .generating(0.5)), foregrounded: true, sessionIsUsable: true),
+            .unavailable(.residencyUnavailable))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .critical, stopReason: nil,
+            textResidencyAvailable: true, foregrounded: true, sessionIsUsable: true), .unavailable(.thermal))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: .memoryPressure,
+            textResidencyAvailable: true, foregrounded: true, sessionIsUsable: true), .unavailable(.memoryPressure))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: nil,
+            textResidencyAvailable: true, foregrounded: false, sessionIsUsable: true), .unavailable(.residencyUnavailable))
+        XCTAssertEqual(PhoneCoderRuntimeMapping.availability(thermal: .nominal, stopReason: nil,
+            textResidencyAvailable: true, foregrounded: true, sessionIsUsable: false), .unavailable(.modelUnavailable))
+    }
+
+    // Removing the active lease or changing FIFO admission must break this test.
+    func testOneLeaseFIFOAndFourWaitingLimit() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let first = try await coordinator.enqueue(request("0")) { _ in }
+        await runtime.waitForStarts(1)
+        var pending: [Task<PhoneCoderGenerationResult, Error>] = []
+        for id in 1...4 { pending.append(try await coordinator.enqueue(request("\(id)")) { _ in }) }
+        do {
+            _ = try await coordinator.enqueue(request("overflow")) { _ in }
+            XCTFail("A fifth waiter must be rejected")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .queueFull) }
+        let starts = await runtime.startedIDs
+        XCTAssertEqual(starts, ["0"])
+        await runtime.succeed()
+        _ = try await first.value
+        for index in 0..<4 {
+            await runtime.waitForStarts(index + 2)
+            let order = await runtime.startedIDs
+            XCTAssertEqual(order, (0...(index + 1)).map(String.init))
+            await runtime.succeed()
+            _ = try await pending[index].value
+        }
+    }
+
+    func testQueuedAndActiveCancellationDrainBeforeNextLease() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let active = try await coordinator.enqueue(request("active")) { _ in }
+        await runtime.waitForStarts(1)
+        let queued = try await coordinator.enqueue(request("queued")) { _ in }
+        let next = try await coordinator.enqueue(request("next")) { _ in }
+        await coordinator.cancel(requestID: request("queued").id, sessionID: sessionID)
+        await assertError(queued, .cancelled)
+        await runtime.holdCancellation()
+        let activeID = request("active").id
+        let capturedSession = sessionID
+        let cancellation = Task { await coordinator.cancel(requestID: activeID, sessionID: capturedSession) }
+        await runtime.waitForCancellation()
+        let whileDraining = await runtime.startedIDs
+        XCTAssertEqual(whileDraining, ["active"])
+        await runtime.releaseCancellation()
+        await cancellation.value
+        await assertError(active, .cancelled)
+        await runtime.waitForStarts(2)
+        let order = await runtime.startedIDs
+        XCTAssertEqual(order, ["active", "next"])
+        await runtime.succeed()
+        _ = try await next.value
+    }
+
+    func testSwitchCancelsOldQueueAndRejectsLateCallbacks() async throws {
+        let runtime = ControlledTextRuntime()
+        let sink = EventCollector()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let active = try await coordinator.enqueue(request("old")) { await sink.append($0) }
+        await runtime.waitForStarts(1)
+        let queued = try await coordinator.enqueue(request("queued")) { await sink.append($0) }
+        let oldSession = await runtime.lastSession
+        await runtime.holdCancellation()
+        let switching = Task { try await coordinator.switchModel(to: "other") }
+        await runtime.waitForCancellation()
+        let whileDraining = await runtime.operations
+        XCTAssertEqual(whileDraining, ["load:model", "start:old", "cancel:old"])
+        do {
+            _ = try await coordinator.enqueue(request("during-switch")) { _ in }
+            XCTFail("Admission must close while old native work drains")
+        } catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, .switchingModel) }
+        await runtime.releaseCancellation()
+        let newSession = try await switching.value
+        await assertError(active, .cancelled)
+        await assertError(queued, .cancelled)
+        XCTAssertNotEqual(oldSession?.id, newSession.id)
+        await runtime.emitFromStart(0, text: "stale")
+        let events = await sink.events
+        XCTAssertTrue(events.isEmpty)
+        let operations = await runtime.operations
+        XCTAssertEqual(operations, ["load:model", "start:old", "cancel:old", "unload", "load:other"])
+    }
+
+    func testCapturedIdentitiesGateConsumerAndLedger() async throws {
+        let runtime = ControlledTextRuntime()
+        let ledger = PhoneCoderRequestLedger(sessionID: sessionID)
+        let req = request("same")
+        _ = try await ledger.begin(id: req.id, fingerprint: SHA256.hash(data: Data()), sessionID: sessionID,
+                                   deadline: ContinuousClock.now.advanced(by: .seconds(60)))
+        let sink = EventCollector()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        let handle = try await coordinator.enqueue(req) { event in
+            await sink.append(event)
+            _ = try? await ledger.append(id: event.requestID, event: .chatText(.init(id: "test", model: "model", created: 0), event.text), sessionID: event.sessionID)
+        }
+        await runtime.waitForStarts(1)
+        await runtime.emitFromStart(0, text: "wrong", modelSessionID: UUID())
+        await runtime.emitFromStart(0, text: "wrong", sessionID: UUID())
+        await runtime.emitFromStart(0, text: "valid")
+        await runtime.succeed()
+        _ = try await handle.value
+        let events = await sink.events
+        XCTAssertEqual(events.map(\.text), ["valid"])
+        XCTAssertEqual(events.first?.requestID, req.id)
+        XCTAssertEqual(events.first?.sessionID, sessionID)
+        try await ledger.finish(id: req.id, terminal: .completed, sessionID: sessionID)
+        let replay = try await ledger.attach(id: req.id, fingerprint: SHA256.hash(data: Data()), after: nil)
+        var recorded: [PhoneCoderRequestLedger.SequencedEvent] = []
+        for await event in replay { recorded.append(event) }
+        XCTAssertEqual(recorded.count, 1)
+        XCTAssertEqual(recorded.first?.event, .chatText(.init(id: "test", model: "model", created: 0), "valid"))
+    }
+
+    func testStaleTerminalResultCannotCompleteCurrentRequest() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+            XCTFail("A stale completion must not be retried")
+            return runtime
+        })
+        let handle = try await coordinator.enqueue(request("terminal")) { _ in }
+        await runtime.waitForStarts(1)
+        await runtime.succeed(modelSessionID: UUID())
+        await assertError(handle, .staleSession)
+    }
+
+    func testSafetyRefusalsKeepCategoriesAndNeverReconstruct() async throws {
+        for refusal in [PhoneCoderRuntimeError.memoryPressure, .thermal] {
+            let runtime = ControlledTextRuntime()
+            await runtime.setAvailability(.unavailable(refusal))
+            let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+                XCTFail("Safety refusals must not reconstruct")
+                return runtime
+            })
+            let handle = try await coordinator.enqueue(request("refused")) { _ in }
+            await assertError(handle, refusal)
+            let state = await coordinator.state()
+            XCTAssertEqual(state.availability, .unavailable(refusal))
+        }
+    }
+
+    func testLoadAdmissionErrorsAreNotRetriedOrRelabelled() async throws {
+        for refusal in [PhoneCoderRuntimeError.memoryPressure, .thermal] {
+            let runtime = ControlledTextRuntime()
+            await runtime.setLoadError(refusal)
+            let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+                XCTFail("Load admission must not be retried")
+                return runtime
+            })
+            let handle = try await coordinator.enqueue(request("load-refused")) { _ in }
+            await assertError(handle, refusal)
+            let starts = await runtime.startedIDs
+            XCTAssertTrue(starts.isEmpty)
+        }
+    }
+
+    func testReconstructsOnlyOnceBeforeOutputWithNewSession() async throws {
+        let first = ControlledTextRuntime()
+        let second = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: first, reconstruct: { second })
+        let sink = EventCollector()
+        let handle = try await coordinator.enqueue(request("retry")) { await sink.append($0) }
+        await first.waitForStarts(1)
+        await first.fail(.runtimeFailure)
+        await second.waitForStarts(1)
+        await first.emitFromStart(0, text: "late")
+        await second.fail(.runtimeFailure)
+        await assertError(handle, .runtimeFailure)
+        let events = await sink.events
+        XCTAssertTrue(events.isEmpty)
+        let old = await first.lastSession
+        let new = await second.lastSession
+        XCTAssertNotEqual(old?.id, new?.id)
+        let operations = await first.operations
+        XCTAssertEqual(operations.last, "unload")
+    }
+
+    func testServerPrologueCommitAlsoForbidsRetry() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+            XCTFail("A server prologue already committed to the ledger")
+            return runtime
+        })
+        let handle = try await coordinator.enqueue(request("prologue")) { _ in }
+        await coordinator.markOutputCommitted(requestID: request("prologue").id, sessionID: sessionID)
+        await runtime.waitForStarts(1)
+        await runtime.fail(.runtimeFailure)
+        await assertError(handle, .runtimeFailure)
+    }
+
+    func testCommitWhileReconstructionIsSuspendedPreventsRetry() async throws {
+        let runtime = ControlledTextRuntime()
+        let replacement = ControlledTextRuntime()
+        let gate = ReconstructionGate()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+            await gate.enter()
+            return replacement
+        })
+        let handle = try await coordinator.enqueue(request("reentrant")) { _ in }
+        await runtime.waitForStarts(1)
+        await runtime.fail(.runtimeFailure)
+        await gate.waitForEntry()
+        await coordinator.markOutputCommitted(requestID: request("reentrant").id, sessionID: sessionID)
+        await gate.release()
+        await assertError(handle, .runtimeFailure)
+        let starts = await replacement.startedIDs
+        XCTAssertTrue(starts.isEmpty)
+    }
+
+    func testNeverRetriesAfterFirstCommittedEvent() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: {
+            XCTFail("Output has already committed")
+            return runtime
+        })
+        let sink = EventCollector()
+        let handle = try await coordinator.enqueue(request("partial")) { await sink.append($0) }
+        await runtime.waitForStarts(1)
+        await runtime.emitFromStart(0, text: "partial")
+        await runtime.fail(.runtimeFailure)
+        await assertError(handle, .runtimeFailure)
+        let events = await sink.events
+        XCTAssertEqual(events.map(\.text), ["partial"])
+    }
+
+    func testHealthReadsLiveHeavyResidencyAndSafety() async throws {
+        let runtime = ControlledTextRuntime()
+        let coordinator = PhoneCoderInferenceCoordinator(runtime: runtime, reconstruct: { runtime })
+        _ = try await coordinator.switchModel(to: "model")
+        let ready = await coordinator.state()
+        XCTAssertEqual(ready.availability, .available)
+        await runtime.setAvailability(.unavailable(.residencyUnavailable))
+        let unavailable = await coordinator.state()
+        XCTAssertEqual(unavailable.availability, .unavailable(.residencyUnavailable))
+        await runtime.setAvailability(.unavailable(.thermal))
+        let hot = await coordinator.state()
+        XCTAssertEqual(hot.availability, .unavailable(.thermal))
+    }
+
+    private let sessionID = UUID()
+    private func request(_ id: String) -> PhoneCoderGenerationRequest {
+        PhoneCoderGenerationRequest(id: .init(rawValue: id), sessionID: sessionID, modelID: "model",
+                                   messages: [ChatMessage(role: .user, content: "hello")])
+    }
+    private func assertError(_ task: Task<PhoneCoderGenerationResult, Error>, _ expected: PhoneCoderRuntimeError,
+                             file: StaticString = #filePath, line: UInt = #line) async {
+        do { _ = try await task.value; XCTFail("Expected \(expected)", file: file, line: line) }
+        catch { XCTAssertEqual(error as? PhoneCoderRuntimeError, expected, file: file, line: line) }
+    }
+}
+
+private actor EventCollector {
+    var events: [PhoneCoderRuntimeEvent] = []
+    func append(_ event: PhoneCoderRuntimeEvent) { events.append(event) }
+}
+
+/// Native generation is the expensive external boundary. Every suspension here
+/// is controlled by the test; no timers, sleeps, polling, or scheduler guesses.
+private actor ControlledTextRuntime: PhoneCoderTextRuntime {
+    struct Start {
+        let request: PhoneCoderGenerationRequest
+        let session: PhoneCoderModelSession
+        let callback: @Sendable (PhoneCoderRuntimeEvent) async -> Void
+    }
+    var starts: [Start] = []
+    var startedIDs: [String] { starts.map { $0.request.id.rawValue } }
+    var operations: [String] = []
+    var lastSession: PhoneCoderModelSession?
+    private var availability: PhoneCoderRuntimeAvailability = .available
+    private var holdsAvailability = false
+    private var availabilityEntered = false
+    private var availabilityWaiter: CheckedContinuation<Void, Never>?
+    private var availabilityRelease: CheckedContinuation<Void, Never>?
+    func holdAvailability() { holdsAvailability = true }
+    func waitForAvailability() async {
+        if availabilityEntered { return }
+        await withCheckedContinuation { availabilityWaiter = $0 }
+    }
+    func releaseAvailability() { holdsAvailability = false; availabilityRelease?.resume(); availabilityRelease = nil }
+    private var loadError: PhoneCoderRuntimeError?
+    private var holdsLoad = false
+    private var loadStarted = false
+    private var loadWaiter: CheckedContinuation<Void, Never>?
+    private var loadRelease: CheckedContinuation<Void, Never>?
+    func holdLoad() { holdsLoad = true }
+    func waitForLoad() async {
+        if loadStarted { return }
+        await withCheckedContinuation { loadWaiter = $0 }
+    }
+    func releaseLoad() { loadRelease?.resume(); loadRelease = nil; holdsLoad = false }
+    func setLoadError(_ error: PhoneCoderRuntimeError) { loadError = error }
+    private var completion: CheckedContinuation<PhoneCoderGenerationResult, Error>?
+    private var waiters: [(Int, CheckedContinuation<Void, Never>)] = []
+    private var holdsCancellation = false
+    private var cancellationStarted = false
+    private var cancellationWaiter: CheckedContinuation<Void, Never>?
+    private var cancellationRelease: CheckedContinuation<Void, Never>?
+    func holdCancellation() { holdsCancellation = true }
+    func waitForCancellation() async {
+        if cancellationStarted { return }
+        await withCheckedContinuation { cancellationWaiter = $0 }
+    }
+    func releaseCancellation() {
+        cancellationRelease?.resume()
+        cancellationRelease = nil
+    }
+    func installedModels() async -> [PhoneCoderModelDescriptor] { [] }
+    func capabilities(session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimeCapabilities {
+        .init(limits: .init(contextWindow: 512, maximumOutputTokens: 64, defaultOutputTokens: 32,
+                           limitSource: .runtime, tokenCountMode: .conservativeApproximation), toolParser: .hermes)
+    }
+    func preflight(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession) async throws -> PhoneCoderRuntimePreflight {
+        let capability = try await capabilities(session: session)
+        let count = LocalAPIStrictInput.upperBound(prompt: LocalAPIStrictInput.prompt(messages: request.messages, template: .chatML, thinking: false))
+        let output = try LocalAPIStrictInput.outputTokens(requested: request.maxTokens, promptTokens: count.tokens, limits: capability.limits)
+        return .init(prompt: count, limits: capability.limits, outputTokens: output)
+    }
+    func liveAvailability() async -> PhoneCoderRuntimeAvailability {
+        if holdsAvailability {
+            await withCheckedContinuation {
+                availabilityEntered = true; availabilityRelease = $0
+                availabilityWaiter?.resume(); availabilityWaiter = nil
+            }
+        }
+        return availability
+    }
+    func setAvailability(_ value: PhoneCoderRuntimeAvailability) { availability = value }
+    func load(modelID: String) async throws -> PhoneCoderModelSession {
+        operations.append("load:\(modelID)")
+        if let loadError { throw loadError }
+        loadStarted = true
+        if holdsLoad {
+            await withCheckedContinuation {
+                loadRelease = $0
+                loadWaiter?.resume()
+                loadWaiter = nil
+            }
+        }
+        let session = PhoneCoderModelSession(id: UUID(), modelID: modelID)
+        lastSession = session
+        return session
+    }
+    func generate(_ request: PhoneCoderGenerationRequest, session: PhoneCoderModelSession,
+                  onEvent: @escaping @Sendable (PhoneCoderRuntimeEvent) async -> Void) async throws -> PhoneCoderGenerationResult {
+        operations.append("start:\(request.id.rawValue)")
+        starts.append(Start(request: request, session: session, callback: onEvent))
+        return try await withCheckedThrowingContinuation { continuation in
+            completion = continuation
+            let ready = waiters.filter { $0.0 <= starts.count }
+            waiters.removeAll { $0.0 <= starts.count }
+            ready.forEach { $0.1.resume() }
+        }
+    }
+    func waitForStarts(_ count: Int) async {
+        if starts.count >= count { return }
+        await withCheckedContinuation { waiters.append((count, $0)) }
+    }
+    func emitFromStart(_ index: Int, text: String, modelSessionID: UUID? = nil, sessionID: UUID? = nil) async {
+        let start = starts[index]
+        await start.callback(.init(requestID: start.request.id, sessionID: sessionID ?? start.request.sessionID,
+                                   modelSessionID: modelSessionID ?? start.session.id, text: text))
+    }
+    func succeed(modelSessionID: UUID? = nil) {
+        let start = starts.last!
+        let pending = completion
+        completion = nil
+        pending?.resume(returning: .init(requestID: start.request.id, sessionID: start.request.sessionID,
+                                        modelSessionID: modelSessionID ?? start.session.id, promptTokens: 1, completionTokens: 1,
+                                        finishReason: .stop))
+    }
+    func finishFromUpstream(_ outcome: AssistantGenerationOutcome) {
+        do { _ = try PhoneCoderRuntimeMapping.result(from: outcome); succeed() }
+        catch {
+            let pending = completion
+            completion = nil
+            pending?.resume(throwing: error)
+        }
+    }
+    func fail(_ error: PhoneCoderRuntimeError) {
+        let pending = completion
+        completion = nil
+        pending?.resume(throwing: error)
+    }
+    func cancel(requestID: PhoneCoderRequestID) async {
+        operations.append("cancel:\(requestID.rawValue)")
+        fail(.cancelled)
+        cancellationStarted = true
+        if holdsCancellation {
+            await withCheckedContinuation { continuation in
+                cancellationRelease = continuation
+                cancellationWaiter?.resume()
+                cancellationWaiter = nil
+            }
+        } else {
+            cancellationWaiter?.resume()
+            cancellationWaiter = nil
+        }
+    }
+    func unload() async { operations.append("unload") }
+}
+
+private actor ReconstructionGate {
+    private var entered = false
+    private var entry: CheckedContinuation<Void, Never>?
+    private var resume: CheckedContinuation<Void, Never>?
+    func enter() async {
+        await withCheckedContinuation { continuation in
+            entered = true
+            resume = continuation
+            entry?.resume()
+            entry = nil
+        }
+    }
+    func waitForEntry() async {
+        if entered { return }
+        await withCheckedContinuation { entry = $0 }
+    }
+    func release() { resume?.resume(); resume = nil }
+}
+
+@MainActor
+private final class ImageOperationBarrier {
+    private var entered = false
+    private var entry: CheckedContinuation<Void, Never>?
+    private var drain: CheckedContinuation<Void, Never>?
+    func wait() async {
+        await withCheckedContinuation { continuation in
+            drain = continuation
+            entered = true
+            entry?.resume(); entry = nil
+        }
+    }
+    func waitForEntry() async {
+        if entered { return }
+        await withCheckedContinuation { entry = $0 }
+    }
+    func release() { drain?.resume(); drain = nil }
+}

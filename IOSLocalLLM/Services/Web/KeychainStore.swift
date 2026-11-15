@@ -1,6 +1,31 @@
 import Foundation
 import Security
 
+/// Injectable boundary for Security operations; production always uses SecItem.
+protocol KeychainOperations {
+    func update(_ query: [String: Any], attributes: [String: Any]) -> OSStatus
+    func add(_ attributes: [String: Any]) -> OSStatus
+    func copyMatching(_ query: [String: Any]) -> (OSStatus, Data?)
+    func delete(_ query: [String: Any]) -> OSStatus
+}
+
+struct SecurityKeychainOperations: KeychainOperations {
+    func update(_ query: [String: Any], attributes: [String: Any]) -> OSStatus {
+        SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+    }
+    func add(_ attributes: [String: Any]) -> OSStatus {
+        SecItemAdd(attributes as CFDictionary, nil)
+    }
+    func copyMatching(_ query: [String: Any]) -> (OSStatus, Data?) {
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        return (status, item as? Data)
+    }
+    func delete(_ query: [String: Any]) -> OSStatus {
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
 // MARK: - KeychainStore
 // Minimal wrapper around the Security framework for API-key storage. Keys
 // are stored with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` so they
@@ -27,54 +52,84 @@ public enum KeychainStore {
         account: String,
         serviceName: String = KeychainStore.service
     ) {
-        guard let data = value.data(using: .utf8) else { return }
-        let q: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: account
-        ]
-        // Try update first; fall back to add.
-        let upd: [String: Any] = [kSecValueData as String: data]
-        let status = SecItemUpdate(q as CFDictionary, upd as CFDictionary)
-        if status == errSecItemNotFound {
-            var add = q
-            add[kSecValueData as String] = data
-            add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            SecItemAdd(add as CFDictionary, nil)
-        }
+        set(value, account: account, serviceName: serviceName, operations: SecurityKeychainOperations())
+    }
+
+    static func set(_ value: String, account: String, serviceName: String = KeychainStore.service,
+                    operations: any KeychainOperations) {
+        try? setChecked(value, account: account, serviceName: serviceName, operations: operations)
     }
 
     public static func get(
         account: String,
         serviceName: String = KeychainStore.service
     ) -> String? {
-        let q: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String:  true,
-            kSecMatchLimit as String:  kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        let status = withUnsafeMutablePointer(to: &item) { ptr -> OSStatus in
-            SecItemCopyMatching(q as CFDictionary, ptr)
-        }
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let str = String(data: data, encoding: .utf8) else { return nil }
-        return str
+        get(account: account, serviceName: serviceName, operations: SecurityKeychainOperations())
+    }
+
+    static func get(account: String, serviceName: String = KeychainStore.service,
+                    operations: any KeychainOperations) -> String? {
+        try? getChecked(account: account, serviceName: serviceName, operations: operations)
     }
 
     public static func delete(
         account: String,
         serviceName: String = KeychainStore.service
     ) {
-        let q: [String: Any] = [
-            kSecClass as String:       kSecClassGenericPassword,
-            kSecAttrService as String: serviceName,
-            kSecAttrAccount as String: account
-        ]
-        SecItemDelete(q as CFDictionary)
+        delete(account: account, serviceName: serviceName, operations: SecurityKeychainOperations())
+    }
+
+    static func delete(account: String, serviceName: String = KeychainStore.service,
+                       operations: any KeychainOperations) {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: serviceName,
+                                    kSecAttrAccount as String: account]
+        _ = operations.delete(query)
+    }
+
+    public struct CheckedError: Error {
+        public let status: OSStatus
+    }
+
+    public static func setChecked(_ value: String, account: String, serviceName: String) throws {
+        try setChecked(value, account: account, serviceName: serviceName, operations: SecurityKeychainOperations())
+    }
+
+    static func setChecked(_ value: String, account: String, serviceName: String,
+                           operations: any KeychainOperations) throws {
+        let data = Data(value.utf8)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: serviceName,
+                                    kSecAttrAccount as String: account]
+        let status = operations.update(query, attributes: [kSecValueData as String: data])
+        if status == errSecItemNotFound {
+            var attributes = query
+            attributes[kSecValueData as String] = data
+            attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            let addStatus = operations.add(attributes)
+            guard addStatus == errSecSuccess else { throw CheckedError(status: addStatus) }
+        } else if status != errSecSuccess {
+            throw CheckedError(status: status)
+        }
+    }
+
+    public static func getChecked(account: String, serviceName: String) throws -> String? {
+        try getChecked(account: account, serviceName: serviceName, operations: SecurityKeychainOperations())
+    }
+
+    static func getChecked(account: String, serviceName: String, operations: any KeychainOperations) throws -> String? {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: serviceName,
+                                    kSecAttrAccount as String: account,
+                                    kSecReturnData as String: true,
+                                    kSecMatchLimit as String: kSecMatchLimitOne]
+        let (status, data) = operations.copyMatching(query)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess else { throw CheckedError(status: status) }
+        guard let data, let value = String(data: data, encoding: .utf8) else {
+            throw CheckedError(status: errSecDecode)
+        }
+        return value
     }
 
     /// Removes every web-tool API key stored under this service namespace.
